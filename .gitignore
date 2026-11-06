@@ -1,0 +1,19 @@
+# Existing captures, accounts, diagnostics and delivery packages stay local.
+/*
+!/.gitignore
+!/engine/
+!/tools/
+!/source/
+/source/*
+!/source/launcher-bridge/
+!/*.md
+!/*.cmd
+!/*TEST.txt
+# Dependency downloads and build outputs are not source.
+/engine/vendor/*
+!/engine/vendor/wgpu-hal-30.0.1/
+!/engine/vendor/wgpu-core-30.0.1/
+/engine/target/
+**/__pycache__/
+**/*.pyc
+/tools/*.log
