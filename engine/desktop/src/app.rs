@@ -420,6 +420,11 @@ impl MainWindow {
             }
         }
 
+        #[cfg(windows)]
+        if self.gui.aola_tools_tick(self.player.get()) {
+            let wake=Instant::now()+std::time::Duration::from_millis(50);
+            self.next_frame_time=Some(self.next_frame_time.map_or(wake,|next|next.min(wake)));
+        }
         self.render_movie_if_needed();
     }
 
@@ -560,7 +565,7 @@ impl ApplicationHandler<RuffleEvent> for App {
 
             if self.preferences.cli.aola_host {
                 window_attributes = window_attributes
-                    .with_title("奥拉星 · 原生迁移测试版")
+                    .with_title(if self.preferences.cli.aola_tools {"奥拉星 · Rust 登录器"} else {"奥拉星 · 原生迁移测试版"})
                     .with_inner_size(PhysicalSize::new(960, 560));
             }
 
@@ -661,8 +666,8 @@ impl ApplicationHandler<RuffleEvent> for App {
                 event_loop_proxy,
             });
             #[cfg(windows)]
-            if crate::aola_host::enabled() {
-                match crate::aola_host::LoginBrowser::new(window,self.event_loop_proxy.clone()) {
+            if crate::aola_host::enabled() && !self.preferences.cli.aola_tools_preview {
+                match crate::aola_host::LoginBrowser::new(window,self.event_loop_proxy.clone(),self.preferences.cli.aola_tools) {
                     Ok(browser)=>self.aola_browser=Some(browser),
                     Err(_)=>{crate::aola_host::record("host-error","webview2-create");event_loop.exit();}
                 }

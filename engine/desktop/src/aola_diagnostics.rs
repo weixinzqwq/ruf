@@ -86,7 +86,7 @@ impl PerformanceLog {
                 "libraryGpuSweepCpuMs":gc.library_gpu_cache_sweep.total_ns as f64/1e6,
                 "orphanSlots":gc.orphan_slots});
         let row = json!({
-            "schema":5,"game":"aola","build":"aola-date-compat-test-20261107",
+            "schema":5,"game":"aola","build":"aola-launcher-20261107",
             "unixMs":SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
             "petPatchMode":std::env::var("AOLA_PET_PATCH").unwrap_or_else(|_|"official".into()),
             "processId":std::process::id(),"movieGeneration":self.movie_generation,"final":final_sample,

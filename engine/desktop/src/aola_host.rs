@@ -23,6 +23,7 @@ use crate::custom_event::RuffleEvent;
 pub const PAGE_URL: &str = "https://aola.100bt.com/play/play.html?from_h5=true";
 pub const START_URL: &str = "https://aola.100bt.com/play/start~2107300001.swf";
 static ENABLED: AtomicBool = AtomicBool::new(false);
+static LOGIN_VISIBLE: AtomicBool = AtomicBool::new(false);
 static STATE: OnceLock<Mutex<PageState>> = OnceLock::new();
 static PROXY: OnceLock<EventLoopProxy<RuffleEvent>> = OnceLock::new();
 static CLOCK: OnceLock<Instant> = OnceLock::new();
@@ -52,6 +53,7 @@ pub fn initialize(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 pub fn enabled() -> bool { ENABLED.load(Ordering::Relaxed) }
+pub fn login_visible() -> bool { LOGIN_VISIBLE.load(Ordering::Relaxed) }
 pub fn elapsed_ms() -> u128 { CLOCK.get_or_init(Instant::now).elapsed().as_millis() }
 pub fn write_event(row: serde_json::Value) {
     if let Some(log)=LOG.get() { let _=writeln!(log.lock().unwrap(),"{row}"); }
@@ -214,6 +216,10 @@ impl ExternalInterfaceProvider for AolaInterface {
     fn call_method(&self, _context: &mut UpdateContext<'_>, name: &str, args: &[Value]) -> Value {
         record("external-call", name);
         let args = arguments(args);
+        if name == "aolaCommandCompleted" {
+            crate::aola_tools::completed(args);
+            return Value::Undefined;
+        }
         let mut state = STATE.get().unwrap().lock().unwrap();
         match name {
             "getQS" | "getU" | "getCode" => {
@@ -307,17 +313,23 @@ pub struct LoginBrowser {
     webview: WebView,
     _context: WebContext,
     window: Arc<Window>,
+    toolbar: bool,
+}
+
+fn login_bounds(window: &Window, toolbar: bool) -> Rect {
+    let size=window.inner_size();
+    let top=if toolbar {(crate::gui::MENU_HEIGHT as f64 * window.scale_factor()).round() as u32} else {0};
+    Rect {position:wry::dpi::PhysicalPosition::new(0,top as i32).into(),size:wry::dpi::PhysicalSize::new(size.width,size.height.saturating_sub(top).max(1)).into()}
 }
 
 impl LoginBrowser {
-    pub fn new(window: Arc<Window>, proxy: EventLoopProxy<RuffleEvent>) -> anyhow::Result<Self> {
-        let size = window.inner_size();
+    pub fn new(window: Arc<Window>, proxy: EventLoopProxy<RuffleEvent>, toolbar: bool) -> anyhow::Result<Self> {
         let mut context=WebContext::new(Some(DATA_ROOT.get().unwrap().join("webview")));
         let webview = WebViewBuilder::new_with_web_context(&mut context)
             .with_incognito(true)
             .with_visible(false)
             .with_focused(false)
-            .with_bounds(Rect { position: wry::dpi::PhysicalPosition::new(0, 0).into(), size: wry::dpi::PhysicalSize::new(size.width, size.height).into() })
+            .with_bounds(login_bounds(&window, toolbar))
             .with_initialization_script(SNAPSHOT_SCRIPT)
             .with_navigation_handler(|address| { record_page("page-navigation", &address); true })
             .with_on_page_load_handler(|event, address| {
@@ -327,7 +339,7 @@ impl LoginBrowser {
             .with_url(PAGE_URL)
             .build_as_child(window.as_ref())?;
         record("host", "embedded-webview2-created");
-        Ok(Self { webview, _context:context, window })
+        Ok(Self { webview, _context:context, window, toolbar })
     }
 
     pub fn window_event(&self, event: &WindowEvent) {
@@ -337,7 +349,7 @@ impl LoginBrowser {
             _ => return,
         };
         if size.width > 0 && size.height > 0 {
-            if self.webview.set_bounds(Rect { position: wry::dpi::PhysicalPosition::new(0, 0).into(), size: wry::dpi::PhysicalSize::new(size.width, size.height).into() }).is_err() {
+            if self.webview.set_bounds(login_bounds(&self.window, self.toolbar)).is_err() {
                 record("host-error", "embedded-login-resize");
             }
         }
@@ -385,6 +397,7 @@ impl LoginBrowser {
                 "cookieCount":state.cookies.len(), "hrefPath":url.path()}));
             record("host", "official-login-ready");
             if self.webview.set_visible(false).is_err() { record("host-error", "embedded-login-hide"); }
+            else { LOGIN_VISIBLE.store(false,Ordering::Relaxed); }
             if self.webview.focus_parent().is_err() { record("host-error", "game-focus"); }
             self.window.request_redraw();
             record("host", "embedded-login-hidden");
@@ -394,6 +407,7 @@ impl LoginBrowser {
 
     pub fn navigate(&self, url: &str) {
         if self.webview.set_visible(true).is_err() { record("host-error", "embedded-login-show"); }
+        else { LOGIN_VISIBLE.store(true,Ordering::Relaxed); }
         record("login-address", if url.is_empty() { "empty" } else { "nonempty" });
         let mut url = Url::parse(PAGE_URL).unwrap().join(url).unwrap();
         if url.host_str() == Some("account.100bt.com") && url.path() == "/game/auth/login.html" {

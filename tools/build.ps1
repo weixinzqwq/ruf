@@ -1,12 +1,16 @@
 ﻿param(
     [ValidateSet('build','test')][string]$Action='build',
-    [ValidateSet('gc-progress','gc-pool','frame-library','switch-fps','tick-profile','pet-detail','window-move','ab-verify','panel-diagnostic','date-compat')][string]$Variant='date-compat'
+    [ValidateSet('gc-progress','gc-pool','frame-library','switch-fps','tick-profile','pet-detail','window-move','ab-verify','panel-diagnostic','date-compat','goto-profile','launcher')][string]$Variant='goto-profile'
 )
 $ErrorActionPreference='Stop'
+if ($Variant -eq 'launcher') {
+    & (Join-Path $PSScriptRoot 'build-launcher.ps1') -Action $Action
+    return
+}
 $taskRoot=Split-Path -Parent $PSScriptRoot
 $taskFramework=Join-Path (Split-Path -Parent $taskRoot) 'aoqi.1.03\reconstructed'
 if ($Action -eq 'build') {
-    $taskDate=if ($Variant -in @('panel-diagnostic','date-compat')) { '20261107' } elseif ($Variant -in @('tick-profile','pet-detail','window-move','ab-verify')) { '20261106' } else { '20261105' }
+    $taskDate=if ($Variant -in @('panel-diagnostic','date-compat','goto-profile')) { '20261107' } elseif ($Variant -in @('tick-profile','pet-detail','window-move','ab-verify')) { '20261106' } else { '20261105' }
     $taskOut=Join-Path $taskRoot "dist\aola-$Variant-test-$taskDate"
     if (Test-Path -LiteralPath (Join-Path $taskOut 'aola-native-test.exe')) { throw "Retained build already exists: $taskOut" }
     $taskMarker="aola-$Variant-test-$taskDate"
@@ -46,6 +50,11 @@ if ($Action -eq 'build') {
     }
     if ($Variant -eq 'date-compat') {
         foreach ($taskFile in @('run-date-compat.cmd','DATE-COMPAT-TEST.txt')) {
+            Copy-Item -LiteralPath (Join-Path $taskRoot $taskFile) -Destination $taskOut
+        }
+    }
+    if ($Variant -eq 'goto-profile') {
+        foreach ($taskFile in @('run-goto-profile.cmd','GOTO-PROFILE-TEST.txt')) {
             Copy-Item -LiteralPath (Join-Path $taskRoot $taskFile) -Destination $taskOut
         }
     }

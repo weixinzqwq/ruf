@@ -45,6 +45,12 @@ pub struct Opt {
     /// Run Aola with official web login and the shared native renderer.
     #[arg(long, conflicts_with = "aoqi_host")]
     pub aola_host: bool,
+    /// Enable the native Aola packet tools and original-session command bridge.
+    #[arg(long, requires = "aola_host")]
+    pub aola_tools: bool,
+    /// Preview the tool interface without opening the official login page or game.
+    #[arg(long, requires = "aola_tools")]
+    pub aola_tools_preview: bool,
     /// Isolated data directory for Aola.
     #[arg(long)]
     pub aola_data_dir: Option<std::path::PathBuf>,

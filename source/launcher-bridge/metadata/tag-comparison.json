@@ -1,0 +1,9 @@
+{
+  "frame_header_equal": true,
+  "tag_count": 11,
+  "changed_tag_indices": [
+    7
+  ],
+  "only_DoABC_changed": true,
+  "all_non_code_tags_equal": true
+}

@@ -10,6 +10,8 @@ mod app;
 #[cfg(windows)]
 mod aola_host;
 #[cfg(windows)]
+mod aola_tools;
+#[cfg(windows)]
 mod aola_diagnostics;
 #[cfg(windows)]
 mod aoqi_host;
@@ -157,6 +159,58 @@ fn panic_hook(info: &PanicHookInfo) {
     }
 }
 
+#[cfg(windows)]
+fn configure_aola_launcher(opt: &mut Opt, executable_name: &str) {
+    if executable_name.eq_ignore_ascii_case("aola-native-test.exe") {
+        opt.aola_host = true;
+    }
+    if executable_name.eq_ignore_ascii_case("aola-launcher.exe")
+        && !opt.aola_host
+        && !opt.aoqi_host
+    {
+        opt.aola_host = true;
+        opt.aola_tools = true;
+    }
+}
+
+#[cfg(all(test, windows))]
+mod aola_startup_tests {
+    use super::*;
+
+    #[test]
+    fn double_click_enables_launcher() {
+        let mut opt = Opt::try_parse_from(["aola-launcher.exe"]).expect("valid options");
+        configure_aola_launcher(&mut opt, "aola-launcher.exe");
+        assert!(opt.aola_host && opt.aola_tools);
+        assert_eq!(opt.frame_rate, None);
+    }
+
+    #[test]
+    fn explicit_host_preserves_comparison_and_other_game() {
+        let mut opt = Opt::try_parse_from(["aola-launcher.exe", "--aola-host"])
+            .expect("valid comparison options");
+        configure_aola_launcher(&mut opt, "aola-launcher.exe");
+        assert!(opt.aola_host && !opt.aola_tools);
+        assert_eq!(opt.frame_rate, None);
+        let mut opt = Opt::try_parse_from(["aola-launcher.exe", "--aoqi-host"])
+            .expect("valid other host options");
+        configure_aola_launcher(&mut opt, "aola-launcher.exe");
+        assert!(!opt.aola_host && !opt.aola_tools && opt.aoqi_host);
+    }
+
+    #[test]
+    fn native_test_and_explicit_rate_are_preserved() {
+        let mut opt = Opt::try_parse_from(["aola-native-test.exe"]).expect("valid options");
+        configure_aola_launcher(&mut opt, "aola-native-test.exe");
+        assert!(opt.aola_host && !opt.aola_tools);
+        assert_eq!(opt.frame_rate, None);
+        let mut opt = Opt::try_parse_from(["aola-launcher.exe", "--frame-rate", "60"])
+            .expect("valid rate option");
+        configure_aola_launcher(&mut opt, "aola-launcher.exe");
+        assert_eq!(opt.frame_rate, Some(60.0));
+    }
+}
+
 fn main() -> Result<(), Error> {
     if std::env::current_exe().ok().and_then(|p| p.file_name().map(|v| v.to_string_lossy().into_owned()))
         .is_some_and(|name| name.eq_ignore_ascii_case("aoqi-allocation-pool-test.exe") || name.eq_ignore_ascii_case("aoqi-pool-reuse-test.exe") || name.eq_ignore_ascii_case("aoqi-gpu-cache-test.exe") || name.eq_ignore_ascii_case("aoqi-command-submit-test.exe") || name.eq_ignore_ascii_case("aoqi-command-maintenance-test.exe") || name.eq_ignore_ascii_case("aoqi-command-encode-test.exe")
@@ -180,15 +234,14 @@ fn main() -> Result<(), Error> {
 
     let mut opt = Opt::parse();
     #[cfg(windows)]
-    if std::env::current_exe().ok().and_then(|p|p.file_name().map(|n|n.to_string_lossy().into_owned()))
-        .is_some_and(|name|name.eq_ignore_ascii_case("aola-native-test.exe")) {
-        opt.aola_host = true;
+    if let Some(name)=std::env::current_exe().ok().and_then(|p|p.file_name().map(|n|n.to_string_lossy().into_owned())) {
+        configure_aola_launcher(&mut opt,&name);
     }
     #[cfg(windows)]
     if opt.aola_host {
         anyhow::ensure!(!opt.aoqi_host,"Choose one game host");
         ruffle_core::aoqi_work::initialize_aola_mode();
-        let root=opt.aola_data_dir.clone().unwrap_or_else(|| std::env::current_exe().unwrap().parent().unwrap().join("aola-data"));
+        let root=opt.aola_data_dir.clone().unwrap_or_else(|| std::env::current_exe().unwrap().parent().unwrap().join(if opt.aola_tools {"aola-launcher-data"} else {"aola-data"}));
         std::fs::create_dir_all(&root)?;
         let root=std::fs::canonicalize(root)?;
         opt.aola_data_dir=Some(root.clone());
@@ -199,11 +252,11 @@ fn main() -> Result<(), Error> {
         opt.graphics=Some(ruffle_render_wgpu::clap::GraphicsBackend::Dx12);
         opt.quality=Some(ruffle_render::quality::StageQuality::High);
         opt.width=Some(960.0);opt.height=Some(560.0);
-        // Default to the SWF's rate; preserve an explicitly requested --frame-rate.
+        // Tools apply their saved rate (default 50 FPS); playback-only keeps the SWF's rate.
         opt.tcp_connections=Some(ruffle_core::backend::navigator::SocketMode::Allow);
         opt.referer=Some(Url::parse(aola_host::PAGE_URL)?);
         opt.movie_url=None;
-        opt.no_gui=true;
+        opt.no_gui=!opt.aola_tools;
         aola_host::initialize(&root)?;
     }
     if std::env::current_exe().ok().and_then(|path|path.file_name().map(|name|name.to_string_lossy().into_owned()))

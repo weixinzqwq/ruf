@@ -1,15 +1,16 @@
 # Aola 项目进度与新对话交接
 
-更新时间：2026-11-07（北京时间，已分析00:26左右面板复现；定位日期解析兼容问题，当前交付修正版待用户验收）。本文件供新对话接续任务；优先阅读本节及第11节，无需重做此前的迁移与窗口修正。
+更新时间：2026-11-07（北京时间，用户指定优先恢复gotoAndStop内部定位；goto-profile独立测试版已构建，待用户采集）。本文件供新对话接续任务；优先阅读本节及第12节，无需重做此前的迁移与窗口修正。
 
 ## 1. 当前准确状态
 
+- **当前轮次按用户指定优先定位 `gotoAndStop` 内舞台/orphan构建、脚本遍历、广播与清理。** 新增逐详情响应的阶段计时和访问计数，保持原执行顺序，不宣称已经改善帧率。卡片统计遍历留后续；角色面板日期修正保留，但尚无在线验收反馈。
 - 当前优化对象是 **Aola（奥拉星）**，不再以奥奇为优化与验收对象。底层仍复用已经优化过的 Rust/Ruffle 源码。
 - 已完成官方登录、单窗口内嵌 WebView2 与游戏显示。用户此前确认可以进地图、移动，窗口缩放及操作正常。
 - **最新窗口拖动修正已由用户确认没有问题。** 用户原话：“当前窗口修正后没有问题，但是我还没有进行刚才替换swf以及使用官方swf的AB组测试。”
 - **本轮 A/B 已完成并分析，实际替换命中已确认。** 每次详情响应少2次读取/解析，但帧率未明显改善；原始间隔重算 A/B 呈现约12.04/12.33 FPS，显示变化约11.92/11.94 FPS。用户反馈操作条件相同、均无显示异常；实际窗口像素尺寸不同，且 B 在采集后有错误码，不标记完整在线兼容性通过。
 - **面板故障已定位：游戏的 `2024/1/5 02:00:00` 被引擎拒绝，起始赛季日期无效，空赛季列表触发初始化 #1009。** 用户用诊断版在00:26左右连续三次复现，目标资源均成功取得，前两次完整错误链吻合；第三次堆栈受日志上限截断。当前用 `date-compat` 版修复四位年格式中一位月/日解析，在线显示仍待用户验收。
-- 当前源码保留既有渲染/回收优化、完整 tick 计时、逐次详情响应定位、可选择的 SWF A/B 替换、窗口拖动修正与实际 SWF 命中诊断、面板定向诊断；本轮新增最小日期兼容修正。新入口明确关闭本地背包替换，未修改官方活动SWF。
+- 当前源码保留既有渲染/回收优化、完整 tick 计时、逐次详情响应定位、可选择的 SWF A/B 替换、窗口拖动修正与实际 SWF 命中诊断、面板定向诊断和上一轮日期兼容修正；本轮新增goto内部阶段计时。新入口明确关闭本地背包替换和面板逐方法日志，未修改官方活动SWF。
 - 根目录及旧窗口版的四份 A/B 脚本已统一设置 `AOQI_STAGE3_MODE=sleep`，新 `ab-verify` 包沿用修正后的入口。本轮发现旧 Aola 宿主会过滤实际命中消息，此次已使用新 EXE 完成 A/B，并在 startup 日志确认 `pet-swf-replacement`，不是仅凭 `petPatchMode` 判断。
 
 上一轮先备份并修正四份脚本，随后核对发现旧命中日志不可达，故仅补充专用诊断并以新目录交付；SWF、游戏逻辑、渲染、回收和窗口修正均未再修改。脚本准备证据在 `evidence/ab-ready-20261106`，其最初“ready”结论已标记被后续日志核对取代；最终源码备份、差异、测试与构建记录在 `evidence/ab-logging-20261106`。旧 EXE、SWF、用户数据和既有采集保留，未启动游戏登录；在线测试由用户完成。当前面板诊断轮次见第10节，不能将这段历史说明理解为当前未修改源码。
@@ -33,10 +34,18 @@
 
 ## 3. 当前应使用的版本
 
-**当前角色信息面板验收使用 `date-compat` 修正版。**
+**当前背包卡顿定位使用 `goto-profile` 版。**
+
+- 入口：`D:\game\Rea\aola\dist\aola-goto-profile-test-20261107\run-goto-profile.cmd`。
+- build：`aola-goto-profile-test-20261107`；schema：`6`。构建、哈希和验证见 `evidence/goto-profile-20261107/delivery.json`。
+- EXE：38,739,456字节；SHA256：`1ffdff9065b0cf0527f9d890985addce5009c2c5c5e7e52793bbf90cf1acacc1`。
+- 独立数据目录 `aola-data-goto-profile`，sleep、50FPS，启用 `AOLA_GOTO_PROFILE=1`，关闭背包替换和上一轮面板逐方法日志。
+- 固定窗口尺寸，静置5秒，背包按固定顺序查看约8只亚比、每次停约2秒，同序再做一轮；关闭背包等5秒后正常退出。无需SWF A/B或额外PresentMon。完整操作见 `GOTO-PROFILE-TEST.txt`。
+
+### 保留的角色面板日期修正版
 
 - 入口：`D:\game\Rea\aola\dist\aola-date-compat-test-20261107\run-date-compat.cmd`。
-- build：`aola-date-compat-test-20261107`；schema：`5`。EXE大小、哈希与核对结果见 `evidence/panel-date-fix-20261107/delivery.json`。
+- build：`aola-date-compat-test-20261107`；schema：`5`。EXE大小38,687,744字节；SHA256：`dfaa20339411b6b4da84acc37066287c1ddbd56d04db4491d9dc68e28bd0975b`。完整核对结果见 `evidence/panel-date-fix-20261107/delivery.json`。
 - 使用独立 `aola-data-date-compat`，保留窗口修正、sleep、50 FPS及定向诊断，显式关闭本地背包替换。
 - 手动登录，打开角色信息面板，若显示则检查页签及年份/赛季切换，正常关闭后告知结果和时间。无需发包或PresentMon；操作说明 `DATE-COMPAT-TEST.txt`。
 
@@ -217,14 +226,14 @@ set "AOQI_STAGE3_optimized=sleep"
 - 每次响应的1024种方法来源上限均触及，未丢失完整响应；未列出的方法不可当作零调用。
 - B在采集结束后记录2007一次和1009八次，无堆栈，原因未定，不能直接认定为补丁错误；本次可见显示正常不等于全面兼容验收完成。
 
-性能方向保留：拆分 `gotoAndStop -> goto_frame_now -> run_inner_goto_frame` 内部的全舞台/orphan构建、脚本遍历、广播和清理耗时，并关联反复切换时的对象生命周期。槽位增长不是内存泄漏证明；同帧goto有可观察副作用，不得直接全部跳过。卡片数量查询的高频遍历保留为后续方向；绘制仍是第二条优化线。**当前先定位用户新增的面板功能故障，不同时推进时间轴优化。**
+用户现已指定继续拆分 `gotoAndStop -> goto_frame_now -> run_inner_goto_frame` 内部的全舞台/orphan构建、脚本遍历、广播和清理耗时，并关联反复切换时的访问规模。槽位增长不是内存泄漏证明；同帧goto有可观察副作用，不得直接全部跳过。卡片数量查询的高频遍历保留为后续方向；绘制仍是第二条优化线。**本轮先计时定位，未跳过或重排时间轴执行。**
 
 A/B分析阶段只分析记录、静态核对调用链和更新进度，没有修改源码、EXE、SWF或启动脚本，也没有启动游戏；后续面板诊断阶段另有源码修改，见第10节。详细报告、输入快照、汇总、逐响应表及图在 `evidence/ab-results-20261106`，入口 `report.txt`。原始采集和交付时的delivery证据保留，未回填历史验收状态。
 
 ## 9. 构建、验证和补充资料
 
-- 当前打包命令：`D:\game\Rea\aola\tools\build.ps1 -Variant date-compat`。
-- 脚本默认 variant 也是 date-compat，且核对源码 build 标记、拒绝覆盖已有交付 EXE。**交付目录存在时，直接重跑会拒绝覆盖；下一轮需新 variant/标记/目录，不要删除旧包来绕过。**
+- 当前打包命令：`D:\game\Rea\aola\tools\build.ps1 -Variant goto-profile`。
+- 脚本默认 variant 也是 goto-profile，且核对源码 build 标记、拒绝覆盖已有交付 EXE；已有launcher分支保留。**交付目录存在时，直接重跑会拒绝覆盖；下一轮需新 variant/标记/目录，不要删除旧包来绕过。**
 - Rust 工具链：`D:\game\Rea\aoqi.1.03\toolchain\rust-1.99.1`。
 - Cargo 缓存/产物：`D:\game\Rea\aoqi.1.03\reconstructed\build\engine-cargo-home`、`engine-target`；离线依赖配置 `engine\.cargo\vendor.toml`。
 - 复用已有脚本中的环境：单构建任务、`RUST_MIN_STACK=8388608`、正确 Java 路径、显式 `CARGO_PROFILE_DEV_DEBUG=0` 和 `CARGO_PROFILE_TEST_DEBUG=0`。此前构建脚本恢复环境时出现过空字符串 profile 配置导致后续测试未启动的问题；相关记录保留，勿误报为引擎测试失败。
@@ -267,6 +276,34 @@ A/B分析阶段只分析记录、静态核对调用链和更新进度，没有�
 
 分析与证据入口：`evidence/panel-date-fix-20261107/report.txt`（日志时间及行号）、`root-cause.txt`（源码因果链及范围）、`summary.json`、`timeline.csv`。4份新日志原件快照、改前源码备份、测试失败证据、修复后差异和构建日志均保留。新包使用独立数据目录且保留定向诊断；不自动登录或复制凭据。
 
-**状态：本地日期兼容修正与回归完成情况以delivery.json为准，角色信息面板在线显示待用户用date-compat新包测试。** 若该面板恢复，再单独记录其它仍打不开的面板，不能把一项日期修正扩大为全部活动已通过。时间轴性能优化继续暂缓。
+**状态：11项回归、release构建、EXE `--help` 及文件核对已通过，角色信息面板在线显示仍待用户验收反馈。** 旧诊断/A-B EXE、两份背包SWF、两份活动SWF、4份新日志与8份旧A/B输入哈希未变，4份改前源码/文档备份校验通过。若该面板恢复，再单独记录其它仍打不开的面板，不能把一项日期修正扩大为全部活动已通过。用户已指定下一轮转回goto定位，日期修正随新包保留。
 
-**新对话最短接续指令：先读取本文件第11节、`evidence/panel-date-fix-20261107/root-cause.txt` 和 delivery.json，检查用户用date-compat版进行的面板/页签测试。诊断已锁定不补零日期被拒绝导致空赛季列表，前后离线回归已留证。保留所有旧包、SWF、采集，不自动登录；不得把本地测试当在线验收。**
+## 12. gotoAndStop舞台/orphan内部定位
+
+关键缺口：既有 `FrameWork::measure` 仅在 `Player::run_frame` 内激活，而逐详情响应位于sockets或直接输入，不能靠旧frame统计解释这些goto的内部成本。本轮在 `exec_detail_root` 建立响应范围，在 `goto_frame_now` 打开实际goto范围，复用各阶段插点，并补上手动帧脚本执行、已移除对象脚本及数字访问计数。
+
+新模块 `core/src/goto_profile.rs` 使用每响应一个固定大小Box，随 `ResponseCost.goto` 导出，不保留GC对象或逐goto记录。原16个响应/采样上限和droppedResponses仍适用；新统计独立于已触及1024种来源上限的方法表。schema 6的 `petDetailResponses.responses[].goto` 包含实际goto次数、同帧/stop/AVM2次数、排队次数、inner/legacy跳过次数、最大嵌套深度、阶段排他时间及计数。
+
+时间口径：`outerTotalMs` 为本响应内最外层实际goto总墙钟时间；各 `phases[].exclusiveMs` 通过暂停/恢复父阶段避免嵌套重复，求和应等于它，`unaccountedMs`应为0。`inclusiveMs`含重复的嵌套时段，不能再相加。旧AVM方法selfMs扣除所有被测子调用，新阶段中可包含构造器/监听脚本，两者口径不同。记录本身有开销，不把新旧EXE帧率差异视作优化收益。
+
+对象口径：MovieClip构建/脚本访问次数不是唯一对象或新建对象数；orphanVisits为弱引用槽位扫描，executed/invalid/sleepSkipped另列。orphan指没有父节点，隐藏或屏外但有父节点的对象仍在普通树内。orphanSlots仅在goto边界取样，增长不是泄漏证明。广播派发次数不是监听函数数，清理前槽位与移除量分别记录。
+
+保留原有顺序和特殊分支：同帧goto仍执行可观察副作用；inner goto脚本顺序仍为舞台先、orphan后；SWF<=9提前返回及排队行为保持。`run_goto`的其它直接入口不会自行打开统计范围；发生在已打开范围内的嵌套工作才归入当前阶段。排队后在响应结束外执行的goto不记为本响应的实际耗时。
+
+源码/证据目录：`evidence/goto-profile-20261107`。`before.json`及before保存13份改前文件；`design.txt`记录调用链、范围、字段和后续分析方式。核心25项、桌面8项、窗口1项合计34项检查通过，覆盖确定性时钟扣重、禁用及重置、6个Flash样例在开启/关闭统计时的输出、frame外同帧goto，以及既有Aola/日期/窗口检查。窗口项直接运行已通过8项桌面检查的同一测试程序，前后哈希一致，见window-test.log/json；其余见tests-final.log。最终构建、源码差异及新包哈希见delivery.json，不以构建锁等待日志冒充通过。
+
+此轮交付基于 `aoqi.1.03/reconstructed/engine` 源码，不覆盖另一路 `aola/engine` 登录器工作；两路目前共用编译缓存，构建锁等待不等于回归失败。测试导入路径错误的首次日志也保留，后续以tests-final.log为准。
+
+**下一步：用户用goto-profile独立入口完成固定顺序背包切换两轮。先检查每响应goto.enabled、droppedResponses及时间求和，再比较各阶段时间、访问次数和orphan槽位随轮次变化，选择一项有证据的优化。卡片统计遍历暂不实施。** 不自动登录、发包或操作用户游戏，不把离线样例通过扩大为在线性能或兼容验收通过。
+
+## 13. Rust 登录器首期（独立源码）
+
+用户已审核通过基础工具、抓包/发包与最小发送桥方案，并授权初始化本地 Git 保存源码。本期源码在 `aola/engine` 与 `aola/native-core`，从日期兼容修正后的优化版独立复制；第12节的 goto-profile 仍在原工程推进，不能把两条构建线的测试或性能结论混用。
+
+实现中文工具栏、收发记录筛选/详情/暂停、发送文本导入导出、`#send`/`#time` 检查和非阻塞队列，以及帧率/画质/静音与可选日志。Rust 观察原 Ruffle 网络通道；独立启动桥调用游戏自身 `ActClientSender`，沿用原连接。断线、重新登录或观察丢失会停止队列。登录凭据隐藏，不保存原始登录包；日志默认关闭。战斗、主题及形态功能不属于本期。
+
+入口与功能边界见 `LAUNCHER.md`。最终目录为 `dist/aola-launcher-20261107-release`，可双击 `run-launcher.cmd` 或 `aola-launcher.exe`；数据目录独立，原测试包、用户数据与旧工程保留。构建入口 `tools/build-launcher.ps1`，有同名交付 EXE 时要求选择新输出目录。验证证据保存于本机 `evidence/launcher-20261107`。
+
+离线预览已经观察到中文工具栏及收发记录窗口；最终构建与测试结果以 `LAUNCHER.md` 和本轮 `delivery.json` 为准。真实登录、实际收发包和服务器结果仍需用户手动验收，离线模拟不构成在线成功证明。Git 仅在本地保存，未设置或推送远端；历史采集、登录资料和交付程序不纳入版本控制。
+
+本轮最终 37 项相关测试全部通过，Release 构建及 EXE `--help` 检查通过；测试日志为 `tests-release-final.log`。已补齐直接双击 EXE 进入登录器、保存的帧率设置恢复及显式启动帧率优先级。早期编译错误的日志保留，未作为最终通过证据；预览版 EXE 哈希保持不变。

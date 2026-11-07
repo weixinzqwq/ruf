@@ -289,6 +289,14 @@ impl GuiController {
         self.gui.on_player_destroyed();
     }
 
+    #[cfg(windows)]
+    pub fn aola_tools_tick(&mut self, mut player: Option<MutexGuard<Player>>) -> bool {
+        if let Some(tools) = &mut self.gui.aola_tools {
+            tools.tick(player.as_deref_mut());
+            true
+        } else { false }
+    }
+
     pub fn create_movie(
         &mut self,
         player: &mut PlayerController,

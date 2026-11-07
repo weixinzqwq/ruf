@@ -1,0 +1,53 @@
+奥拉背包 A/B 测试交接（2026-11-06）
+
+当前状态：保留已确认正常的窗口修正，修正 A/B 启动变量，并补上实际 SWF 命中诊断。
+本轮使用独立新 EXE；A、B 使用同一 EXE，SWF 与上一窗口版完全相同。在线测试由你完成。
+
+请使用本文件所在目录：
+D:\game\Rea\aola\dist\aola-ab-verify-test-20261106
+不要使用 aola 根目录入口、window-move 或 pet-detail 旧包；根目录入口供打包复制，旁边没有 EXE。
+目录内 PET-DETAIL-TEST.txt 记载的是上一轮交付；本轮启动路径以本文件为准。
+
+1. 测试 A：官方背包原件
+   先正常退出其他游戏测试窗口，再双击本目录 run-detail-A-original.cmd。
+   在官方页面手动登录。保持相同窗口尺寸和游戏设置。
+   进入背包并按固定顺序预热要查看的亚比，静置约 10 秒。
+   启动 PresentMon 采集，按固定顺序、相近操作间隔切换 30–60 秒；
+   尽量覆盖普通卡片和神卡列表，然后静置约 10 秒，停止采集并正常关闭游戏。
+   记录采集开始/结束时间、CSV 文件名以及测试组 A。
+
+2. 测试 B：两处重复解析删除补丁
+   确认 A 已关闭，再双击本目录 run-detail-B-optimized.cmd，并手动登录。
+   重复 A 的窗口尺寸、亚比顺序、预热、操作间隔及采集时长。
+   同样记录时间、CSV 文件名以及测试组 B；结束后正常关闭游戏。
+   A、B 不要同时运行。两者均为同一命中诊断修正版 EXE、50 FPS、sleep 模式、256 MiB 纹理池。
+
+3. 同时观察
+   模型、属性文字、卡片列表、装备状态、切换后显示是否正常。
+   记录最明显的卡顿发生在哪次切换，以及是否只在首次查看时出现。
+   若 B 出现异常，记录场景并关闭 B；重新启动同目录 A 可返回官方背包原件。
+
+4. 记录保存位置
+   PresentMon CSV 放到 D:\game\Rea\aola\capture，保留原文件，不覆盖旧采集。
+   A 自动日志：本目录 aola-data-baseline\diagnostics。
+   B 自动日志：本目录 aola-data-optimized\diagnostics。
+   每组保留 startup-*.jsonl 与 performance-*.jsonl；Aola 宿主不生成 cache\log 普通运行日志。
+   保留现有及新增日志。A、B 数据目录独立，不复制登录文件。
+
+5. 测完后反馈
+   告诉我“测试完成”，并注明 A、B 各自的采集文件名或大致时间，以及有无显示异常。
+   我会先按 PID、时间和 build 对齐日志，再检查 startup-*.jsonl 中的
+   type="pet-swf-replacement"：A 应为 optimized=false，B 应为 optimized=true。
+   该事件在实际返回本地 SWF 字节时记录；仅出现 petPatchMode 不算命中证明。
+   若官网资源版本已经变化、没有命中，本轮不能作为补丁 A/B 结果，需先核对版本。
+   然后比较详情响应自身耗时、调用次数、遗漏量、实际帧率、长帧和绘制峰值。
+
+交接核对
+   当前 build：aola-ab-verify-test-20261106；日志 schema：5。
+   A SWF SHA256：5011d9a09e6b5cd1e82b1bae36ffc6ad0ce84a1f89db3b998a61b308cbfdbd87
+   B SWF SHA256：308cf278d40ce80001cbbf2e9d2e4bc35ecbf120cc379c17fe4767cd926f122c
+   精确替换路径：/play/pet/newpetpackage~2026102936286521.swf
+   本轮准备证据：D:\game\Rea\aola\evidence\ab-logging-20261106
+   项目进度：D:\game\Rea\aola\process.md
+
+以上是测试准备与静态核对结果；实际性能收益和在线兼容性等待此次手动测试。

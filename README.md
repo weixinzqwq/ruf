@@ -1,3 +1,7 @@
+# Rust 登录器首期
+
+新登录器源码位于本目录 `engine` 与 `native-core`，功能及构建入口见 [LAUNCHER.md](LAUNCHER.md)。旧优化测试与原工程保留；下文记录此前迁移和性能验证过程。
+
 # 奥拉星原生迁移：登录与进图
 
 本轮将奥拉星官方 Flash 启动链接入现有 Rust/Ruffle 框架，先验证官方登录与进入地图。游戏由原生 Ruffle/DX12 执行和绘制，WebView2 承接官方 HTML 登录。CEF 项目、原版软件和已交付奥奇版本保留。

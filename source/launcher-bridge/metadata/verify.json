@@ -1,0 +1,109 @@
+{
+  "input": "D:\\game\\Rea\\aola\\source\\launcher-bridge\\variants\\start-launcher.fws.swf",
+  "evidence_directory": "D:\\game\\Rea\\aola\\source\\launcher-bridge\\evidence\\verify\\run-20261107-005837-435584-42040",
+  "static_verification_passed": true,
+  "runtime_validation_required": true,
+  "runtime_validation_performed": false,
+  "warnings": [
+    "Static success does not prove that Flash can load or execute this SWF.",
+    "Verify the default/no-replacement runtime before the modified path."
+  ],
+  "checks": {
+    "header_and_lengths": true,
+    "comparison_completed": true,
+    "ffdec_reread": true,
+    "expected_declarations": true
+  },
+  "inspection": {
+    "path": "D:\\game\\Rea\\aola\\source\\launcher-bridge\\variants\\start-launcher.fws.swf",
+    "signature": "FWS",
+    "compression": "none",
+    "version": 18,
+    "file_size": 8677,
+    "declared_length": 8677,
+    "decoded_length": 8677,
+    "length_valid": true,
+    "sha256": "696b2dd2878dd6e3be2d889733b12d39a2562d73c62ef60094fefa55b897b4a4",
+    "compressed_length_field": null,
+    "compressed_payload_length": null,
+    "compressed_length_valid": null,
+    "lzma_properties": null,
+    "lzma_dictionary_size": null,
+    "lzma_lc": null,
+    "lzma_lp": null,
+    "lzma_pb": null
+  },
+  "comparison": {
+    "original": {
+      "path": "D:\\game\\Rea\\aola\\source\\launcher-bridge\\source\\start-original.fws.swf",
+      "signature": "FWS",
+      "compression": "none",
+      "version": 18,
+      "file_size": 3929,
+      "declared_length": 3929,
+      "decoded_length": 3929,
+      "length_valid": true,
+      "sha256": "f9733de901b0e62526d22b7d11cc76c42095c98fc1c79fdf02508b90870ad094",
+      "compressed_length_field": null,
+      "compressed_payload_length": null,
+      "compressed_length_valid": null,
+      "lzma_properties": null,
+      "lzma_dictionary_size": null,
+      "lzma_lc": null,
+      "lzma_lp": null,
+      "lzma_pb": null
+    },
+    "modified": {
+      "path": "D:\\game\\Rea\\aola\\source\\launcher-bridge\\variants\\start-launcher.fws.swf",
+      "signature": "FWS",
+      "compression": "none",
+      "version": 18,
+      "file_size": 8677,
+      "declared_length": 8677,
+      "decoded_length": 8677,
+      "length_valid": true,
+      "sha256": "696b2dd2878dd6e3be2d889733b12d39a2562d73c62ef60094fefa55b897b4a4",
+      "compressed_length_field": null,
+      "compressed_payload_length": null,
+      "compressed_length_valid": null,
+      "lzma_properties": null,
+      "lzma_dictionary_size": null,
+      "lzma_lc": null,
+      "lzma_lp": null,
+      "lzma_pb": null
+    },
+    "file_sha256_equal": false,
+    "decoded_body_length_equal": false
+  },
+  "ffdec": "D:\\Programs\\FFdec\\ffdec-cli.exe",
+  "ffdec_command": [
+    "D:\\Programs\\FFdec\\ffdec-cli.exe",
+    "-onerror",
+    "abort",
+    "-export",
+    "script,symbolClass",
+    "D:\\game\\Rea\\aola\\source\\launcher-bridge\\evidence\\verify\\run-20261107-005837-435584-42040\\decompiled",
+    "D:\\game\\Rea\\aola\\source\\launcher-bridge\\variants\\start-launcher.fws.swf"
+  ],
+  "ffdec_exit_code": 0,
+  "exported_file_count": 3,
+  "declaration_checks": {
+    "classes": {
+      "mmo.checkversion.Load": true
+    },
+    "packages": {
+      "mmo.checkversion": true
+    },
+    "methods": {
+      "onLauncherSend": true
+    },
+    "symbol_classes": {
+      "mmo.checkversion.Load": true
+    },
+    "texts": {
+      "aolaSendCommand": true,
+      "aolaBridgeReady": true
+    },
+    "instances": {}
+  }
+}

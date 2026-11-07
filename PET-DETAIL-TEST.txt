@@ -1,0 +1,54 @@
+奥拉背包详情解析与调用定位测试版（2026-11-06）
+
+交付目录：dist/aola-pet-detail-test-20261106
+
+本轮修改
+1. 从当前官网 start.xml + versiondata 核对并下载 pet/newpetpackage~2026102936286521.swf。
+   原始 SHA256：5011d9a09e6b5cd1e82b1bae36ffc6ad0ce84a1f89db3b998a61b308cbfdbd87。
+2. 在 PetCardList、GodCardList 的 onPetDetailedCached 中，各删除一次紧随首次读取的重复 getPetDetailInfo 调用。
+   保留各面板自己的详情对象、事件顺序、其他方法和美术资源。没有将旧版背包、皮肤或战斗补丁整体搬入。
+   优化件 SHA256：308cf278d40ce80001cbbf2e9d2e4bc35ecbf120cc379c17fe4767cd926f122c。
+3. 为每次 PetDataService/onViewSinglePet 响应记录方法调用次数、包含子调用耗时、自身耗时和最慢一次；
+   没有服务器响应而直接从缓存派发详情更新时，也会记录独立响应。保留完整 tick、绘制、提交、纹理和显存计数。
+
+使用方式
+先正常退出旧进程，再依次测试以下入口；不要同时运行两个游戏窗口。
+A：run-detail-A-original.cmd —— 新引擎 + 本次下载的官方背包原件。
+B：run-detail-B-optimized.cmd —— 相同引擎 + 两处去重补丁。
+两者均强制 50 FPS，1 倍速，原有 sleep 优化与 256 MiB 纹理池配置相同。
+分别使用 aola-data-baseline、aola-data-optimized 独立目录，请在官方页面手动登录。
+保持窗口尺寸、亚比顺序、操作间隔和预热方式相同。静置约 10 秒，采集 30–60 秒背包切换；
+尽量覆盖相同卡片/神卡面板，再静置约 10 秒并正常关闭。PresentMon 记录放在 capture。
+同时检查模型、卡片列表、属性文字、装备状态和切换后显示是否正常。
+
+对照与回退
+A 与 B 都精确替换上述版本的同一资源，排除下载速度差异。校验本地文件 SHA256 后才启用。
+只处理 aola.100bt.com 的指定 GET 路径；其他版本、其他域名、带请求体或 POST 均保持原请求。
+native 日志中的 “Aola pet SWF replacement hit” 表示实际命中，optimized 字段区分 A/B。
+如果官方更新资源文件名，补丁不会覆盖新版本；没有命中记录时不得当作补丁生效。
+使用 A 即可回退到官方背包原件；原先 tick-profile 测试目录及其 EXE 均保留。
+run-aola-50fps.cmd 不启用替换，可用于当前线上官方资源路径核对。
+
+新增日志口径（schema 5）
+performance-*.jsonl 的 petDetailResponses.responses 每项是一个完整响应，sequence 为当前 Player 内编号。
+stage 表明根调用发生在 sockets 等 tick 阶段，或直接由输入触发的 outsideTick；后者不计入 tick 阶段合计。
+methods.calls 统计全部经过 AVM2 exec 边界的调用，含快调用；inclusiveMs 包含子调用，不能相加。
+selfMs 扣除被记录的子方法调用，可用于区别解释器脚本本体和原生方法；原生方法内部没有进一步拆分。
+category 按编译方法名区分 detailData、timeline、text、displayList、listRefresh、resource 与其他调用。
+例如 TextField 原生方法内的排版/字形工作仍属于该方法，不能把 category 当作精确的底层 CPU 分类。
+resourceCreationMs/timedResourceCreations 是同一次响应内渲染器资源创建计数的差值；
+meshRegistrationMs、queueSubmitMs 是同一次响应内对应累计计数的差值，可能嵌套，不能与方法或响应时间相加。
+这些仅统计同步发生的工作；响应结束后才完成的异步加载仍由既有 tick/慢回调与绘制计时记录。
+每个响应至多保存 1024 种来源，每次采样至多保存 16 个响应；检查 unlistedCalls、unlistedSelfMs 和 droppedResponses。
+bookkeepingMs 仅为部分计数维护开销；首次方法名提取、计时器开销及日志写出并未完整扣除。
+该详细诊断会增加成本，因此 A/B 必须使用本轮同一 EXE，不能直接拿 B 与旧诊断版宣称速度收益。
+只保存方法元数据和计数，不记录宠物/账号 ID、回调参数或网络包，不持有游戏 GC 对象。
+
+结论边界
+当前官方版本仍存在重复构建，提供的旧补丁没有修改 PetDetailDataMap。
+旧补丁对过期异步回调和显示对象释放的处理可作后续参考；其版本与现版不同，且混有形态桥逻辑，本轮未整体移植。
+本轮只去掉两处明确重复，不能预先保证解决全部 0.4–1.5 秒详情卡顿。
+SWF 静态检查与宿主自动测试不能替代在线加载验收；改善程度、实际命中和兼容性等待手动 A/B 日志确认。
+
+构建：tools/build.ps1 -Variant pet-detail
+补丁重建及证据：evidence/pet-detail-20261106/rebuild-swf.ps1、metadata、verification-v4。

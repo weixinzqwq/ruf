@@ -2,10 +2,14 @@
 /*
 !/.gitignore
 !/engine/
+!/native-core/
 !/tools/
 !/source/
 /source/*
 !/source/launcher-bridge/
+/source/launcher-bridge/evidence/
+/source/launcher-bridge/decompiled/
+/source/launcher-bridge/fixtures/*.log
 !/*.md
 !/*.cmd
 !/*TEST.txt

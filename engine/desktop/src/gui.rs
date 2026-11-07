@@ -45,6 +45,8 @@ pub struct RuffleGui {
     context_menu: Option<ContextMenu>,
     dialogs: Dialogs,
     menu_bar: MenuBar,
+    #[cfg(windows)]
+    aola_tools: Option<crate::aola_tools::Tools>,
 
     was_suspended_before_debug: bool,
     preferences: GlobalPreferences,
@@ -59,6 +61,10 @@ impl RuffleGui {
         preferences: GlobalPreferences,
     ) -> Self {
         Self {
+            #[cfg(windows)]
+            aola_tools: if preferences.cli.aola_tools {
+                Some(crate::aola_tools::Tools::new(preferences.cli.aola_data_dir.as_ref().expect("Aola data root"), preferences.cli.frame_rate))
+            } else { None },
             was_suspended_before_debug: false,
 
             context_menu: None,
@@ -90,6 +96,12 @@ impl RuffleGui {
         menu_height_offset: f64,
     ) {
         let locale = self.preferences.language();
+
+        #[cfg(windows)]
+        if let Some(tools) = &mut self.aola_tools {
+            tools.update(egui_ctx, egui_ui, player.as_deref_mut());
+            return;
+        }
 
         self.menu_bar
             .consume_shortcuts(egui_ctx, &mut self.dialogs, player.as_deref_mut());
@@ -161,6 +173,11 @@ impl RuffleGui {
 
     /// Notifies the GUI that the player has been destroyed.
     fn on_player_destroyed(&mut self) {
+        #[cfg(windows)]
+        if let Some(tools) = &mut self.aola_tools {
+            crate::aola_tools::network::reset();
+            tools.destroyed();
+        }
         self.dialogs.close_dialogs_with_notifiers();
     }
 
@@ -178,5 +195,7 @@ impl RuffleGui {
             .recreate_open_dialog(opt, Some(content_descriptor), self.event_loop.clone());
 
         player.set_volume(self.dialogs.volume_controls.get_volume());
+        #[cfg(windows)]
+        if let Some(tools) = &mut self.aola_tools { tools.created(&mut player); }
     }
 }

@@ -328,8 +328,22 @@ impl ActivePlayer {
             }
         });
 
+        #[cfg(windows)]
+        {
+            builder = if preferences.cli.aola_tools {
+                crate::aola_tools::network::reset();
+                builder.with_navigator(crate::aola_tools::network::AolaNavigator::new(navigator))
+            } else { builder.with_navigator(navigator) };
+        }
+        #[cfg(not(windows))]
+        { builder = builder.with_navigator(navigator); }
+        let frame_rate = if aoqi_host_enabled { None } else { opt.player.frame_rate };
+        #[cfg(windows)]
+        let frame_rate = if preferences.cli.aola_tools {
+            // Keep the toolbar authoritative when the game changes stage.frameRate.
+            Some(preferences.cli.frame_rate.unwrap_or(50.0))
+        } else { frame_rate };
         builder = builder
-            .with_navigator(navigator)
             .with_renderer(renderer)
             .with_storage(preferences.storage_backend().create_backend(&opt))
             .with_notification_sender(notification_sender)
@@ -364,7 +378,7 @@ impl ActivePlayer {
             .with_page_url(opt.player.spoof_url.clone().map(|url| url.to_string()))
             .with_player_version(opt.player.player_version)
             .with_player_runtime(opt.player.player_runtime.unwrap_or_default())
-            .with_frame_rate(if aoqi_host_enabled { None } else { opt.player.frame_rate })
+            .with_frame_rate(frame_rate)
             .with_avm2_optimizer_enabled(opt.avm2_optimizer_enabled);
         if aoqi_host_enabled {
             let (width, height) = GuiController::AOQI_RENDER_SIZE;
