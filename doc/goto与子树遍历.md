@@ -28,6 +28,8 @@
 
 ## 当前测试操作
 
+截至2026-11-21，现有B组分析记录了9次详情响应，详情处理累计9292.18ms，平均约1032ms/次。补采A组时以每次响应耗时比较；两组还需核对对象规模与操作顺序。
+
 1. 关闭旧程序，在新目录运行[同包A控制入口](../dist/aola-subtree-scripts-test-20261109/run-subtree-A-control.cmd)，手动登录。
 2. 与B保持相同地图、窗口和约8只亚比顺序，每只停约2秒；关闭背包等5秒后正常退出，记录结束时间和显示情况。
 3. 需要重做B时运行[同包B优化入口](../dist/aola-subtree-scripts-test-20261109/run-subtree-B-optimized.cmd)。两个入口只有新优化开关及独立数据目录不同。
@@ -35,3 +37,5 @@
 5. 用`src/tools/analyze-performance.py --a <A日志或diagnostics目录> --b <B日志或目录> --output <输出JSON>`复算。核对窗口、版本、响应数、丢弃数和结束标记，再比较每响应耗时、访问量和orphan规模。
 
 历史B日志在`doc/evidence/runtime/aola-subtree-scripts-test-20261109/aola-data-subtree-B/diagnostics`，原登录资料未迁移。当前不叠加构建遍历或卡片统计优化，不直接跳过同帧goto。上一轮[定位版](../dist/aola-goto-profile-test-20261107/run-goto-profile.cmd)保留用于回退定位。
+
+11 月 21 日另一轮实机采集显示，最后一次切换中，仅嵌套 goto 对无父对象的构造、脚本遍历就用了 1.451 秒。新的独立对照将上述子树脚本开关固定为关，只测嵌套 goto 中无父 MovieClip 子树的叶节点优化。首轮合成实验 12 对中有 11 对候选较快。[实机热点、候选与对照入口](背包详情与SWF去重.md#新引擎候选与同包验证)

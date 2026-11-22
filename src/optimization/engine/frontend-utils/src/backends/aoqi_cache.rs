@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
+mod budget;
+
 const MAGIC: &[u8; 8] = b"AOQIC001";
 const MAX_RESOURCE: usize = 128 * 1024 * 1024;
 const MAX_METADATA: usize = 16 * 1024;
@@ -21,6 +23,7 @@ const MAX_METADATA: usize = 16 * 1024;
 pub struct AoqiCache {
     root: PathBuf,
     entries: PathBuf,
+    budget: Option<Arc<budget::DiskBudget>>,
 }
 
 pub struct CachedResource {
@@ -38,7 +41,18 @@ impl AoqiCache {
         let entries = root.join("v1");
         fs::create_dir_all(&entries)?;
         no_link(&entries)?;
-        Ok(Self { root, entries })
+        Ok(Self { root, entries, budget: None })
+    }
+
+    pub(super) fn for_aola(root: PathBuf) -> io::Result<Self> {
+        let mut cache = Self::new(root)?;
+        if let Some(limit) = budget::configured_limit(std::env::var("AOLA_DISK_CACHE_BUDGET_MB").ok().as_deref()) {
+            match budget::DiskBudget::start(&cache.entries, limit) {
+                Ok(budget) => cache.budget = Some(budget),
+                Err(error) => tracing::warn!("Static cache budget unavailable: {error}"),
+            }
+        }
+        Ok(cache)
     }
 
     pub fn root(&self) -> &Path { &self.root }
@@ -66,7 +80,11 @@ impl AoqiCache {
             Err(error) => return Err(error),
             Ok(_) => no_link(&path)?,
         }
-        let mut file = File::open(path)?;
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let length = file.metadata()?.len();
         if length > (MAX_RESOURCE + MAX_METADATA + 12) as u64 { return Ok(None); }
         let mut header = [0_u8; 12];
@@ -135,10 +153,14 @@ impl AoqiCache {
             file.write_all(bytes)?;
             file.sync_all()?;
             drop(file);
-            fs::rename(&temporary, &path)
+            if let Some(budget) = &self.budget {
+                budget.publish(&temporary, &path)
+            } else {
+                fs::rename(&temporary, &path).map(|_| true)
+            }
         })();
-        if result.is_err() { let _ = fs::remove_file(temporary); }
-        result.map(|_| true)
+        if !matches!(result, Ok(true)) { let _ = fs::remove_file(temporary); }
+        result
     }
 
     /// Read actual disk contents, including files copied by cache migration. Never
@@ -152,9 +174,10 @@ impl AoqiCache {
         let mut pending = vec![self.root.clone()];
         while let Some(directory) = pending.pop() {
             no_link(&directory)?;
-            for entry in fs::read_dir(directory)? {
+            for entry in fs::read_dir(&directory)? {
                 let entry = entry?;
                 let path = entry.path();
+                if directory == self.entries && entry.file_name() == budget::LOCK_NAME { continue; }
                 no_link(&path)?;
                 let metadata = entry.metadata()?;
                 if metadata.is_dir() { pending.push(path); }
@@ -183,12 +206,15 @@ fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default
 fn hash(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
 fn no_link(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
+    if is_link(&metadata) { Err(io::Error::other("Cache directory contains a link or reparse point")) }
+    else { Ok(()) }
+}
+fn is_link(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
     let reparse = { use std::os::windows::fs::MetadataExt; metadata.file_attributes() & 0x400 != 0 };
     #[cfg(not(windows))]
     let reparse = false;
-    if metadata.file_type().is_symlink() || reparse { Err(io::Error::other("Cache directory contains a link or reparse point")) }
-    else { Ok(()) }
+    metadata.file_type().is_symlink() || reparse
 }
 
 fn public_resource_url(url: &Url) -> bool {

@@ -89,6 +89,51 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     profiler: GpuProfiler,
     bitmap_cache_budget: u64,
     bitmap_caches: BitmapCachePool,
+    #[cfg(windows)]
+    cache_pressure: Option<crate::dxgi_cache_pressure::CachePressure>,
+}
+
+#[cfg(all(test, windows))]
+#[test]
+#[ignore = "requires DX12; verifies pressure policy against real cache handles"]
+fn dx12_cache_pressure_preserves_hot_filters_and_restores_user_limits() {
+    use crate::dxgi_cache_pressure::{CachePressure, memory_usage};
+    use windows::Win32::Graphics::Dxgi::DXGI_MEMORY_SEGMENT_GROUP_LOCAL;
+    let mut renderer = WgpuRenderBackend::for_offscreen(
+        (64, 64), wgpu::Backends::DX12, wgpu::PowerPreference::HighPerformance,
+    ).unwrap();
+    let enabled = std::env::var("AOLA_DXGI_CACHE_PRESSURE").as_deref() == Ok("1");
+    assert_eq!(renderer.cache_pressure.is_some(), enabled);
+    let (usage, budget) = memory_usage(&renderer.descriptors.adapter, DXGI_MEMORY_SEGMENT_GROUP_LOCAL).unwrap();
+    assert!(budget > 0);
+    println!("DXGI local usage={usage} budget={budget}; applying synthetic pressure samples");
+    let limits = TexturePoolLimits { idle_bytes: 16 * 1024 * 1024, idle_frames: 120 };
+    renderer.cache_pressure.get_or_insert_with(|| CachePressure::new(limits));
+    renderer.set_texture_pool_limits(limits);
+    let before_submit = std::time::Instant::now();
+    renderer.submit_frame(Color::BLACK, CommandList::new(), Vec::new());
+    assert!(!renderer.cache_pressure.as_mut().unwrap().due(before_submit));
+    renderer.bitmap_cache_budget = 2 * 65536;
+    let size = NonZeroU32::new(16).unwrap();
+    let cold = renderer.create_bitmap_cache_texture(size, size).unwrap();
+    let in_flight = cold.get().unwrap();
+    renderer.bitmap_caches.end_frame();
+    renderer.bitmap_caches.end_frame();
+    let hot = renderer.create_bitmap_cache_texture(size, size).unwrap();
+    renderer.apply_cache_pressure(Some((90, 100)));
+    assert_eq!(renderer.texture_pool.idle_limit(), limits.idle_bytes / 2);
+    assert!(!cold.is_valid() && hot.is_valid());
+    assert_eq!(as_texture(&in_flight).texture.width(), 16);
+    // Pending drawing still owns the allocation until submission releases it.
+    drop(in_flight);
+    let next = renderer.create_bitmap_cache_texture(size, size).unwrap();
+    assert!(hot.is_valid() && next.is_valid());
+    assert!(renderer.bitmap_caches.reserved_bytes > renderer.bitmap_cache_budget / 2);
+    let updated = TexturePoolLimits { idle_bytes: 8 * 1024 * 1024, ..limits };
+    renderer.set_texture_pool_limits(updated);
+    assert_eq!(renderer.offscreen_texture_pool.idle_limit(), updated.idle_bytes / 2);
+    for _ in 0..3 { renderer.apply_cache_pressure(Some((50, 100))); }
+    assert_eq!(renderer.texture_pool.idle_limit(), updated.idle_bytes);
 }
 
 impl WgpuRenderBackend<SwapChainTarget> {
@@ -224,6 +269,15 @@ impl WgpuRenderBackend<crate::target::TextureTarget> {
 
 impl<T: RenderTarget> WgpuRenderBackend<T> {
     pub fn new(descriptors: Arc<Descriptors>, target: T) -> Result<Self, Error> {
+        Self::new_with_quality(descriptors, target, StageQuality::Low)
+    }
+
+    /// Prepare the pipelines needed by the first frame at the requested quality.
+    pub fn new_with_quality(
+        descriptors: Arc<Descriptors>,
+        target: T,
+        quality: StageQuality,
+    ) -> Result<Self, Error> {
         if target.width() > descriptors.limits.max_texture_dimension_2d
             || target.height() > descriptors.limits.max_texture_dimension_2d
         {
@@ -236,13 +290,17 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
                 .into());
         }
 
+        let target_format = target.format();
         let surface = Surface::new(
             &descriptors,
-            StageQuality::Low,
+            quality,
             target.width(),
             target.height(),
-            target.format(),
+            target_format,
         );
+        // draw_commands_and_copy_to always copies the resolved image to a
+        // single-sample presentation target, including when the stage uses MSAA.
+        descriptors.copy_pipeline(target_format, 1);
 
         // These finite defaults are reconstruction choices, not recovered ABI.
         let readback_budget = byte_budget(std::env::var("AOQI_READBACK_IDLE_BUDGET_MB").ok().as_deref(), 64);
@@ -294,6 +352,10 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         offscreen_texture_pool.set_limits(limits);
 
         Ok(Self {
+            #[cfg(windows)]
+            cache_pressure: (descriptors.backend == wgpu::Backend::Dx12
+                && std::env::var("AOLA_DXGI_CACHE_PRESSURE").as_deref() == Ok("1"))
+                .then(|| crate::dxgi_cache_pressure::CachePressure::new(limits)),
             descriptors,
             target,
             surface,
@@ -382,8 +444,46 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
     }
 
     pub fn set_texture_pool_limits(&mut self, limits: TexturePoolLimits) {
+        #[cfg(windows)]
+        let limits = if let Some(pressure) = &mut self.cache_pressure {
+            pressure.configured_pool = limits;
+            pressure.pool_limits()
+        } else {
+            limits
+        };
         self.texture_pool.set_limits(limits);
         self.offscreen_texture_pool.set_limits(limits);
+    }
+
+    #[cfg(windows)]
+    fn poll_cache_pressure(&mut self) {
+        use windows::Win32::Graphics::Dxgi::DXGI_MEMORY_SEGMENT_GROUP_LOCAL;
+        let Some(pressure) = &mut self.cache_pressure else { return; };
+        if pressure.due(std::time::Instant::now()) {
+            let sample = crate::dxgi_cache_pressure::memory_usage(
+                &self.descriptors.adapter, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
+            );
+            self.apply_cache_pressure(sample);
+        }
+    }
+
+    #[cfg(windows)]
+    fn apply_cache_pressure(&mut self, sample: Option<(u64, u64)>) {
+        let Some(pressure) = &mut self.cache_pressure else { return; };
+        if pressure.observe(sample) {
+            let limits = pressure.pool_limits();
+            self.texture_pool.set_limits(limits);
+            self.offscreen_texture_pool.set_limits(limits);
+            tracing::info!(
+                reduced = pressure.reduced, idle_pool_limit = limits.idle_bytes, ?sample,
+                "DXGI cache pressure changed"
+            );
+        }
+        if pressure.reduced && sample.is_some_and(|(_, budget)| budget > 0) {
+            // Filters can need these textures to draw correctly. Shrink cold
+            // ownership at sample time, preserving the normal allocation ceiling.
+            self.bitmap_caches.make_room(0, self.bitmap_cache_budget / 2);
+        }
     }
 
     fn register_shape_internal(
@@ -591,15 +691,13 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 stats.native_sampler_buffers = Some(convert(sampler));
             }
             use windows::Win32::Graphics::Dxgi::{DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL};
-            // Read-only query while the wgpu adapter guard keeps the native adapter alive.
-            if let Some(adapter) = unsafe { self.descriptors.adapter.as_hal::<wgpu::hal::api::Dx12>() } {
-                if let Ok(info) = adapter.raw_adapter().query_video_memory_info(DXGI_MEMORY_SEGMENT_GROUP_LOCAL) {
-                    stats.local_usage = Some(info.CurrentUsage);
-                    stats.local_budget = Some(info.Budget);
-                }
-                if let Ok(info) = adapter.raw_adapter().query_video_memory_info(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL) {
-                    stats.non_local_usage = Some(info.CurrentUsage);
-                    stats.non_local_budget = Some(info.Budget);
+            for (segment, usage, budget) in [
+                (DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut stats.local_usage, &mut stats.local_budget),
+                (DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut stats.non_local_usage, &mut stats.non_local_budget),
+            ] {
+                if let Some((used, limit)) = crate::dxgi_cache_pressure::memory_usage(&self.descriptors.adapter, segment) {
+                    *usage = Some(used);
+                    *budget = Some(limit);
                 }
             }
         }
@@ -891,6 +989,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             .submit_for_target(&self.descriptors, &self.target, frame_output);
         let cleanup_started = web_time::Instant::now();
         self.texture_pool.end_frame();
+        #[cfg(windows)]
+        self.poll_cache_pressure();
         self.bitmap_caches.end_frame();
         // Temporary targets now share the bounded cache and can survive across
         // frames. Render passes initialize their contents before reading them.

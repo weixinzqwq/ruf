@@ -535,6 +535,14 @@ impl Player {
 
     pub fn enable_tick_profiling(&mut self) { self.tick_profile.stats.enabled = true; }
 
+    pub fn set_pet_detail_mode(&mut self, mode: crate::pet_detail_profile::DetailMode) {
+        self.tick_profile.detail_mode = mode;
+    }
+
+    pub fn pet_detail_mode(&self) -> crate::pet_detail_profile::DetailMode {
+        self.tick_profile.detail_mode
+    }
+
     pub fn take_pet_detail_profile(&self) -> (Vec<crate::pet_detail_profile::ResponseCost>, u64) {
         self.tick_profile.detail.borrow_mut().take()
     }

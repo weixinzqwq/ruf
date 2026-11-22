@@ -1,0 +1,141 @@
+// The caller must first match the received package against the fixed 2026111953323155
+// reference. This checks the permitted relation between its uncompressed movie body
+// and the archived candidate (SWF file headers excluded).
+const ORIGINAL_SIZE: usize = 2_197_537;
+const CANDIDATE_SIZE: usize = 2_197_786;
+
+// Original body offsets, old bytes, new bytes. Regenerate with patch_skin.py.
+// These are the DoABC length, ABC pool additions and 13 reviewed method-body edits.
+#[rustfmt::skip]
+const EDITS: &[(usize, &[u8], &[u8])] = &[
+    // DoABC length
+    (1980781, &[0x3b, 0x3b], &[0x34, 0x3c]),
+    // ABC string pool
+    (1980934, &[0xb8], &[0xba]),
+    (2043098, &[], &[
+        0x0a, 0x6d, 0x61, 0x73, 0x74, 0x65, 0x72, 0x4c, 0x69, 0x73, 0x74, 0x04,
+        0x6b, 0x69, 0x6c, 0x6c,
+    ]),
+    // ABC multiname pool
+    (2046380, &[0xf1], &[0xf4]),
+    (2061811, &[], &[0x07, 0x02, 0x82, 0x13, 0x07, 0x02, 0xb8, 0x1c, 0x07, 0x02, 0xb9, 0x1c]),
+    // PackageSkinManager.joinNormals
+    (2097202, &[0x20], &[0x29]),
+    (2097205, &[], &[0xd0, 0x66, 0xdd, 0x01, 0x11, 0x01, 0x00, 0x00, 0x47]),
+    // PackageSkinManager.joinSimple
+    (2097243, &[0x3c], &[0x45]),
+    (2097246, &[], &[0xd0, 0x66, 0xdd, 0x01, 0x11, 0x01, 0x00, 0x00, 0x47]),
+    // PackageSkinManager.init
+    (2097393, &[0x61], &[0x6a]),
+    (2097396, &[], &[0xd0, 0x66, 0xdd, 0x01, 0x11, 0x01, 0x00, 0x00, 0x47]),
+    // PackageSkinManager.changeClassify
+    (2097515, &[0x67], &[0x70]),
+    (2097518, &[], &[0xd0, 0x66, 0xdd, 0x01, 0x11, 0x01, 0x00, 0x00, 0x47]),
+    // PackageSkinManager.dispose
+    (2097653, &[0x01], &[0x03]),
+    (2097656, &[0x0a], &[0x36]),
+    (2097659, &[], &[
+        0xd0, 0x66, 0xdd, 0x01, 0xd5, 0xd0, 0x20, 0x61, 0xdd, 0x01, 0xd1, 0x12,
+        0x15, 0x00, 0x00, 0x24, 0x00, 0xd6, 0x10, 0x07, 0x00, 0x00, 0x09, 0xd1,
+        0xd2, 0x23, 0x4f, 0x53, 0x00, 0x32, 0x01, 0x02, 0x11, 0xf2, 0xff, 0xff,
+        0x60, 0xae, 0x10, 0xd0, 0x1a, 0x07, 0x00, 0x00,
+    ]),
+    // Style.dispose
+    (2098060, &[0x15], &[0x27]),
+    (2098064, &[0x20, 0x61, 0xed], &[0x66, 0xf0]),
+    (2098068, &[], &[0x12, 0x08, 0x00, 0x00]),
+    (2098080, &[], &[
+        0x01, 0xd0, 0x20, 0x61, 0xed, 0x01, 0xd0, 0x20, 0x61, 0xf1, 0x01, 0xd0,
+        0x20, 0x61, 0xf2,
+    ]),
+    // MotionBase.appear
+    (2098524, &[0x51], &[0x58]),
+    (2098601, &[0x4f], &[0x46]),
+    (2098605, &[], &[0xd0, 0x66, 0xfe, 0x01, 0x61, 0xf1, 0x1b]),
+    // MotionBase.dispose
+    (2098635, &[0x01], &[0x04]),
+    (2098638, &[0x0d], &[0x5e]),
+    (2098641, &[], &[
+        0xd0, 0x66, 0xfe, 0x01, 0x12, 0x44, 0x00, 0x00, 0x60, 0xaa, 0x13, 0x66,
+        0xf2, 0x1b, 0xd0, 0x66, 0xff, 0x01, 0x66, 0xa9, 0x13, 0xd5, 0xd1, 0x12,
+        0x31, 0x00, 0x00, 0x24, 0x00, 0xd6, 0x10, 0x23, 0x00, 0x00, 0x09, 0xd1,
+        0xd2, 0x23, 0xd7, 0xd3, 0x66, 0xf1, 0x1b, 0xd0, 0x66, 0xfe, 0x01, 0x1a,
+        0x12, 0x00, 0x00, 0xd3, 0x20, 0x61, 0xf1, 0x1b, 0xd3, 0x66, 0xae, 0x14,
+        0x11, 0x05, 0x00, 0x00, 0xd3, 0x4f, 0xf3, 0x1b, 0x00, 0x32, 0x01, 0x02,
+        0x11, 0xd6, 0xff, 0xff,
+    ]),
+    (2098646, &[], &[0xd0, 0x20, 0x61, 0x80, 0x02]),
+    // MotionLeft.disappear
+    (2099055, &[0x27], &[0x2e]),
+    (2099090, &[0x4f], &[0x46]),
+    (2099094, &[], &[0xd0, 0x66, 0xfe, 0x01, 0x61, 0xf1, 0x1b]),
+    // MotionDown.disappear
+    (2099196, &[0x27], &[0x2e]),
+    (2099231, &[0x4f], &[0x46]),
+    (2099235, &[], &[0xd0, 0x66, 0xfe, 0x01, 0x61, 0xf1, 0x1b]),
+    // MotionRight.disappear
+    (2099342, &[0x27], &[0x2e]),
+    (2099377, &[0x4f], &[0x46]),
+    (2099381, &[], &[0xd0, 0x66, 0xfe, 0x01, 0x61, 0xf1, 0x1b]),
+    // MotionUp.disappear
+    (2099483, &[0x27], &[0x2e]),
+    (2099518, &[0x4f], &[0x46]),
+    (2099522, &[], &[0xd0, 0x66, 0xfe, 0x01, 0x61, 0xf1, 0x1b]),
+    // MotionNormal.disappear
+    (2099625, &[0x2a], &[0x31]),
+    (2099663, &[0x4f], &[0x46]),
+    (2099667, &[], &[0xd0, 0x66, 0xfe, 0x01, 0x61, 0xf1, 0x1b]),
+];
+
+pub(super) fn matches_skin_candidate(original_body: &[u8], candidate_body: &[u8]) -> bool {
+    if original_body.len() != ORIGINAL_SIZE || candidate_body.len() != CANDIDATE_SIZE {
+        return false;
+    }
+    let mut original_pos = 0;
+    let mut candidate_pos = 0;
+    for &(offset, old, new) in EDITS {
+        let candidate_edit = candidate_pos + (offset - original_pos);
+        if original_body[original_pos..offset] != candidate_body[candidate_pos..candidate_edit]
+            || &original_body[offset..offset + old.len()] != old
+            || &candidate_body[candidate_edit..candidate_edit + new.len()] != new
+        {
+            return false;
+        }
+        original_pos = offset + old.len();
+        candidate_pos = candidate_edit + new.len();
+    }
+    original_body[original_pos..] == candidate_body[candidate_pos..]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_the_exact_edits_and_unchanged_ranges() {
+        // Synthetic contents test the delta in isolation. The loader separately checks
+        // the actual response, local reference, version and shared TweenLite resource.
+        let mut source = vec![0; ORIGINAL_SIZE];
+        let mut candidate = Vec::new();
+        let mut pos = 0;
+        for &(start, old, new) in EDITS {
+            candidate.extend_from_slice(&source[pos..start]);
+            candidate.extend_from_slice(new);
+            pos = start + old.len();
+            source[start..pos].copy_from_slice(old);
+        }
+        candidate.extend_from_slice(&source[pos..]);
+        assert!(matches_skin_candidate(&source, &candidate));
+
+        for index in [0, EDITS[0].0, CANDIDATE_SIZE - 1] {
+            candidate[index] ^= 1;
+            assert!(!matches_skin_candidate(&source, &candidate));
+            candidate[index] ^= 1;
+        }
+        source[EDITS[0].0] ^= 1;
+        assert!(!matches_skin_candidate(&source, &candidate));
+        source[EDITS[0].0] ^= 1;
+        assert!(!matches_skin_candidate(&source[..source.len() - 1], &candidate));
+        assert!(!matches_skin_candidate(&source, &candidate[..candidate.len() - 1]));
+    }
+}

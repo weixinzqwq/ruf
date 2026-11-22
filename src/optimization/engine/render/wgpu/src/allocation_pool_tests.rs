@@ -27,6 +27,15 @@ fn dx12_allocation_pool_pressure() {
     assert_eq!(hot_misses, 0);
     println!("allocation_pool hot_misses={hot_misses} idle_allocation_bytes={} descriptor_bytes={} native_bytes={}",
         pool.idle_stats().0,initial.live_estimated_bytes,initial.live_allocation_bytes);
+    let held = take(&mut pool, 32);
+    pool.set_limits(TexturePoolLimits { idle_bytes: 16 * 1024 * 1024, idle_frames: 120 });
+    let retained = pool.idle_stats().0;
+    assert!(retained > 0 && retained <= 16 * 1024 * 1024);
+    pool.set_limits(TexturePoolLimits { idle_bytes: 0, idle_frames: 120 });
+    assert_eq!(pool.idle_stats().0, 0);
+    assert_eq!(held.0.width(), 32);
+    drop(held);
+    assert_eq!(pool.idle_stats().0, 0);
     drop(pool);
     assert_eq!(renderer.resource_stats().unwrap().temporary_texture.live_allocation_bytes, 0);
 }

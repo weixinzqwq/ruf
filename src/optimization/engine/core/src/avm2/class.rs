@@ -614,7 +614,19 @@ impl<'gc> Class<'gc> {
         let traits = traits
             .iter()
             .map(|abc_traits| Trait::from_abc_trait(unit, abc_traits, activation))
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<Box<[_]>, _>>()?;
+        let owner = self.name();
+        if let Some(root) = crate::pet_detail_profile::DetailRoot::for_class(
+            owner.local_name().as_wstr(), owner.namespace().as_uri_opt().as_deref(),
+        ) {
+            for t in &traits {
+                if t.name().local_name().as_wstr() == root.member()
+                    && let TraitKind::Method { method, .. } = t.kind()
+                {
+                    method.mark_detail_root(root);
+                }
+            }
+        }
         let write = Gc::write(activation.gc(), self.0);
         let _ = unlock!(write, ClassData, traits).set(traits);
         Ok(())

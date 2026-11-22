@@ -16,6 +16,9 @@ pub(crate) enum TickWork { Other, Frames, AudioSync, Sockets, NetConnections, Ti
 #[repr(usize)]
 pub(crate) enum CallbackKind { Timer, Event, Function }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DetailCall { Untracked, FullRoot, FullChild, SummaryRoot }
+
 #[derive(Clone, Copy, Debug)]
 pub struct TickStats {
     pub enabled: bool,
@@ -64,6 +67,7 @@ pub(crate) struct CallbackToken {
 pub(crate) struct TickProfiler {
     pub stats: TickStats,
     pub detail: RefCell<crate::pet_detail_profile::DetailProfiler>,
+    pub detail_mode: crate::pet_detail_profile::DetailMode,
     pub goto: crate::goto_profile::GotoProfiler,
     active: Option<TickWork>,
     since: Instant,
@@ -73,7 +77,7 @@ pub(crate) struct TickProfiler {
 
 impl Default for TickProfiler {
     fn default() -> Self {
-        Self { detail: RefCell::default(), goto: Default::default(), stats: TickStats::default(), active: None, since: Instant::now(), callback_depth: 0, slow: RefCell::new(Vec::new()) }
+        Self { detail: RefCell::default(), detail_mode: Default::default(), goto: Default::default(), stats: TickStats::default(), active: None, since: Instant::now(), callback_depth: 0, slow: RefCell::new(Vec::new()) }
     }
 }
 
@@ -127,6 +131,40 @@ impl TickProfiler {
     }
 
     pub fn detail_stage(&self) -> Option<usize> { self.active.map(|s| s as usize) }
+
+    #[inline]
+    pub fn begin_detail<'a>(&self, root: Option<crate::pet_detail_profile::DetailRoot>, name: impl FnOnce() -> &'a str) -> DetailCall {
+        use crate::pet_detail_profile::DetailMode;
+        match self.detail_mode {
+            DetailMode::Summary => {
+                // Ordinary methods do not borrow the collector, inspect a name,
+                // or read a clock. A nested root belongs to the outer response.
+                if let Some(root) = root && self.detail_scope_active()
+                    && self.detail.borrow_mut().begin_summary(root, self.detail_stage())
+                {
+                    return DetailCall::SummaryRoot;
+                }
+            }
+            DetailMode::Full if self.detail_scope_active() => {
+                let mut detail = self.detail.borrow_mut();
+                let nested = detail.active();
+                if detail.begin(name()) {
+                    return if nested { DetailCall::FullChild } else { DetailCall::FullRoot };
+                }
+            }
+            DetailMode::Full => {}
+        }
+        DetailCall::Untracked
+    }
+
+    #[inline]
+    pub fn finish_detail(&self, call: DetailCall) {
+        match call {
+            DetailCall::SummaryRoot => self.detail.borrow_mut().finish_summary(),
+            DetailCall::FullChild | DetailCall::FullRoot => self.detail.borrow_mut().finish(),
+            DetailCall::Untracked => {}
+        }
+    }
 
     pub fn outer_function_active(&self) -> bool { self.callbacks_active() && self.callback_depth == 0 }
 
@@ -195,6 +233,67 @@ fn resource_leaf(url: &str) -> String {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn aola_summary_skips_method_names_and_child_accounting() {
+        use crate::pet_detail_profile::{DetailMode, DetailRoot};
+        let mut profile = TickProfiler::default();
+        profile.detail_mode = DetailMode::Summary;
+        let unnamed = || -> &'static str { panic!("summary must never resolve a profile name") };
+        let root = Some(DetailRoot::ViewSinglePet);
+        assert_eq!(profile.begin_detail(root, unnamed), DetailCall::Untracked);
+        profile.stats.enabled = true;
+        profile.begin(Instant::now());
+        profile.switch(TickWork::Frames);
+        assert_eq!(profile.begin_detail(root, unnamed), DetailCall::Untracked);
+        profile.finish(Instant::now());
+        for _ in 0..18 {
+            let outer = profile.begin_detail(root, unnamed);
+            assert_eq!(outer, DetailCall::SummaryRoot);
+            // A regular child must not even borrow the collector.
+            let guard = profile.detail.borrow_mut();
+            assert_eq!(profile.begin_detail(None, unnamed), DetailCall::Untracked);
+            drop(guard);
+            let nested = profile.begin_detail(Some(DetailRoot::DispatchCachedDetail), unnamed);
+            assert_eq!(nested, DetailCall::Untracked);
+            profile.finish_detail(nested);
+            profile.finish_detail(outer);
+        }
+        let (rows, dropped) = profile.detail.borrow_mut().take();
+        assert_eq!((rows.len(), dropped), (16, 2));
+        assert!(rows.iter().all(|r| r.root == root && r.stage.is_none() && r.methods.is_empty()));
+    }
+
+    #[test]
+    fn aola_detail_modes_preserve_nested_exception_and_next_response() {
+        use crate::pet_detail_profile::{DetailMode, DetailRoot};
+        use std::sync::{Arc, Mutex};
+        struct Trace(Arc<Mutex<Vec<String>>>);
+        impl crate::backend::log::LogBackend for Trace {
+            fn avm_trace(&self, text: &str) { self.0.lock().unwrap().push(text.to_owned()); }
+            fn avm_warning(&self, _: &str) {}
+        }
+        let census = std::env::var("AOLA_ORPHAN_CENSUS").as_deref() == Ok("1");
+        for mode in [DetailMode::Summary, DetailMode::Full] {
+            let movie = crate::tag_utils::SwfMovieData::from_data(
+                include_bytes!("../../tests/tests/swfs/avm2/aola_detail_roots/test.swf"),
+                "file:///aola_detail_roots.swf".into(), None, None).unwrap();
+            let trace = Arc::new(Mutex::new(Vec::new()));
+            let player = crate::PlayerBuilder::new().with_movie(movie).with_autoplay(true).with_log(Trace(trace.clone())).build();
+            let mut player = player.lock().unwrap();
+            player.enable_tick_profiling();
+            player.set_pet_detail_mode(mode);
+            for _ in 0..10 { player.tick(ruffle_common::duration::FloatDuration::from_millis(40.0)); }
+            assert_eq!(*trace.lock().unwrap(), ["fixture", "complete"]);
+            let (rows, dropped) = player.take_pet_detail_profile();
+            assert_eq!(dropped, 0);
+            let roots = rows.iter().map(|r| (r.sequence, r.root, r.stage)).collect::<Vec<_>>();
+            let stage = Some(TickWork::Timers as usize);
+            assert_eq!(roots, [(1, Some(DetailRoot::ViewSinglePet), stage), (2, Some(DetailRoot::DispatchCachedDetail), stage)]);
+            assert!(rows.iter().all(|r| r.total_ns > 0 && r.methods.is_empty() == (mode == DetailMode::Summary)));
+            assert!(rows.iter().all(|r| r.orphan_census.is_some() == (mode == DetailMode::Full && census)));
+        }
+    }
 
     #[test]
     fn aola_detail_scope_includes_host_input_without_changing_tick_callbacks() {

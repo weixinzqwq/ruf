@@ -15,7 +15,7 @@ use ruffle_core::events::{GamepadButton, KeyCode};
 use ruffle_core::font::DefaultFont;
 use ruffle_core::{LoadBehavior, Player, PlayerBuilder, PlayerEvent};
 use ruffle_frontend_utils::backends::audio::CpalAudioBackend;
-use ruffle_frontend_utils::backends::navigator::{ExternalNavigatorBackend, FutureSpawner};
+use ruffle_frontend_utils::backends::navigator::{AolaSwfMode, ExternalNavigatorBackend, FutureSpawner};
 use ruffle_frontend_utils::bundle::source::BundleSourceError;
 use ruffle_frontend_utils::bundle::{Bundle, BundleError};
 use ruffle_frontend_utils::content::{ContentDescriptor, PlayingContent};
@@ -238,15 +238,46 @@ impl ActivePlayer {
         } else { navigator };
 
         let navigator = if let Some(root)=preferences.cli.aola_data_dir.as_ref().filter(|_|preferences.cli.aola_host) {
-            navigator.with_aoqi_cache(root.join("cache")).expect("Cannot initialize Aola resource cache")
+            navigator.with_aola_cache(root.join("cache")).expect("Cannot initialize Aola resource cache")
         } else {navigator};
+        let hide_notice = preferences.cli.aola_host
+            && std::env::var_os("AOLA_HIDE_NOTICE").as_deref() == Some(std::ffi::OsStr::new("1"));
+        let block_skill = preferences.cli.aola_host
+            && std::env::var_os("AOLA_BLOCK_SKILL").as_deref() == Some(std::ffi::OsStr::new("1"));
+        let mut navigator = navigator;
+        if hide_notice || block_skill {
+            let exe = std::env::current_exe().ok();
+            let root = exe.as_deref().and_then(std::path::Path::parent);
+            if hide_notice {
+                navigator = navigator.with_aola_notice(root.map(|r| r.join("swf-notice")).as_deref());
+            }
+            if block_skill {
+                navigator = navigator.with_aola_battle(root.map(|r| r.join("swf-battle")).as_deref());
+            }
+        }
         let navigator = if preferences.cli.aola_host {
-            match std::env::var("AOLA_PET_PATCH").as_deref() {
-                Ok(mode @ ("baseline" | "optimized")) => {
-                    let root = std::env::current_exe().expect("Executable path").parent().expect("Executable directory").join("swf");
-                    navigator.with_aola_pet_patch(&root, mode == "optimized").expect("Validated Aola pet SWF files required")
+            let legacy = std::env::var("AOLA_PET_PATCH").unwrap_or_default();
+            let lifecycle = std::env::var("AOLA_SWF_LIFECYCLE_MODE").unwrap_or_default();
+            match AolaSwfMode::select(&lifecycle, &legacy) {
+                AolaSwfMode::Official => {
+                    if lifecycle == "official" {
+                        tracing::info!(target: "aola_swf_lifecycle", mode="official", source="config", result="official");
+                    }
+                    navigator
                 }
-                _ => navigator,
+                AolaSwfMode::Legacy { optimized } => {
+                    let root = std::env::current_exe().expect("Executable path").parent().expect("Executable directory").join("swf");
+                    navigator.with_aola_pet_patch(&root, optimized).expect("Validated Aola pet SWF files required")
+                }
+                AolaSwfMode::Lifecycle { mode, conflict } => {
+                    if let Some(data) = preferences.cli.aola_data_dir.as_ref() {
+                        let root = std::env::current_exe().expect("Executable path").parent().expect("Executable directory").join("swf-lifecycle");
+                        navigator.with_aola_lifecycle(mode, &root, &data.join("swf-capture"), conflict)
+                    } else {
+                        tracing::info!(target: "aola_swf_lifecycle", mode="unavailable", source="config", result="missing-data-directory");
+                        navigator
+                    }
+                }
             }
         } else { navigator };
         if cfg!(feature = "external_video") && preferences.openh264_enabled() {
@@ -289,7 +320,8 @@ impl ActivePlayer {
             GameModePreference::Off => false,
         };
 
-        let mut renderer = WgpuRenderBackend::new(descriptors, movie_view)
+        let quality = opt.player.quality.unwrap_or(StageQuality::High);
+        let mut renderer = WgpuRenderBackend::new_with_quality(descriptors, movie_view, quality)
             .map_err(|e| anyhow!(e.to_string()))
             .expect("Couldn't create wgpu rendering backend");
         if aoqi_host_enabled {
@@ -309,7 +341,7 @@ impl ActivePlayer {
 
         #[cfg(windows)]
         if crate::aola_host::enabled() {
-            builder=builder.with_external_interface(Box::new(crate::aola_host::AolaInterface));
+            builder=builder.with_external_interface(Box::new(crate::aola_host::AolaInterface::new(hide_notice, block_skill)));
         }
         if !opt.gamepad_button_mapping.is_empty() {
             builder = builder.with_gamepad_button_mapping(opt.gamepad_button_mapping.clone());
@@ -349,7 +381,7 @@ impl ActivePlayer {
             .with_autoplay(true)
             .with_letterbox(opt.player.letterbox.unwrap_or(Letterbox::On))
             .with_max_execution_duration(opt.player.max_execution_duration.unwrap_or(Duration::MAX))
-            .with_quality(opt.player.quality.unwrap_or(StageQuality::High))
+            .with_quality(quality)
             .with_align(
                 opt.player.align.unwrap_or_default(),
                 opt.player.force_align.unwrap_or_default(),
@@ -372,7 +404,12 @@ impl ActivePlayer {
         }
         let player = builder.build();
         #[cfg(windows)]
-        if crate::aola_host::enabled() { player.lock().unwrap().enable_tick_profiling(); }
+        if crate::aola_host::enabled() {
+            let mut player = player.lock().unwrap();
+            player.enable_tick_profiling();
+            let mode = std::env::var("AOLA_DETAIL_PROFILE").ok();
+            player.set_pet_detail_mode(ruffle_core::pet_detail_profile::DetailMode::from_setting(mode.as_deref()));
+        }
         #[cfg(windows)]
         crate::aoqi_host::attach(&player);
 

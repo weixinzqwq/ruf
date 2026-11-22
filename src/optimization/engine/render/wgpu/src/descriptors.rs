@@ -297,3 +297,62 @@ impl Quad {
         }
     }
 }
+
+#[cfg(all(test, windows))]
+mod startup_tests {
+    use super::Descriptors;
+    use crate::backend::{WgpuRenderBackend, create_wgpu_instance, request_adapter_and_device};
+    use crate::target::TextureTarget;
+    use crate::utils::supported_sample_count;
+    use ruffle_render::{backend::RenderBackend, commands::CommandList, quality::StageQuality};
+    use std::sync::Arc;
+    use swf::Color;
+
+    #[test]
+    #[ignore = "requires a DX12 adapter"]
+    fn aola_first_frame_uses_only_the_selected_pipeline_set() {
+        let backends = wgpu::Backends::DX12;
+        let instance = create_wgpu_instance(backends, Default::default(), None);
+        let (adapter, device, queue) = futures::executor::block_on(request_adapter_and_device(
+            backends,
+            &instance,
+            None,
+            wgpu::PowerPreference::LowPower,
+        ))
+        .unwrap();
+        let descriptors = Arc::new(Descriptors::new(instance, adapter, device, queue));
+        let target = TextureTarget::new(&descriptors.device, (8, 8)).unwrap();
+        let format = target.format;
+        let quality = StageQuality::High;
+        let samples = supported_sample_count(&descriptors.adapter, quality.sample_count(), format);
+        let mut renderer =
+            WgpuRenderBackend::new_with_quality(descriptors.clone(), target, quality).unwrap();
+        let assert_cached = || {
+            let shape = descriptors.pipelines.lock().unwrap();
+            assert_eq!(shape.len(), 1);
+            assert!(shape.contains_key(&(samples, format)));
+            let copy = descriptors.copy_pipeline.lock().unwrap();
+            assert_eq!(copy.len(), 1);
+            assert!(copy.contains_key(&(1, format)));
+        };
+        assert_cached();
+        // PlayerBuilder applies the stage quality again before rendering.
+        renderer.set_quality(quality);
+        let clear = Color::from_rgb(0x5070b0, 255);
+        renderer.submit_frame(clear, CommandList::new(), vec![]);
+        let frame = renderer.capture_frame().unwrap();
+        assert!(frame.pixels().all(|p| p.0 == [80, 112, 176, 255]));
+        assert_cached();
+        // A subsequent quality change can still acquire another set on demand.
+        let native_count = || descriptors.device.get_internal_counters().hal.render_pipelines.read();
+        let before = native_count();
+        renderer.set_quality(StageQuality::Low);
+        let sets = descriptors.pipelines.lock().unwrap();
+        assert!(sets.contains_key(&(1, format)));
+        println!(
+            "startup samples={samples}, prepared stage sets=1, prepared copy pipelines=1, \
+             additional native pipelines after requesting Low={}",
+            native_count() - before
+        );
+    }
+}

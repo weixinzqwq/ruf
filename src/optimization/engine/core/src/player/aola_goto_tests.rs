@@ -1,6 +1,8 @@
 use super::*;
 use crate::display_object::{GotoInfo, StopOrPlay};
+use crate::display_object::TDisplayObjectContainer;
 use crate::frame_profile::FrameWork;
+use crate::goto_profile::Counter;
 use std::path::Path;
 
 struct Trace(Arc<Mutex<Vec<String>>>);
@@ -51,6 +53,61 @@ fn aola_stopped_stage_subtree_skips_scripts_and_play_wakes_it() {
 }
 
 #[test]
+fn aola_goto_leaf_path_follows_a_playing_leaf_through_reparenting() {
+    let movie = SwfMovieData::from_data(
+        include_bytes!("../../../tests/tests/swfs/avm2/aoqi_stage3_sleep_wake/Main.swf"),
+        "file:///leaf/Main.swf".into(), None, None).unwrap();
+    let player = PlayerBuilder::new().with_movie(movie).build();
+    let mut player = player.lock().unwrap();
+    player.disable_gc_for_flash_trace_fixture();
+    for _ in 0..8 { player.run_frame(); }
+    let (attached, detached, reattached) = player.mutate_with_update_context(|context| {
+        let root = context.stage.root_clip().unwrap().as_movie_clip().unwrap();
+        let mut parent = root.iter_render_list().next().unwrap().as_movie_clip().unwrap();
+        let leaf = loop {
+            let child = parent.iter_render_list().next().unwrap().as_movie_clip().unwrap();
+            if child.num_children() == 0 { break child; }
+            parent = child;
+        };
+        leaf.play();
+        assert!(leaf.playing() && leaf.initialized() && leaf.object2().is_some());
+        let measure = |context: &mut crate::context::UpdateContext<'_>| {
+            let stage_root = context.stage.root_clip().unwrap().as_movie_clip().unwrap();
+            context.tick_profile.goto.begin_response(true);
+            stage_root.goto_frame(context, GotoInfo { frame: stage_root.current_frame(), stop_or_play: StopOrPlay::Stop });
+            let stats = context.tick_profile.goto.finish_response().unwrap();
+            assert_eq!(stats.inner_calls, 1);
+            let construct = FrameWork::OrphanConstruct as usize;
+            let scripts = FrameWork::OrphanScripts as usize;
+            for (index, phase) in stats.phases.iter().enumerate() {
+                if index != construct { assert_eq!(phase.counts[Counter::ConstructLeafHits as usize], 0); }
+                if index != scripts { assert_eq!(phase.counts[Counter::ScriptLeafHits as usize], 0); }
+            }
+            [
+                stats.phases[construct].counts[Counter::ConstructLeafHits as usize],
+                stats.phases[scripts].counts[Counter::ScriptLeafHits as usize],
+            ]
+        };
+        let attached = measure(context);
+        parent.remove_child(context, leaf.into());
+        assert!(leaf.parent().is_none());
+        let detached = measure(context);
+        parent.insert_at_index(context, leaf.into(), 0);
+        assert!(DisplayObject::ptr_eq(leaf.parent().unwrap(), parent.into()));
+        let reattached = measure(context);
+        (attached, detached, reattached)
+    });
+    let enabled = crate::goto_profile::goto_leaf_fast_path_enabled();
+    assert_eq!(reattached, attached);
+    if enabled {
+        assert_eq!(detached, [attached[0] + 1, attached[1] + 1]);
+    } else {
+        assert_eq!((attached, detached), ([0, 0], [0, 0]));
+    }
+    println!("goto_leaf_path enabled={enabled} attached={attached:?} detached={detached:?} reattached={reattached:?}");
+}
+
+#[test]
 fn aola_goto_profile_preserves_nested_goto_and_orphan_flash_traces() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/tests/swfs/avm2");
     let mut total_gotos = 0;
@@ -60,6 +117,8 @@ fn aola_goto_profile_preserves_nested_goto_and_orphan_flash_traces() {
             ("goto_nested_framescript", 1), ("movieclip_queued_noop_goto_swf10", 2),
             ("movieclip_queued_noop_goto_swf9", 2),
             ("orphan_removeobject", 9),
+            ("goto_button_nested_framescript", 2), ("goto_nested_construct_sibling", 3),
+            ("goto_framescript_queued_same_frame", 10), ("swf_10_queued_goto_scripts_construct", 2),
         ] {
             let directory = root.join(name);
             let movie = SwfMovieData::from_data(&std::fs::read(directory.join("test.swf")).unwrap(),

@@ -52,9 +52,9 @@ impl Default for IdleBudget {
 }
 
 impl IdleBudget {
-    fn reserve_up_to(self: &Arc<Self>, bytes: u64, admission_limit: u64) -> Option<IdleReservation> {
+    fn reserve(self: &Arc<Self>, bytes: u64) -> Option<IdleReservation> {
         self.used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-            used.checked_add(bytes).filter(|total| *total <= admission_limit.min(self.limit.load(Ordering::Relaxed)))
+            used.checked_add(bytes).filter(|total| *total <= self.limit.load(Ordering::Relaxed))
         }).ok()?;
         Some(IdleReservation { budget: self.clone(), bytes })
     }
@@ -100,12 +100,12 @@ impl<T, D> PoolStorage<T, D> {
         let bytes = self.idle_budget.map_or(0, |(_, size)| size(&item.description));
         if self.idle_budget.is_some_and(|(budget, _)| bytes > budget) { return; }
         self.trim(bytes);
-        if let Some((budget, bytes)) = &self.shared_idle_budget {
+        if let Some((budget, estimated_bytes)) = &self.shared_idle_budget {
             // All sizes share the native-byte cap. Cold owners make room on a miss;
             // current/previous-frame owners remain protected from one-use noise.
             let probation = item._resource_lease.as_ref().is_some_and(|lease| !lease.pool_reusable);
-            let limit = u64::MAX;
-            let Some(reservation) = budget.reserve_up_to(*bytes, limit) else {
+            let bytes = item._resource_lease.as_ref().map_or(*estimated_bytes, |lease| lease.allocation_bytes);
+            let Some(reservation) = budget.reserve(bytes) else {
                 if let Some(lease) = &item._resource_lease { lease.idle_return_rejected(probation); }
                 return;
             };
@@ -137,16 +137,41 @@ struct TextureBucket<T = PooledTexture, D: BufferDescription = AlwaysCompatible>
     last_access: u64,
 }
 
-/// Only nonempty buckets are indexed. Returns from outstanding entries notify
-/// this index without taking the pool-map lock (and without a strong cycle).
+/// Pressure eviction indexes only nonempty buckets. Age tracking also covers
+/// empty buckets. Late returns notify the pressure index without taking the
+/// pool-map lock.
 #[derive(Debug, Default)]
 struct IdleIndex {
     by_access: [BTreeMap<u64, TextureKey>; 2],
+    // One entry per bucket, including empty buckets with outstanding textures.
+    // Hits update the bucket itself. Recheck its age only when it could expire.
+    by_frame: BTreeMap<u64, Vec<TextureKey>>,
     returns: Arc<Mutex<Vec<TextureKey>>>,
     pending: Vec<TextureKey>,
 }
 
 impl IdleIndex {
+    fn expire<T, D: BufferDescription>(
+        &mut self, pools: &mut FnvHashMap<TextureKey, TextureBucket<T, D>>,
+        frame: u64, idle_frames: u64,
+    ) {
+        while let Some((&oldest, _)) = self.by_frame.first_key_value() {
+            if frame.saturating_sub(oldest) < idle_frames {
+                break;
+            }
+            let (_, keys) = self.by_frame.pop_first().unwrap();
+            for key in keys {
+                let bucket = &pools[&key];
+                if frame.saturating_sub(bucket.last_used) >= idle_frames {
+                    self.remove(key, bucket.last_access);
+                    pools.remove(&key);
+                } else {
+                    self.by_frame.entry(bucket.last_used).or_default().push(key);
+                }
+            }
+        }
+    }
+
     fn remove(&mut self, key: TextureKey, access: u64) {
         self.by_access[usize::from(key.sample_count == 1)].remove(&access);
     }
@@ -167,9 +192,9 @@ impl IdleIndex {
     }
 }
 
-fn make_room<T, D: BufferDescription>(
+fn evict_to_fit<T, D: BufferDescription>(
     pools: &FnvHashMap<TextureKey, TextureBucket<T, D>>, index: &mut IdleIndex,
-    requested: TextureKey, budget: &IdleBudget, frame: u64, bytes: u64,
+    budget: &IdleBudget, bytes: u64, request: Option<(TextureKey, u64)>,
 ) -> (u64, u64) {
     let limit = budget.limit.load(Ordering::Relaxed);
     let mut evicted = 0;
@@ -182,11 +207,13 @@ fn make_room<T, D: BufferDescription>(
             let Some((&access, &key)) = index.by_access[kind].first_key_value() else { break; };
             visited += 1;
             let bucket = &pools[&key];
-            if key == requested {
-                index.by_access[kind].remove(&access);
-                continue;
+            if let Some((requested, frame)) = request {
+                if key == requested {
+                    index.by_access[kind].remove(&access);
+                    continue;
+                }
+                if frame.saturating_sub(bucket.last_used) <= 1 { break; }
             }
-            if frame.saturating_sub(bucket.last_used) <= 1 { break; }
             let mut available = bucket.pool.available.lock().unwrap();
             while budget.used.load(Ordering::Relaxed).saturating_add(bytes) > limit
                 && !available.items.is_empty()
@@ -220,6 +247,7 @@ impl TexturePool {
         self.pools.lock().unwrap().clear();
         let mut index = self.idle_index.lock().unwrap();
         index.by_access.iter_mut().for_each(BTreeMap::clear);
+        index.by_frame.clear();
         index.returns.lock().unwrap().clear();
         self.globals_cache.clear();
     }
@@ -235,7 +263,10 @@ impl TexturePool {
         self.limits = limits;
         self.idle_budget.limit.store(limits.idle_bytes, Ordering::Relaxed);
         if self.idle_budget.used.load(Ordering::Relaxed) > limits.idle_bytes {
-            self.clear();
+            let pools = self.pools.lock().unwrap();
+            let mut index = self.idle_index.lock().unwrap();
+            index.drain_returns(&pools);
+            evict_to_fit(&pools, &mut index, &self.idle_budget, 0, None);
         }
     }
 
@@ -244,14 +275,7 @@ impl TexturePool {
     pub fn end_frame(&mut self) {
         let frame = self.frame.load(Ordering::Relaxed);
         let mut pools = self.pools.lock().unwrap();
-        let candidates: Vec<_> = pools.iter().map(|(key, bucket)| {
-            (*key, bucket.last_used, bucket.pool.available.lock().unwrap().items.iter().map(|item| item._resource_lease.as_ref().map_or(key.estimated_bytes(), |lease| lease.allocation_bytes)).sum())
-        }).collect();
-        let mut index = self.idle_index.lock().unwrap();
-        for key in idle_evictions(candidates, frame, self.limits) {
-            if let Some(bucket) = pools.remove(&key) { index.remove(key, bucket.last_access); }
-        }
-        drop(index);
+        self.idle_index.lock().unwrap().expire(&mut pools, frame, self.limits.idle_frames);
         drop(pools);
         self.prune_globals();
         self.frame.fetch_add(1, Ordering::Relaxed);
@@ -298,7 +322,9 @@ impl TexturePool {
             .unwrap_or_else(|| key.estimated_bytes().div_ceil(alignment) * alignment);
         // New and recurring sizes can displace cold owners, never recent ones.
         // This avoids starving a changing animation behind long-idle sizes.
-        let (evicted, visited) = if reused { (0, 0) } else { make_room(&pools, &mut index, key, &shared_budget, frame, charge) };
+        let (evicted, visited) = if reused { (0, 0) } else {
+            evict_to_fit(&pools, &mut index, &shared_budget, charge, Some((key, frame)))
+        };
         descriptors.resource_metrics.pool_request(reused, evicted);
         if seen && !reused { descriptors.resource_metrics.pool_recurrent_miss(); }
         let bucket = pools.entry(key).or_insert_with(|| {
@@ -347,6 +373,7 @@ impl TexturePool {
                 available.shared_idle_budget = Some((shared_budget, charge));
                 available.idle_notice = Some((index.returns.clone(), key));
             }
+            index.by_frame.entry(frame).or_default().push(key);
             TextureBucket { pool, last_used: frame, last_access: access }
         });
         bucket.last_used = frame;
@@ -419,23 +446,6 @@ impl TextureKey {
             .saturating_mul(u64::from(self.sample_count))
             .saturating_mul(bytes_per_texel)
     }
-}
-
-fn idle_evictions(
-    mut entries: Vec<(TextureKey, u64, u64)>,
-    frame: u64,
-    limits: TexturePoolLimits,
-) -> Vec<TextureKey> {
-    entries.sort_by_key(|(_, last_used, _)| *last_used);
-    let mut total = entries.iter().fold(0u64, |sum, (_, _, bytes)| sum.saturating_add(*bytes));
-    let mut removed = Vec::new();
-    for (key, last_used, bytes) in entries {
-        if frame.saturating_sub(last_used) >= limits.idle_frames || total > limits.idle_bytes {
-            total = total.saturating_sub(bytes);
-            removed.push(key);
-        }
-    }
-    removed
 }
 
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
@@ -632,7 +642,9 @@ mod tests {
         let budget = Arc::new(IdleBudget { used: AtomicU64::new(0), limit: AtomicU64::new(100) });
         let metrics = Arc::new(ResourceMetrics::default());
         let drops = Arc::new(AtomicU64::new(0));
-        let mut first = PoolStorage { items: Vec::new(), idle_budget: None, shared_idle_budget: Some((budget.clone(), 60)), idle_notice: None };
+        // Admission must charge the actual returned allocation even when the
+        // bucket's last size estimate would have let both items through.
+        let mut first = PoolStorage { items: Vec::new(), idle_budget: None, shared_idle_budget: Some((budget.clone(), 10)), idle_notice: None };
         let mut second = PoolStorage { items: Vec::new(), idle_budget: None, shared_idle_budget: Some((budget.clone(), 60)), idle_notice: None };
         first.put(item(&metrics, &drops, 60));
         second.put(item(&metrics, &drops, 60));
@@ -710,14 +722,14 @@ mod tests {
         let pool = &pools[&key(2999)].pool;
         pool.available.lock().unwrap().put(item(&metrics, &drops, 32));
         index.drain_returns(&pools);
-        assert_eq!(make_room(&pools, &mut index, key(3001), &budget, 2, 32), (1, 1));
+        assert_eq!(evict_to_fit(&pools, &mut index, &budget, 32, Some((key(3001), 2))), (1, 1));
         assert!(index.by_access.iter().all(BTreeMap::is_empty));
         // An entry held during the eviction returns later and must be reusable
         // or evictable again, without rescanning the other 2999 empty buckets.
         let live = PoolEntry { item: Some(item(&metrics, &drops, 32)), pool: Arc::downgrade(&pool.available) };
         drop(live);
         index.drain_returns(&pools);
-        assert_eq!(make_room(&pools, &mut index, key(3001), &budget, 2, 32), (1, 1));
+        assert_eq!(evict_to_fit(&pools, &mut index, &budget, 32, Some((key(3001), 2))), (1, 1));
         assert_eq!(budget.used.load(Ordering::Relaxed), 0);
     }
 
@@ -739,7 +751,7 @@ mod tests {
             pools.insert(key, TextureBucket { pool, last_used: 0, last_access });
         }
         let live = PoolEntry { item: Some(item(&metrics, &drops, 32)), pool: Arc::downgrade(&pools[&cold_key].pool.available) };
-        assert_eq!(make_room(&pools, &mut test_index(&pools), key(2), &budget, 2, key(2).estimated_bytes()).0, 1);
+        assert_eq!(evict_to_fit(&pools, &mut test_index(&pools), &budget, key(2).estimated_bytes(), Some((key(2), 2))).0, 1);
         assert!(pools[&cold_key].pool.available.lock().unwrap().items.is_empty());
         assert_eq!(pools[&hot_key].pool.available.lock().unwrap().items.len(), 1);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
@@ -777,13 +789,13 @@ mod tests {
         }
         let mut pools = FnvHashMap::default();
         pools.insert(key(1), TextureBucket { pool, last_used: 7, last_access: 1 });
-        assert_eq!(make_room(&pools, &mut test_index(&pools), key(2), &budget, 8, 64).0, 0);
+        assert_eq!(evict_to_fit(&pools, &mut test_index(&pools), &budget, 64, Some((key(2), 8))).0, 0);
         assert_eq!(drops.load(Ordering::Relaxed), 0);
         let mut transient = PoolStorage { items: Vec::new(), idle_budget: None, shared_idle_budget: Some((budget.clone(), 64)), idle_notice: None };
         transient.put(item(&metrics, &drops, 64));
         assert!(transient.items.is_empty());
         assert_eq!(budget.used.load(Ordering::Relaxed), 96);
-        assert_eq!(make_room(&pools, &mut test_index(&pools), key(2), &budget, 9, 64).0, 2);
+        assert_eq!(evict_to_fit(&pools, &mut test_index(&pools), &budget, 64, Some((key(2), 9))).0, 2);
         assert_eq!(pools[&key(1)].pool.available.lock().unwrap().items.len(), 1);
     }
 
@@ -801,24 +813,55 @@ mod tests {
         let mut pools=FnvHashMap::default();
         pools.insert(key(1),TextureBucket {pool,last_used:0,last_access:0});
         let mut requested=key(1);requested.format=wgpu::TextureFormat::Bgra8Unorm;
-        assert_eq!(make_room(&pools,&mut test_index(&pools),requested,&budget,2,requested.estimated_bytes()).0,1);
+        assert_eq!(evict_to_fit(&pools,&mut test_index(&pools),&budget,requested.estimated_bytes(),Some((requested,2))).0,1);
         assert_eq!(pools[&key(1)].pool.available.lock().unwrap().items.len(),3);
         assert_eq!(budget.used.load(Ordering::Relaxed),96);
         assert_eq!(drops.load(Ordering::Relaxed),1);
     }
 
     #[test]
-    fn estimated_budget_includes_samples_and_texture_count() {
+    fn estimated_budget_includes_samples_and_lowering_the_limit_reclaims_only_the_excess() {
         assert_eq!(key(3).estimated_bytes(), 3 * 2 * 4 * 4);
-        let entries = vec![(key(1), 1, 80), (key(2), 3, 60), (key(3), 2, 40)];
-        assert_eq!(idle_evictions(entries, 4, TexturePoolLimits { idle_bytes: 100, idle_frames: 10 }), vec![key(1)]);
+        let budget = Arc::new(IdleBudget { used: AtomicU64::new(0), limit: AtomicU64::new(96) });
+        let metrics = Arc::new(ResourceMetrics::default());
+        let drops = Arc::new(AtomicU64::new(0));
+        let mut pools = FnvHashMap::default();
+        let pool = BufferPool::<DropProbe, Size>::new(Box::new(|_, _| panic!("CPU-only")));
+        {
+            let mut idle = pool.available.lock().unwrap();
+            idle.shared_idle_budget = Some((budget.clone(), 32));
+            for _ in 0..3 { idle.put(item(&metrics, &drops, 32)); }
+        }
+        pools.insert(key(1), TextureBucket { pool, last_used: 3, last_access: 0 });
+        let mut index = test_index(&pools);
+        budget.limit.store(64, Ordering::Relaxed);
+        assert_eq!(evict_to_fit(&pools, &mut index, &budget, 0, None), (1, 1));
+        assert_eq!(budget.used.load(Ordering::Relaxed), 64);
+        budget.limit.store(0, Ordering::Relaxed);
+        assert_eq!(evict_to_fit(&pools, &mut index, &budget, 0, None), (2, 1));
+        assert_eq!(budget.used.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn expiry_releases_old_keys_even_below_budget() {
-        let entries = vec![(key(1), 0, 0), (key(2), 1, 32), (key(3), 2, 32)];
-        assert_eq!(idle_evictions(entries, 3, TexturePoolLimits { idle_bytes: 1024, idle_frames: 2 }), vec![key(1), key(2)]);
-        assert_eq!(idle_evictions(vec![(key(1), 3, 32)], 3, TexturePoolLimits { idle_bytes: 0, idle_frames: 120 }), vec![key(1)]);
+    fn expiry_reschedules_reused_buckets_and_expires_empty_metadata_at_the_exact_age() {
+        let mut pools = FnvHashMap::default();
+        let mut index = IdleIndex::default();
+        for (width, first_used, last_used) in [(1, 0, 0), (2, 0, 1), (3, 1, 2)] {
+            let pool = BufferPool::<DropProbe, Size>::new(Box::new(|_, _| panic!("CPU-only")));
+            pools.insert(key(width), TextureBucket { pool, last_used, last_access: width.into() });
+            index.by_frame.entry(first_used).or_default().push(key(width));
+        }
+        index.expire(&mut pools, 1, 2);
+        assert_eq!(pools.len(), 3);
+        index.expire(&mut pools, 2, 2);
+        assert_eq!(pools.len(), 2);
+        assert!(!pools.contains_key(&key(1)));
+        index.expire(&mut pools, 3, 2);
+        assert_eq!(pools.len(), 1);
+        assert!(pools.contains_key(&key(3)));
+        index.expire(&mut pools, 3, 0);
+        assert!(pools.is_empty());
+        assert!(index.by_frame.is_empty());
     }
 
     #[test]

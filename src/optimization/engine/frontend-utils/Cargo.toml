@@ -14,7 +14,7 @@ workspace = true
 default = ["native-tls"]
 cpal = ["dep:cpal", "dep:bytemuck", "ruffle_core/audio"]
 fs = []
-navigator = ["fs", "dep:async-io", "dep:tokio"]
+navigator = ["fs", "dep:async-io", "dep:tokio", "dep:lzma-rs", "dep:tempfile"]
 ui = []
 freetype = ["ui", "dep:freetype-rs"]
 
@@ -28,9 +28,11 @@ native-tls = ["reqwest/native-tls"]
 rustls-tls = ["reqwest/rustls-no-provider"]
 
 [dependencies]
+lzma-rs = { workspace = true, optional = true }
 sha2 = { workspace = true }
 serde_json = { workspace = true }
 aoqi-assets = { path = "../aoqi-assets" }
+tempfile = { workspace = true, optional = true }
 toml_edit = { workspace = true, features = ["parse"] }
 url = { workspace = true }
 tracing = { workspace = true }
@@ -59,6 +61,7 @@ bytemuck = { workspace = true, optional = true }
 freetype-rs = { version = "0.38.0", optional = true }
 
 [dev-dependencies]
+http = "1"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
 macro_rules_attribute = "0.2.2"

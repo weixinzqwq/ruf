@@ -5694,6 +5694,8 @@ dependencies = [
  "cpal",
  "freetype-rs",
  "futures-lite",
+ "http",
+ "lzma-rs",
  "macro_rules_attribute",
  "reqwest",
  "ruffle_core",

@@ -1,6 +1,7 @@
 //! Aola official-page login adapter on the shared native Ruffle renderer.
 //! Query and cookie values stay in memory; diagnostics contain only stage names.
 use std::collections::BTreeMap;
+use std::cell::Cell;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -95,7 +96,20 @@ pub fn record_panic(info: &std::panic::PanicHookInfo<'_>) {
 pub struct DiagnosticLayer;
 
 pub fn diagnostic_enabled(meta: &tracing::Metadata<'_>) -> bool {
-    meta.target() == "aola_pet_patch" || meta.target() == "aola_panel_diagnostic" || meta.target() == "avm_trace" || *meta.level() <= tracing::Level::WARN
+    matches!(meta.target(), "aola_notice" | "aola_battle") || meta.target() == "aola_swf_lifecycle" || meta.target() == "aola_swf_operation" || meta.target() == "aola_pet_patch" || meta.target() == "aola_panel_diagnostic" || meta.target() == "avm_trace" || *meta.level() <= tracing::Level::WARN
+}
+
+#[derive(Default)]
+struct SwfOperation(Option<&'static str>);
+
+impl Visit for SwfOperation {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "operation" {
+            self.0 = ["panel-created", "view-switch", "panel-cleanup", "classify-return"]
+                .into_iter().find(|&name| name == value);
+        }
+    }
+    fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
 }
 
 #[derive(Default)]
@@ -140,6 +154,21 @@ fn pet_patch_event(event: &Event<'_>) -> Option<serde_json::Value> {
 }
 
 #[derive(Default)]
+struct SwfLifecycleFields(serde_json::Map<String, serde_json::Value>);
+
+impl Visit for SwfLifecycleFields {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if matches!(field.name(), "mode" | "resource" | "version" | "source" | "result") {
+            self.0.insert(field.name().into(), value.into());
+        }
+    }
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "bytes" { self.0.insert("bytes".into(), value.into()); }
+    }
+    fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+}
+
+#[derive(Default)]
 struct ErrorCode(String);
 
 impl Visit for ErrorCode {
@@ -155,6 +184,25 @@ impl Visit for ErrorCode {
 
 impl<S: Subscriber> Layer<S> for DiagnosticLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        if event.metadata().target() == "aola_swf_operation" {
+            let mut fields = SwfOperation::default();
+            event.record(&mut fields);
+            if let Some(operation) = fields.0 {
+                write_event(json!({"type":"swf-operation", "operation":operation,
+                    "build":crate::aola_diagnostics::BUILD, "elapsedMs":elapsed_ms()}));
+            }
+            return;
+        }
+        let target = event.metadata().target();
+        if matches!(target, "aola_swf_lifecycle" | "aola_notice" | "aola_battle") {
+            let mut fields = SwfLifecycleFields::default();
+            event.record(&mut fields);
+            fields.0.insert("type".into(), match target { "aola_notice" => "notice-swf", "aola_battle" => "battle-swf", _ => "swf-lifecycle" }.into());
+            fields.0.insert("build".into(), crate::aola_diagnostics::BUILD.into());
+            fields.0.insert("elapsedMs".into(), (elapsed_ms() as u64).into());
+            write_event(fields.0.into());
+            return;
+        }
         if let Some(row) = panel_diagnostic_event(event) { write_event(row); return; }
         if let Some(row) = pet_patch_event(event) {
             write_event(row);
@@ -208,10 +256,54 @@ fn cookie_script(key: &str, value: &str, expires: f64) -> String {
     format!("(() => {{ let s={key}+'='+encodeURIComponent({value})+';path=/;domain=.100bt.com'; if({expires}!==0) s+=';expires='+new Date(Date.now()+{expires}).toUTCString(); document.cookie=s; }})();")
 }
 
-pub struct AolaInterface;
+pub struct AolaInterface {
+    hide_notice: bool,
+    observed_notice_channels: Cell<u8>,
+    block_skill: bool,
+    observed_battle_effect: Cell<bool>,
+}
+
+impl AolaInterface {
+    pub fn new(hide_notice: bool, block_skill: bool) -> Self {
+        Self { hide_notice, observed_notice_channels: Cell::new(0), block_skill, observed_battle_effect: Cell::new(false) }
+    }
+
+    fn skill_result(&self, args: &[Value]) -> Value {
+        if !matches!(arguments(args), [Value::String(name)] if name == "wanyu-zhichao") {
+            return Value::Bool(false);
+        }
+        if !self.observed_battle_effect.replace(true) {
+            record("battle-effect", "wanyu-zhichao");
+        }
+        Value::Bool(self.block_skill)
+    }
+
+    fn notice_result(&self, args: &[Value]) -> Value {
+        let channel = match arguments(args).first() {
+            Some(Value::String(value)) => value.as_str(),
+            _ => "",
+        };
+        let (bit, label) = match channel {
+            "random" => (1, "random"),
+            "honor" => (2, "honor"),
+            "title" => (4, "title"),
+            "broadcast" => (8, "broadcast"),
+            "coming" => (16, "coming"),
+            _ => (32, "default"),
+        };
+        let observed = self.observed_notice_channels.get();
+        if observed & bit == 0 {
+            self.observed_notice_channels.set(observed | bit);
+            record("notice-channel", label);
+        }
+        Value::Bool(self.hide_notice)
+    }
+}
 
 impl ExternalInterfaceProvider for AolaInterface {
     fn call_method(&self, _context: &mut UpdateContext<'_>, name: &str, args: &[Value]) -> Value {
+        if name == "aolaBlockSkill" { return self.skill_result(args); }
+        if name == "aolaHideNotice" { return self.notice_result(args); }
         record("external-call", name);
         let args = arguments(args);
         let mut state = STATE.get().unwrap().lock().unwrap();
@@ -427,6 +519,23 @@ impl LoginBrowser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn aola_notice_callback_shares_one_boolean_and_records_each_channel_once() {
+        for enabled in [false, true] {
+            let interface = AolaInterface::new(enabled, !enabled);
+            assert!(matches!(interface.skill_result(&[]), Value::Bool(false)));
+            assert!(matches!(interface.skill_result(&[Value::String("other".into())]), Value::Bool(false)));
+            assert!(!interface.observed_battle_effect.get());
+            assert!(matches!(interface.skill_result(&[Value::String("wanyu-zhichao".into())]), Value::Bool(v) if v != enabled));
+            assert!(interface.observed_battle_effect.get());
+            for name in ["random", "honor", "title", "broadcast", "coming", "random"] {
+                assert!(matches!(interface.notice_result(&[Value::String(name.into())]), Value::Bool(v) if v == enabled));
+            }
+            assert_eq!(interface.observed_notice_channels.get(), 31);
+            assert!(matches!(interface.notice_result(&[]), Value::Bool(v) if v == enabled));
+            assert_eq!(interface.observed_notice_channels.get(), 63);
+        }
+    }
     #[test]
     fn aola_panel_diagnostics_pass_filter_and_ignore_argument_fields() {
         use tracing_subscriber::prelude::*;

@@ -242,17 +242,28 @@ pub fn exec<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let panel_trace = crate::aola_panel_diagnostics::enabled()
         && crate::aola_panel_diagnostics::begin_method(method.profile_name());
-    let profiling = activation.context.tick_profile.detail_scope_active();
-    let nested = profiling && activation.context.tick_profile.detail.borrow().active();
-    let tracked = if profiling {
-        activation.context.tick_profile.detail.borrow_mut().begin(method.profile_name())
-    } else { false };
-    let result = if tracked && !nested {
+    let detail = activation.context.tick_profile.begin_detail(method.detail_root(), || method.profile_name());
+    let result = if detail == crate::tick_profile::DetailCall::FullRoot {
         exec_detail_root(method, scope, receiver, bound_superclass, user_arguments, activation, callee)
     } else {
         exec_inner(method, scope, receiver, bound_superclass, user_arguments, activation, callee)
     };
-    if tracked { activation.context.tick_profile.detail.borrow_mut().finish(); }
+    // Both successful returns and AVM exceptions complete the outer timer.
+    activation.context.tick_profile.finish_detail(detail);
+    if detail == crate::tick_profile::DetailCall::FullRoot {
+        crate::orphan_census::after_response(activation.context);
+    }
+    let operation = method.swf_operation();
+    if operation.observes_return() && result.is_ok() {
+        let stack = activation.context.avm2.call_stack();
+        let stack = stack.borrow();
+        // exec_inner has already popped the successfully returned method.
+        let mut callers = stack.callers().map(|m| m.swf_operation());
+        let mut parent = || callers.next().unwrap_or(super::swf_operation::Operation::Other);
+        if let Some(label) = operation.event(parent(), parent()) {
+            tracing::info!(target: "aola_swf_operation", operation = label);
+        }
+    }
     if crate::aola_panel_diagnostics::armed() {
         if let Err(error) = &result {
             crate::aola_panel_diagnostics::emit(method.profile_name(), "method-error", 0, &error.diagnostic_stack());

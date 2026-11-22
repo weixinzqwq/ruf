@@ -9,6 +9,7 @@ use crate::context::UpdateContext;
 use crate::string::AvmString;
 
 use async_channel::{Receiver, Sender, unbounded};
+use either::Either;
 use gc_arena::Collect;
 use ruffle_macros::istr;
 use slotmap::{SlotMap, new_key_type};
@@ -16,6 +17,7 @@ use std::{
     cell::{Cell, RefCell},
     time::Duration,
 };
+use web_time::Instant;
 
 new_key_type! {
     pub struct SocketHandle;
@@ -70,6 +72,44 @@ pub struct Sockets<'gc> {
     receiver: Receiver<SocketAction>,
     #[collect(require_static)]
     sender: Sender<SocketAction>,
+    #[collect(require_static)]
+    dispatch_budget: Option<Duration>,
+}
+
+fn parse_dispatch_budget(value: &str) -> Option<Duration> {
+    let millis = value.parse::<u64>().ok()?;
+    (millis > 0).then(|| Duration::from_millis(millis))
+}
+
+/// Optional time budget checked between socket actions during each player update.
+pub fn dispatch_budget_from_env() -> Option<Duration> {
+    std::env::var("AOLA_SOCKET_BUDGET_MS")
+        .ok()
+        .and_then(|v| parse_dispatch_budget(&v))
+}
+
+fn actions_for_update(
+    receiver: &Receiver<SocketAction>,
+    budget: Option<Duration>,
+) -> impl Iterator<Item = SocketAction> + use<> {
+    if let Some(budget) = budget {
+        // Keep undispatched actions in the channel's FIFO. Take only actions present
+        // before dispatch, even when callbacks cause more actions to be enqueued.
+        let available = receiver.len();
+        let receiver = receiver.clone();
+        let started = Instant::now();
+        Either::Left((0..available).map_while(move |index| {
+            // Always make progress, even if the thread was descheduled before dispatch.
+            if index > 0 && started.elapsed() >= budget {
+                return None;
+            }
+            receiver.try_recv().ok()
+        }))
+    } else {
+        // Preserve the original unbudgeted drain-before-dispatch behavior.
+        let actions: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        Either::Right(actions.into_iter())
+    }
 }
 
 impl<'gc> Sockets<'gc> {
@@ -80,6 +120,7 @@ impl<'gc> Sockets<'gc> {
             sockets: SlotMap::with_key(),
             receiver,
             sender,
+            dispatch_budget: dispatch_budget_from_env(),
         }
     }
 
@@ -200,12 +241,7 @@ impl<'gc> Sockets<'gc> {
     }
 
     pub fn update_sockets(context: &mut UpdateContext<'gc>) {
-        let mut actions = vec![];
-
-        while let Ok(action) = context.sockets.receiver.try_recv() {
-            actions.push(action)
-        }
-
+        let actions = actions_for_update(&context.sockets.receiver, context.sockets.dispatch_budget);
         for action in actions {
             match action {
                 SocketAction::Connect(handle, ConnectionState::Connected) => {
@@ -406,7 +442,85 @@ fn sanitize_host(host: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_host;
+    use super::*;
+
+    #[test]
+    fn aola_socket_budget_accepts_only_positive_milliseconds() {
+        for value in ["", "0", "-1", "1.5", "1ms", "18446744073709551616"] {
+            assert_eq!(parse_dispatch_budget(value), None);
+        }
+        assert_eq!(parse_dispatch_budget("4"), Some(Duration::from_millis(4)));
+    }
+
+    #[test]
+    fn aola_socket_budget_defers_data_and_close_in_fifo_order() {
+        let (sender, receiver) = unbounded();
+        let handle = SocketHandle::default();
+        sender
+            .try_send(SocketAction::Connect(handle, ConnectionState::Connected))
+            .unwrap();
+        sender
+            .try_send(SocketAction::Data(handle, vec![1]))
+            .unwrap();
+        sender.try_send(SocketAction::Close(handle)).unwrap();
+
+        // A zero time allowance models a budget already spent after the first
+        // callback. Production maps a zero environment setting to None.
+        let next_update =
+            || actions_for_update(&receiver, Some(Duration::ZERO)).collect::<Vec<_>>();
+        assert_eq!(
+            next_update(),
+            [SocketAction::Connect(handle, ConnectionState::Connected)]
+        );
+        assert_eq!(receiver.len(), 2);
+        assert_eq!(next_update(), [SocketAction::Data(handle, vec![1])]);
+        assert_eq!(next_update(), [SocketAction::Close(handle)]);
+        assert!(next_update().is_empty());
+    }
+
+    #[test]
+    fn aola_socket_actions_arriving_during_dispatch_wait_for_next_update() {
+        for budget in [None, Some(Duration::from_secs(60))] {
+            let (sender, receiver) = unbounded();
+            let handle = SocketHandle::default();
+            sender
+                .try_send(SocketAction::Data(handle, vec![1]))
+                .unwrap();
+            sender
+                .try_send(SocketAction::Data(handle, vec![2]))
+                .unwrap();
+
+            let mut actions = actions_for_update(&receiver, budget);
+            assert_eq!(actions.next(), Some(SocketAction::Data(handle, vec![1])));
+            sender.try_send(SocketAction::Close(handle)).unwrap();
+            assert_eq!(actions.next(), Some(SocketAction::Data(handle, vec![2])));
+            assert_eq!(actions.next(), None);
+            assert_eq!(
+                actions_for_update(&receiver, budget).collect::<Vec<_>>(),
+                [SocketAction::Close(handle)]
+            );
+        }
+    }
+
+    #[test]
+    fn aola_socket_budget_yields_after_a_slow_dispatch() {
+        let (sender, receiver) = unbounded();
+        let handle = SocketHandle::default();
+        sender
+            .try_send(SocketAction::Connect(handle, ConnectionState::Connected))
+            .unwrap();
+        sender.try_send(SocketAction::Close(handle)).unwrap();
+
+        let budget = Duration::from_millis(2);
+        let mut actions = actions_for_update(&receiver, Some(budget));
+        assert_eq!(
+            actions.next(),
+            Some(SocketAction::Connect(handle, ConnectionState::Connected))
+        );
+        std::thread::sleep(budget + Duration::from_millis(1));
+        assert_eq!(actions.next(), None);
+        assert_eq!(receiver.try_recv().unwrap(), SocketAction::Close(handle));
+    }
 
     #[test]
     fn truncate_host_at_null() {

@@ -1,0 +1,400 @@
+奥拉 Flux v1.0.0：针对奥拉星的静态逆向分析
+分析日期：2026-11-22
+
+结论
+====
+这份样本包含定制的原生 Ruffle 播放器、奥拉星 SWF 覆盖资源和桌面辅助界面。
+已确认的主要性能机制包括：原生 liblzma 解压快速路径；共享磁盘缓存与后台
+ZWS→FWS 预解压；位图纹理和离屏池的预算、清理与 OOM 恢复路径；DXGI
+内存压力监控；2×/4× MSAA 管线预热；战斗动画与公告的提前跳过；部分
+战斗活动与引用的主动清理；可选的 Socket 事件分帧处理。
+
+本报告确认的是“代码中存在什么机制”，不是运行基准。没有启动 EXE、没有
+登录游戏，也没有修改上传文件。不能由静态结果推导 FPS 提升比例、实际
+回收量，或断言所有开关都在用户当前配置中开启。
+
+重要限制：aolaSessionGc 入口中的两个 dispose 调用有真实清理动作；其最后
+调用的 System.pauseForGCIfCollectionImminent 在该样本自己的 playerglobal
+中仍是 stub。System.gc 也是空实现。因此这段接口不能称为“强制 GC”。
+
+用户指定的 C:\Users\weixi\.agents\skills\reverse-engineer-anything\SKILL.md
+在当前工作环境不可访问；已检查的可用技能目录也没有同名技能。本次使用
+PE 解析、x86-64 反汇编、SWF/ABC 提取解析和官方源码对照完成分析。
+
+1. 样本身份与坐标规则 [E01]
+==============================
+上传文件：奥拉Flux v1.0.0.exe
+大小：47,199,744 字节
+SHA-256：4a7cd5526e6099880bb11dca1f09cff0d71079e88d4e6fcab52a0da86f951639
+
+外层：Windows x64 原生 GUI 启动器，Rust/minGW 编译特征，无 CLR 目录。
+内嵌主程序：原 EXE 文件偏移 0x4595b，长度 46,476,800 字节。
+主程序 SHA-256：c9d61318dd6e4816ad17ed62af68e174d92a3ee05f51bb9e1a53806b04409a29
+主程序 ImageBase：0x140000000；内部名 aola-turbo。
+WebView2Loader.dll：原 EXE 偏移 0x2c9876d；含签名尾部长度 165,440 字节；
+版本 1.0.2651.64。它用于网页/界面集成；不能据此认为游戏由 WebView2 播放。
+
+自报版本完整字符串：
+  1.0.0-local (7339de48986c35553f04d7b598cd57c93a211a42 2026-11-22)
+原 EXE 偏移：0x17a1d89。
+构建时间：2026-11-22T04:25:46.438523800Z。
+HTTP User-Agent：Ruffle/0.8.0-nightly.2026.11.15 (https://ruffle.rs)。
+
+注意：About 文本中相邻的格式控制字符“c”不属于提交哈希。正确的自报
+提交以 7339 开始，共 40 个十六进制字符。官方仓库未能定位该提交；它仅是
+样本自报的本地构建标识。UA 也不能单独证明其精确上游基线。
+
+下文 VA 均为内嵌主 EXE 的静态虚拟地址（ASLR 前）；外层启动器 VA 会明确
+标注。文件偏移均指上传原 EXE，除非明确写“SWF 内偏移”。不能把 VA 当作
+文件偏移。FWS 是未压缩 SWF，相关字节码的原文件偏移可以直接相加；CWS/
+ZWS 解压后的 SWF 内偏移不能直接加到压缩数据的外层偏移。
+
+2. 加载：原生 liblzma 解压与兼容回退 [E02]
+===========================================
+SWF 读取函数 0x140acbb90 在 0x140acbc4c 调用 0x141113980。
+该包装函数用 5 字节 LZMA 属性和 8 字节长度组成 13 字节 .lzma 头，调用：
+  0x141576870：alone decoder 初始化；
+  0x141576b70：流式解码；
+  0x14157afb0：结束解码器。
+
+0x141576b70 中的断言分支引用了原生 C 源文件：
+  xz-5.2/src/liblzma/common\common.c
+原 EXE 偏移：0x2b9c523；引用指令：0x141576e4c。
+相邻断言：ret != LZMA_BUF_ERROR。
+
+成功路径返回解压后的数据；失败路径在 0x140acbcd1 使用日志：
+  native LZMA decode failed (...), falling back to lzma-rs
+该日志的原 EXE 文本偏移：0x2a18f0c。
+随后确实进入 lzma-rs 解码逻辑。
+
+判断：程序具有原生 liblzma 解码路径，并保留 Rust 解码实现作为回退。
+这直接针对压缩 SWF 的 CPU 解压成本。未测量它相对回退实现的具体速度。
+不能把这条路径描述成“AS3 校验原生化”或“所有解析都后台化”。
+
+3. 加载：低优先级后台预解压 ZWS 缓存 [E03]
+============================================
+后台线程名：aola-swf-prewarm，原 EXE 偏移 0x2acd738。
+工作函数：0x140f88140。
+进入后调用 GetCurrentThread 与 SetThreadPriority，后者参数为 -2。
+工作函数读取队列中的缓存路径，检查文件签名为 ZWS。
+  0x140f894df：比较 0x53575a（小端 ZWS）。
+转换函数：0x140f8aa90。
+  0x140f8b14d、0x140f8b151：写入 FWS 文件头。
+输出经过 zws.tmp 临时文件再替换缓存；有替换失败的复制/删除回退。
+
+范围包括：启动时扫描已有缓存；新下载的缓存也会投递到队列。
+  缓存保存函数：0x140fb0780。
+  0x140fb0830 写入缓存；0x140fb08f6 检查 ZWS；
+  0x140fb0916 调用队列 helper 0x140fb0a20。
+
+对应日志：
+  0x2acd749：prewarm: queued ... cached swf
+  0x2acd58e：prewarm done: ... converted, ... skipped, ... MB -> ... MB in ... s
+  0x2acd783：zws.tmp
+
+判断：以更多磁盘空间换取后续少做 LZMA 解压，对重复加载场景/亚比资源
+有针对性。后台转换器明确处理 ZWS；本次没有证明 CWS 也走这条转换路径。
+后台转换器内看到的是 lzma-rs 逻辑，不能混同为上一节的原生 liblzma 路径。
+缓存预解压不等于 ABC 校验、对象构造、矢量细分和纹理上传均不再阻塞。
+
+4. 磁盘：共享缓存、默认预算与清理 [E04]
+========================================
+外层启动器设置 AOLA_SHARED_CACHE=1：
+  外层 VA 0x140003248 复制键；0x1400032ce 写 ASCII '1'。
+无覆盖时，共享缓存目录为 %LOCALAPPDATA%\aola\cache。
+支持 AOLA_CACHE_DIR、AOLA_NO_CACHE，以及缓存目录选择/迁移。
+记忆路径文件：%LOCALAPPDATA%\aola\cache-dir.txt。
+
+编译默认缓存上限：4096 MiB（4 GiB）；默认 no_cache=false。
+  settings 构造函数：0x140f9aa80。
+  0x140f9ae21 写入 0x1000；解析器将 cache_limit_mb 写入相同字段 +0x1d0。
+支持 cache_limit_mb、cacheGb、cache_gb；GB 别名按 1024 换算。
+
+初始化扫描发现超过预算时，会排序并删除旧文件，目标约为预算 80%：
+  0x140fa83fd：MiB 转字节。
+  0x140fa8415：比较总量与预算。
+  0x140fa846b 起：计算 4 * floor(budget / 5)。
+日志原 EXE 偏移 0x2accf01：cache: ... MB, removed ... old files。
+
+判断：共享可减少重复下载；预算清理防止磁盘无限积累。本次未证明每次命中
+都会更新文件的访问顺序，不应称为已验证的严格 LRU。
+4 GiB 是磁盘缓存预算，不是内存/显存上限，也不是启动时一次申请 4 GiB。
+用户设置可以覆盖该编译默认值，上传的 EXE 不代表用户当前设置文件。
+
+5. GPU：位图纹理预算、预分配清理与空闲回收 [E05]
+=================================================
+样本有独立 core\src\bitmap_cache.rs 管理代码和以下日志：
+  0x2a2704b：texture cache: pre-alloc reclaim ... MB for a ... MB upload
+  0x2a44276：texture cache idle: released ...
+  0x2a442d2：texture cache over budget: released ...
+  0x2a4432a：texture cache: ... MB resident / ... MB budget, reclaimed ...
+
+配置读取函数 0x140bb19d0 解析 AOLA_TEX_BUDGET_MB。
+缺省/解析失败分支返回 0x18000000，即 384 MiB。
+动态 DXGI 管理可通过全局 0x142c002e0 覆盖实际预算。
+
+在 0x140ec0a70 内：
+  0x140ec0b37–0x140ec0b3f：累加内部计数。
+  0x140ec0d32–0x140ec0d47：差值达到 30 才做周期检查。
+  0x140ec0e23–0x140ec0e3d：超预算时尝试回收到约 75% 预算。
+  0x140ec1103–0x140ec1119：满足空闲条件时，尝试回收到约 25% 预算。
+
+空闲阈值环境变量：AOLA_IDLE_RECLAIM_SECS。
+解析函数：0x140ed73d0；合法值乘 60；缺省阈值直接取 180。
+这里比较的是内部 tick 计数，日志按除以 60 显示秒数。
+不能称为严格墙上时钟的“每 3 秒强制清理”。
+
+回收函数 0x140d87da0 汇总条目，按条目 +0x30 字段排序，选择可回收候选。
+它跳过特定标志为真的条目、跳过纹理句柄引用计数大于 1 的条目，然后清除
+可回收句柄并更新统计。
+
+判断：这是受管理纹理的预算和最佳努力回收机制。384 MiB 不是整个进程的
+硬显存上限，75%/25% 是尝试达到的目标，活跃或被引用的资源可能留存。
+回收降低留存压力，但若随后再次使用已释放资源，也可能带来重传/重建成本。
+
+6. GPU：离屏纹理池预算与压力释放 [E06]
+========================================
+配置环境变量：AOLA_OFFSCREEN_BUDGET_MB。
+读取函数：0x141003e50；缺省取 0x80 后左移 20 位，即 128 MiB。
+实际运行可优先使用动态预算全局 0x142c00340（按 MiB 换算）。
+
+纹理获取函数 0x141002b00：
+  0x14100301f–0x14100302c：计数后检查 counter & 0x3f；
+  约每 64 次获取检查一次池占用。
+  根据尺寸、格式、采样数、空闲项数量估算池内缓存字节数。
+  超预算时按大桶优先释放，尝试把统计的空闲缓存降至约 25% 预算。
+
+日志：
+  0x2ae0b8b：cleared ... offscreen pools, freed ... MB idle textures
+  0x2ae0bc3：offscreen pool over budget: ... MB idle -> freed ... MB
+  0x273578c：out of memory: purged ... MB of pooled offscreen textures
+  0x273591e：uploading ... bitmap (... MB), purged ... MB of pooled textures first
+
+判断：确有离屏池预算与主动释放机制。上游本来已有 TexturePool 和归还复用，
+因此这里可归因的改动是预算、压力处理和回收策略，不能把“有纹理池”本身
+全部算作该程序原创。池账面统计不等于驱动测得的整个进程显存用量。
+本次未完整证明混合模式离屏表面按对象包围盒裁剪，不能把它列为确定成果。
+
+7. GPU：DXGI 压力监控、渲染降级与错误恢复 [E07]
+================================================
+自定义模块路径：desktop\src\aola_mem.rs；线程名 aola-dxgi。
+相关函数：0x140070030（监控/预算），0x1402eb570（压力级别变化处理）。
+监控读取预算与占用、估算余量，更新纹理预算及离屏预算。
+存在低余量、最近压力事件以及 AOLA_OOM_LEVEL 相关分支。
+
+原 EXE 0x272754b 起有产品文案：
+  显存紧张：已临时把渲染精度降到 75%、关闭 FSR 放大（重启客户端恢复）
+原 EXE 0x27275ab 起：
+  显存危急：渲染精度已降到 50%，建议关掉浏览器/抖音等占显存的程序
+原 EXE 0x2727525 起：
+  显存恢复，渲染精度回到 100%
+原 EXE 0x2ad566b 起：
+  wgpu out of memory #... (kept running, will reclaim next frame): ...
+另有连续失败后 giving up 的路径，不能据此宣称 OOM 永不崩溃。
+
+这些分支与记录值用于压力管理，而非增加硬件显存。渲染精度降低会改变画面
+负载/清晰度，是运行时的取舍。本报告核实了对应控制流、预算写入和文案，
+没有实际触发降级并逐帧测量输出尺寸。
+
+8. 首次渲染：2×/4× MSAA 管线预热 [E08]
+========================================
+函数 0x14007f7b0：
+  0x14007f7d9：edx = 2；0x14007f7e1 调用 0x140fecf50。
+  0x14007f7f7：edx = 4；0x14007f7ff 调用同一构建/缓存函数。
+随后记录耗时：MSAA pipelines prewarmed in ... ms。
+日志原 EXE 偏移：0x17a0c7c；日志引用指令：0x14007f91e。
+
+判断：预先建立常用采样配置，针对首次使用时的管线准备停顿。这不会让
+4× MSAA 的每帧像素处理成本消失，也没有证明所有材质/滤镜管线都预热。
+
+9. 游戏 SWF：按开关跳过昂贵动画与表现流程 [E09]
+================================================
+从原 EXE 提取并校验出 10 个奥拉星 SWF 覆盖资源（见后附清单）。
+战斗文件 pet/petfightnew.swf 为 FWS，文件头原偏移 0x1be2b5d。
+它含有 MCPetContainer.aolaBlockSkill 等自定义字段和宿主接口。
+
+最明确例子：
+  GQWanyuZhichaoEffectHelper.playAttackMovie
+  方法 909；SWF 内字节码偏移 0x5e89eb。
+  方法开头检测 aolaBlockSkill；为真时，执行非空完成回调 apply()，随后
+  return；因此跳过原动画实现，同时保留推进后续流程的完成信号。
+
+已确认的消费分支：
+  aolaBlockSkill：部分特殊技能帮助类、UseSkill.handleMovie/handleSkillEnd。
+  aolaBlockGodWeapon：GQShenBingEffectHelper.attack/hurt。
+  aolaBlockEndPanel：FinBattle.endFight/showEndFightPanel 提前关闭面板返回。
+  aolaBlockAppear：MCPetContainer.startLoad/onResPrepared 控制出场表现。
+  aolaBlockBattleFx：GQFightFlauntStandEffectHelper.setStandStatus。
+  aolaBlockFlauntAppear：McVsPetAppear/McMyPetAppear.initEffectMc。
+  aolaBlockFlauntKill：McPetDie/McPetDie1.initEffectMc。
+  aolaBlockFightScreen：设置 fightMode，跳过部分战斗显示层切换。
+
+这些开关在嵌入 SWF 的静态初值为 false；实际宿主设置可覆盖。
+重要边界：aolaBlockAppear 开启时，startLoad 仍调用亚比资源预加载。
+不能说“屏蔽动画就完全不下载/不加载/不保留该资源”。
+
+aolaBlockBgSwitch 在已分析战斗 ABC 中只找到 setter/属性，没有读取该
+标记的分支。程序界面确有“屏蔽背景切换”描述，但其最终效果尚不能确认。
+另外，存在加载时的 controlv2 字节码补丁迹象；原 EXE 提取出的 SWF 未必
+就是最终交给 VM 的全部字节码。
+
+10. 游戏 SWF：主动清理活动与引用，GC API 本身无效 [E10]
+======================================================
+MCPetContainer.cinit：方法 5200，SWF 内偏移 0x62ebb5。
+通过 ExternalInterface.addCallback 注册 aolaSessionGc。
+清理方法：5201；SWF 内代码偏移 0x62ed4f；原 EXE 代码偏移 0x22118ac。
+
+等价行为（解释用伪代码）：
+  FightMovieManager.instance.dispose();
+  FightTweenMaxManager.instance.dispose();
+  System.pauseForGCIfCollectionImminent(0.25);
+
+第一个 dispose（SWF 0x5e38aa）会遍历动画列表：
+  逐帧 addFrameScript(i, null)；stop()；有父容器则 removeChild()；
+  清空 _movieList、_log、单例引用。
+第二个 dispose（SWF 0x5e2d93）：
+  对 TweenMax 逐个 pause()、kill()；清空列表与单例引用。
+这些是可以确认的停止活动、移除回调和解除部分引用。
+
+但该 EXE 的内置 playerglobal SWF（原 EXE 0x2a5cf4b）中：
+  System.pauseForGCIfCollectionImminent，方法 1933，代码原 EXE 0x2a963c8：
+    getlocal_0; pushscope;
+    findpropstrict stub_method;
+    pushstring 'flash.system.System';
+    pushstring 'pauseForGCIfCollectionImminent';
+    callpropvoid stub_method, 2;
+    returnvoid;
+  System.gc，方法 1932，代码原 EXE 0x2a963bc：
+    getlocal_0; pushscope; returnvoid;
+
+因此上述 GC 请求不能计为强制垃圾回收。正常 Ruffle 自动 GC 是另一机制。
+仅确认 aolaSessionGc 可供宿主调用，尚未确认每场战斗结束都会调它；也没
+有在这条回调链确认 Loader.unloadAndStop。不能宣称所有模型资源立即释放。
+
+11. 游戏 SWF：公告屏蔽提前返回和清队列 [E11]
+=============================================
+messagesend/messagesendservice.swf：FWS，原 EXE 0x17fb9d8。
+MessageRandomShow.initSystemdMsg：方法 59，SWF 0x49584；
+宿主 aolaHideNotice('random') 为真时，在创建 Timer 前返回。
+荣誉、称号、广播等处理函数也会先问宿主开关再创建相关内容。
+MessageSendService.messageComing：方法 85，SWF 0x4a5c2；
+被屏蔽时设置 messages.length=0，提前返回，不进入后续图像创建路径。
+
+判断：部分路径确实少做构造、排队和绘制工作。不能泛称停掉全部定时器；
+另一个已有 Timer 的处理分支仍会 start。
+
+12. 网络事件：可选分帧预算，默认关闭 [E12]
+==========================================
+环境变量：AOLA_SOCKET_BUDGET_MS；原 EXE 字符串偏移 0x2a2775b。
+初始化函数：0x140eb1ab0；缺失或解析失败返回 0。
+全局值：0x14159c1c8；消费函数：0x140ec0a70。
+  0x140ec2976 读取预算；
+  0x140ec3900 检查 0，0 则继续不受此预算限制的处理；
+  0x140ec390e–0x140ec395e 计算已用毫秒；
+  到预算后，0x140ec3f1b 起把余下网络事件保留到 pending VecDeque；
+  后续轮次从 pending 队列继续处理。
+同循环有 XMLSocket/connect/close/socketData 的直接引用。
+
+判断：设置正值后可减少一批集中回包持续挤占一帧的机会。默认是关闭的，
+不能把它当作已启用收益。预算在回调之间检查，不能中断一个已经很慢的
+AS3 回调，且跨帧处理可能增加部分事件的处理延迟。
+
+13. 显示设置、辅助界面和观测 [E13]
+==================================
+内嵌 HTML 提供：画质；30/45/60 FPS；MSAA 跟随/关闭/2×/4×；
+render_scale=1/1.5/2；FSR；Vulkan/DX12/OpenGL；0.5 至 10 倍播放速度。
+界面计算显示的分辨率：960 × window_scale × render_scale 与
+560 × window_scale × render_scale。
+内核有 FSR1 EASU 的着色器实现文本（原 EXE 0x2ad6236 附近）。
+
+这些是画质/负载/时间推进选项。提高倍率、分辨率、MSAA 不等于底层计算
+更高效；10 倍速不能证明渲染器快 10 倍。清磁盘缓存也不等于释放 GPU。
+
+辅助面板的 window.__aola.push(state) 只有 state.rev 改变时重建 DOM，
+普通帧率/内存数字更新走 refreshStats/textContent，以免反复销毁输入框。
+内嵌 HTML 原 EXE 范围：0x1787fcb–0x179e6bf。
+
+诊断开关与日志证据：
+  AOLA_MEM_LOG：原 EXE 0x17a0234。
+  AOLA_PERF_LOG：原 EXE 0x17a03f3。
+  AOLA_MEM_PROBE：原 EXE 0x272749a。
+  日志字段含工作集、提交、DXGI、纹理预算、bitmap、OOM、backend；
+  性能日志区分 tick/build/paint，记录 >50ms 间隔和 >16ms 阶段。
+这些是观测能力，不能单独算作已经发生的性能提升。
+
+14. 未能确认的进一步优化及边界
+===============================
+（1）未得到足够证据证明自研 AVM2 JIT 或原生替换游戏 MD5/校验。
+（2）未得到足够证据证明舞台外停止 MovieClip 的通用休眠/跳帧机制。
+（3）未完成混合模式 blend 离屏表面按对象包围盒裁剪的机器码验证。
+（4）未证明所有 SWF/ABC 解析、校验和纹理上传都已移出主线程。
+（5）未证明战斗结束就自动调用 aolaSessionGc 并释放所有库/纹理。
+（6）未证明所有屏蔽开关的覆盖范围、运行期补丁组合和当前设置。
+（7）未测量 FPS、p95/p99 帧时、首次/重复切换耗时、实际内存回落量。
+
+以上“不确认”不等于证明不存在。剥离符号后的原生机器码可能没有可识别
+字符串。实际运行还受到下载资源版本、自动更新、外部设置和驱动的影响。
+
+战斗域重置是一个额外但需保留的发现：FightData.resetDomainIfStale 被
+enterFight 调用，会对旧 _domain 做诊断标记后置空，getter 随后懒创建新域。
+但它调用的 InspectorErrorWatch.tagDomain 未在提取出的 controlv2 中找到；
+可能依赖运行时补丁。未证明这条链在最终运行资源组合中成功执行，也未
+证明这段逻辑相对于官方游戏原始 SWF 的作者归属。因此不作为确定的
+“每局资源全部回收”成果。
+
+15. 官方 Ruffle 对照与归因
+===========================
+参照标签：nightly-2026-11-15；与样本 UA 一致，仅用作候选对照，不是已
+确认的精确分叉点。已读取官方源码发现：
+  TexturePool、PoolEntry::Drop 复用：上游已有。
+  cacheAsBitmap、dirty 标记、滤镜边界计算：上游已有。
+  gc-arena collect_debt：上游已有。
+  Tokio/Reqwest 异步网络：上游已有。
+  AVM2 verifier/optimizer、early binding、帧率设置：上游已有相关机制。
+
+上游 blend 的参照路径以当前父 surface 的宽高创建离屏面；样本若改变为
+对象区域裁剪，才是进一步优化，但本次尚未完成这项证明。
+上游默认 GC 与样本 System.gc()/pauseForGC... 的空实现不能混淆。
+
+主要官方来源（精确标签源码通过 GitHub 读取）：
+https://github.com/ruffle-rs/ruffle/blob/nightly-2026-11-15/render/wgpu/src/buffer_pool.rs
+  blob SHA：423984509ea55676e4b64af4a2fbc1f59496e585
+https://github.com/ruffle-rs/ruffle/blob/nightly-2026-11-15/core/src/display_object.rs
+  blob SHA：2425006896842d5dcd14a3e9e683481eddf6f8de
+https://github.com/ruffle-rs/ruffle/blob/nightly-2026-11-15/core/src/player.rs
+  blob SHA：fce1e4dc01664b33e6592de7a176f5715f6785e1
+https://github.com/ruffle-rs/ruffle/blob/nightly-2026-11-15/frontend-utils/src/backends/navigator.rs
+  blob SHA：798dfe58e1cd48c73bbfd60ffd16b51fa62d6c53
+https://github.com/ruffle-rs/ruffle/blob/nightly-2026-11-15/core/src/avm2/globals/flash/system/System.as
+https://ruffle.rs/blog/2026/11/04/stable-releases-and-everything-else
+https://ruffle.rs/blog/2024/01/14/2023-in-review
+
+附录 A：提取出的奥拉星 SWF 清单
+================================
+路径                                           原 EXE 头偏移   签名  解压长度
+library/socketserver1.swf                        0x17b5032      CWS     252061
+library/socketserver.swf                         0x17cafbd      CWS     253609
+library/socketclient.swf                         0x17e0eea      CWS     267795
+messagesend/messagesendservice.swf               0x17fb9d8      FWS     308856
+control/controlv2.swf                            0x1847083      ZWS    4972292
+control/controlbarskin/skin0.swf                 0x19fe0e5      FWS    1040618
+play~2026111953323155.swf                         0x1afc206      CWS    2382955
+pet/petfightnew.swf                              0x1be2b5d      FWS    6553676
+pet/petdictionary/petillustratedhandbook.swf      0x2222bf3      FWS     515679
+fortunemanager/starcoin.swf                      0x22a0a8b      FWS    3886751
+
+全部提取/解压长度与文件头一致。存在覆盖资源不代表其中每个方法都被作者
+修改；上述 aola 前缀字段、控制流和宿主接口才提供针对性改动的直接证据。
+
+附录 B：解释性能收益时的必要区分
+================================
+少做工作：提前跳过特效/公告，可减少相应代码路径的构造、执行、绘制。
+提前做工作：后台预解压、管线预热，把成本移到更合适的时段。
+复用工作：磁盘缓存减少下载/解压，纹理缓存减少重复准备，但会占用空间。
+控制留存：预算和回收缓解内存压力，可能增加后续重建成本。
+改变表现：降精度、减 MSAA、调整播放速度，改变负载或时间推进。
+改善调度：Socket 分帧预算减少连续处理，但默认关闭且不打断单次慢回调。
+
+应通过同一机器、同一图形后端、同一显示参数、同一资源和相同操作路线
+对照测量，才能把这些机制与实际体验改善建立定量关系。本次没有捏造
+任何性能提升比例或实测结果。

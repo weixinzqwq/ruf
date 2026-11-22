@@ -34,6 +34,8 @@ mod context3d;
 mod globals;
 mod resource_metrics;
 mod bitmap_cache;
+#[cfg(windows)]
+mod dxgi_cache_pressure;
 #[cfg(all(test, windows))]
 mod render_work_tests;
 #[cfg(all(test, windows))]

@@ -23,6 +23,8 @@ pub struct OrphanManager<'gc> {
 impl<'gc> OrphanManager<'gc> {
     pub fn slots(&self) -> usize { self.orphans.len() }
 
+    pub(crate) fn weak_slots(&self) -> &[DisplayObjectWeak<'gc>] { &self.orphans }
+
     fn orphans_mut(&mut self) -> &mut Vec<DisplayObjectWeak<'gc>> {
         Rc::make_mut(&mut self.orphans)
     }

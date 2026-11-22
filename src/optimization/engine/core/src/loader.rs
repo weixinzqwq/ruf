@@ -350,7 +350,7 @@ impl<'gc> LoadManager<'gc> {
 
                     let prepared = if matches!(content_type, ContentType::Swf) {
                         let resource_url = url.clone();
-                        Some(crate::aoqi_work::blocking(move || SwfMovieData::from_data(&body, resource_url.clone(), Some(resource_url), None))
+                        Some(crate::aoqi_work::decode_movie(body, move |body| SwfMovieData::from_data(&body, resource_url.clone(), Some(resource_url), None))
                             .await.map_err(|error| Error::FetchError(error.into()))??)
                     } else { None };
                     player.lock().unwrap().mutate_with_update_context(|uc| {
@@ -599,7 +599,7 @@ pub struct MovieLoader<'gc> {
 }
 
 async fn prepare_movie_body(body: Vec<u8>) -> Result<(Vec<u8>, Option<crate::tag_utils::PreparedSwf>), Error> {
-    crate::aoqi_work::blocking(move || {
+    crate::aoqi_work::decode_movie(body, |body| {
         let body = if ContentType::sniff(&body) == ContentType::Unknown {
             extract_swz(&body).unwrap_or(body)
         } else { body };
@@ -932,7 +932,7 @@ impl<'gc> MovieLoader<'gc> {
         let id = 1;
         let generated_url = format!("{}/[[DYNAMIC]]/{}", loader_url, id);
 
-        if crate::aoqi_work::mode().loading {
+        if crate::aoqi_work::mode().background_for_movie(&bytes) {
             let player = uc.player_handle();
             uc.navigator.spawn_future(Box::pin(async move {
                 match prepare_movie_body(bytes).await {
@@ -998,7 +998,7 @@ pub fn load_root_movie<'gc>(
             .map(|u| u.to_string())
             .unwrap_or(swf_url);
 
-        let mut movie = crate::aoqi_work::blocking(move || SwfMovieData::from_data(&body, spoofed_or_swf_url, None, None))
+        let mut movie = crate::aoqi_work::decode_movie(body, move |body| SwfMovieData::from_data(&body, spoofed_or_swf_url, None, None))
             .await.map_err(|error| Error::FetchError(error.into()))?
             .inspect_err(|error| {
                 player

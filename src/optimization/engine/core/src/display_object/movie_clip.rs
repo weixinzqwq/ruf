@@ -2539,6 +2539,129 @@ impl<'gc> MovieClip<'gc> {
         }
     }
 
+    // Only propagate the leaf path along MovieClip edges in this orphan walk.
+    // Buttons, loaders and calls re-entering from AS use their original entry points.
+    pub(crate) fn construct_goto_orphan(object: DisplayObject<'gc>, context: &mut UpdateContext<'gc>) {
+        match object {
+            DisplayObject::MovieClip(clip) => clip.construct_subtree::<true>(context),
+            other => other.construct_frame(context),
+        }
+    }
+
+    pub(crate) fn run_goto_orphan_scripts(object: DisplayObject<'gc>, context: &mut UpdateContext<'gc>) {
+        match object {
+            DisplayObject::MovieClip(clip) => clip.run_scripts_subtree::<true>(context),
+            other => other.run_frame_scripts(context),
+        }
+    }
+
+    /// Construct objects placed on this frame.
+    fn construct_subtree<const GOTO_ORPHAN: bool>(self, context: &mut UpdateContext<'gc>) {
+        context.tick_profile.goto.count(crate::goto_profile::Counter::ConstructVisits, 1);
+        if GOTO_ORPHAN && self.0.initialized() && self.0.object2.get().is_some()
+            && !self.0.loop_queued() && self.num_children() == 0
+        {
+            // Allocation, loop reset and child construction are idle. The pending
+            // frame-script update still has to happen before FRAME_CONSTRUCTED.
+            if *context.frame_phase == FramePhase::Construct {
+                self.check_has_pending_script();
+            }
+            context.tick_profile.goto.count(crate::goto_profile::Counter::ConstructLeafHits, 1);
+            return;
+        }
+        // AVM1 code expects to execute in line with timeline instructions, so
+        // it's exempted from frame construction.
+        if self.movie().is_action_script_3()
+            && (self.frames_loaded() >= 1 || self.header_frames() == 0)
+        {
+            let is_load_frame = !self.0.initialized();
+            let needs_construction = if self.0.object2.get().is_none() {
+                self.allocate_as_avm2_object(context, self.into());
+                true
+            } else {
+                false
+            };
+
+            self.0.unset_loop_queued();
+
+            if needs_construction {
+                self.construct_as_avm2_object(context);
+                self.on_construction_complete(context);
+                // If we're in the load frame and we were constructed by ActionScript,
+                // then we want to wait for the Sprite constructor to run
+                // 'construct_frame' on children. This is observable by ActionScript -
+                // before calling super(), 'this.numChildren' will show a non-zero number
+                // when we have children placed on the load frame, but 'this.getChildAt(0)'
+                // will return 'null' since the children haven't had their AVM2 objects
+                // constructed by `construct_frame` yet.
+            } else if !(is_load_frame && self.placed_by_avm2_script()) {
+                let running_construct_frame = self
+                    .0
+                    .contains_flag(MovieClipFlags::RUNNING_CONSTRUCT_FRAME);
+                for child in self.iter_render_list() {
+                    // Under some conditions, we won't run `construct_frame` on
+                    // a not-yet-constructed child
+                    if child.object2().is_none() {
+                        // Avoid running recursively- if `Sprite.constructChildren`
+                        // was constructing this clip's children, and somehow
+                        // a child's construction triggered another `construct_frame`
+                        // on this clip, Flash avoids running `construct_frame` on
+                        // the non-constructed children of this clip.
+                        if running_construct_frame {
+                            continue;
+                        }
+
+                        // The supercall constructor for display objects is responsible
+                        // for triggering construct_frame on frame 1 (see above comment).
+                        // However, if the child has already been constructed, we run
+                        // `construct_frame` like normal.
+                        if child.manual_frame_construct() {
+                            continue;
+                        }
+                    }
+
+                    if GOTO_ORPHAN {
+                        Self::construct_goto_orphan(child, context);
+                    } else {
+                        child.construct_frame(context);
+                    }
+                }
+            }
+        }
+
+        if *context.frame_phase == FramePhase::Construct {
+            // Check for frame-scripts before starting the frame-script phase,
+            // to differentiate the pre-existing scripts from those introduced during frame-script phase.
+            self.check_has_pending_script();
+        }
+    }
+
+    fn run_scripts_subtree<const GOTO_ORPHAN: bool>(self, context: &mut UpdateContext<'gc>) {
+        context.tick_profile.goto.count(crate::goto_profile::Counter::ScriptVisits, 1);
+        // Reuse the orphan sleep proof and its mutation invalidation for child subtrees.
+        // Construction and frame-event broadcasts still run through their original paths.
+        if crate::goto_profile::subtree_script_sleep_enabled()
+            && crate::orphan_manager::sleeping_subtree(self.into())
+        {
+            return;
+        }
+        if GOTO_ORPHAN && !self.has_pending_script() && self.0.queued_goto.get().is_none()
+            && self.num_children() == 0
+        {
+            context.tick_profile.goto.count(crate::goto_profile::Counter::ScriptLeafHits, 1);
+            return;
+        }
+        self.run_local_frame_scripts(context);
+
+        for child in self.iter_render_list() {
+            if GOTO_ORPHAN {
+                Self::run_goto_orphan_scripts(child, context);
+            } else {
+                child.run_frame_scripts(context);
+            }
+        }
+    }
+
     fn check_has_pending_script(self) {
         let has_pending_script = self.has_frame_script(self.0.current_frame.get());
         self.set_has_pending_script(has_pending_script);
@@ -2610,86 +2733,12 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
         }
     }
 
-    /// Construct objects placed on this frame.
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
-        context.tick_profile.goto.count(crate::goto_profile::Counter::ConstructVisits, 1);
-        // AVM1 code expects to execute in line with timeline instructions, so
-        // it's exempted from frame construction.
-        if self.movie().is_action_script_3()
-            && (self.frames_loaded() >= 1 || self.header_frames() == 0)
-        {
-            let is_load_frame = !self.0.initialized();
-            let needs_construction = if self.0.object2.get().is_none() {
-                self.allocate_as_avm2_object(context, self.into());
-                true
-            } else {
-                false
-            };
-
-            self.0.unset_loop_queued();
-
-            if needs_construction {
-                self.construct_as_avm2_object(context);
-                self.on_construction_complete(context);
-                // If we're in the load frame and we were constructed by ActionScript,
-                // then we want to wait for the Sprite constructor to run
-                // 'construct_frame' on children. This is observable by ActionScript -
-                // before calling super(), 'this.numChildren' will show a non-zero number
-                // when we have children placed on the load frame, but 'this.getChildAt(0)'
-                // will return 'null' since the children haven't had their AVM2 objects
-                // constructed by `construct_frame` yet.
-            } else if !(is_load_frame && self.placed_by_avm2_script()) {
-                let running_construct_frame = self
-                    .0
-                    .contains_flag(MovieClipFlags::RUNNING_CONSTRUCT_FRAME);
-                for child in self.iter_render_list() {
-                    // Under some conditions, we won't run `construct_frame` on
-                    // a not-yet-constructed child
-                    if child.object2().is_none() {
-                        // Avoid running recursively- if `Sprite.constructChildren`
-                        // was constructing this clip's children, and somehow
-                        // a child's construction triggered another `construct_frame`
-                        // on this clip, Flash avoids running `construct_frame` on
-                        // the non-constructed children of this clip.
-                        if running_construct_frame {
-                            continue;
-                        }
-
-                        // The supercall constructor for display objects is responsible
-                        // for triggering construct_frame on frame 1 (see above comment).
-                        // However, if the child has already been constructed, we run
-                        // `construct_frame` like normal.
-                        if child.manual_frame_construct() {
-                            continue;
-                        }
-                    }
-
-                    child.construct_frame(context);
-                }
-            }
-        }
-
-        if *context.frame_phase == FramePhase::Construct {
-            // Check for frame-scripts before starting the frame-script phase,
-            // to differentiate the pre-existing scripts from those introduced during frame-script phase.
-            self.check_has_pending_script();
-        }
+        self.construct_subtree::<false>(context);
     }
 
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
-        context.tick_profile.goto.count(crate::goto_profile::Counter::ScriptVisits, 1);
-        // Reuse the orphan sleep proof and its mutation invalidation for child subtrees.
-        // Construction and frame-event broadcasts still run through their original paths.
-        if crate::goto_profile::subtree_script_sleep_enabled()
-            && crate::orphan_manager::sleeping_subtree(self.into())
-        {
-            return;
-        }
-        self.run_local_frame_scripts(context);
-
-        for child in self.iter_render_list() {
-            child.run_frame_scripts(context);
-        }
+        self.run_scripts_subtree::<false>(context);
     }
 
     fn render_self(self, context: &mut RenderContext<'_, 'gc>) {

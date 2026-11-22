@@ -1,5 +1,11 @@
 mod fetch;
 mod aola_pet_patch;
+mod aola_lifecycle;
+mod aola_swf_capture;
+mod aola_skin_recipe;
+mod aola_display_patch;
+mod aola_battle_edits;
+mod aola_notice_edits;
 
 use crate::backends::navigator::fetch::{Response, ResponseBody};
 use crate::backends::aoqi_cache::{AoqiCache, CachingResponse};
@@ -46,6 +52,24 @@ pub trait FutureSpawner<Err> {
     fn spawn(&self, future: OwnedFuture<(), Err>);
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum AolaSwfMode<'a> {
+    Official,
+    Legacy { optimized: bool },
+    Lifecycle { mode: &'a str, conflict: bool },
+}
+
+impl<'a> AolaSwfMode<'a> {
+    pub fn select(lifecycle: &'a str, legacy: &str) -> Self {
+        let old_mode = matches!(legacy, "baseline" | "optimized");
+        match lifecycle {
+            "" if old_mode => Self::Legacy { optimized: legacy == "optimized" },
+            "" | "official" => Self::Official,
+            mode => Self::Lifecycle { mode, conflict: old_mode },
+        }
+    }
+}
+
 /// Implementation of `NavigatorBackend` for non-web environments that can call
 /// out to a web browser.
 pub struct ExternalNavigatorBackend<F: FutureSpawner<Error>, I: NavigatorInterface> {
@@ -71,6 +95,8 @@ pub struct ExternalNavigatorBackend<F: FutureSpawner<Error>, I: NavigatorInterfa
 
     aoqi_cache: Option<AoqiCache>,
     aola_pet_patch: Option<aola_pet_patch::PetPatch>,
+    aola_lifecycle: Option<aola_lifecycle::Trial>,
+    display_patches: Vec<Arc<aola_display_patch::DisplayPatch>>,
 }
 
 impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F, I> {
@@ -138,6 +164,8 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
             interface,
             aoqi_cache: None,
             aola_pet_patch: None,
+            aola_lifecycle: None,
+            display_patches: Vec::new(),
         }
     }
 
@@ -151,6 +179,55 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
     pub fn with_aoqi_cache(mut self, root: PathBuf) -> io::Result<Self> {
         self.aoqi_cache = Some(AoqiCache::new(root)?);
         Ok(self)
+    }
+
+    pub fn with_aola_cache(mut self, root: PathBuf) -> io::Result<Self> {
+        self.aoqi_cache = Some(AoqiCache::for_aola(root)?);
+        Ok(self)
+    }
+
+    pub fn with_aola_notice(mut self, bundle: Option<&Path>) -> Self {
+        use aola_display_patch::{DisplayPatch, NOTICE};
+        if let Some(patch) = bundle.map(|root| DisplayPatch::new(&NOTICE, root))
+            .filter(|p| p.candidate().is_ok()) {
+            NOTICE.audit("config", "ready");
+            self.display_patches.push(Arc::new(patch));
+        } else {
+            NOTICE.audit("config", "invalid-reference");
+        }
+        self
+    }
+
+    pub fn with_aola_battle(mut self, bundle: Option<&Path>) -> Self {
+        use aola_display_patch::{BATTLE, DisplayPatch};
+        if let Some(root) = bundle {
+            self.display_patches.push(Arc::new(DisplayPatch::new(&BATTLE, root)));
+            BATTLE.audit("config", "enabled");
+        } else {
+            BATTLE.audit("config", "invalid-reference");
+        }
+        self
+    }
+
+    pub fn with_aola_lifecycle(mut self, mode: &str, bundle: &Path, capture: &Path, legacy: bool) -> Self {
+        let label = match mode {
+            "original" | "roundtrip" | "capture" | "lifecycle" => mode,
+            _ => "unknown",
+        };
+        self.aola_lifecycle = None;
+        let had_legacy = self.aola_pet_patch.take().is_some();
+        if legacy || had_legacy {
+            aola_lifecycle::audit(label, "", "", "config", "conflicting-modes", 0);
+        } else {
+            match aola_lifecycle::Trial::load(mode, bundle, capture) {
+                Ok(trial) => {
+                    aola_lifecycle::audit(label, "", "", "config", "ready", 0);
+                    self.aola_lifecycle = Some(trial);
+                }
+                Err(_) => aola_lifecycle::audit(label, "", "", "config", "invalid-configuration", 0),
+            }
+        }
+        self
     }
 }
 
@@ -224,6 +301,11 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
             }
         }
 
+        let lifecycle = self.aola_lifecycle.as_ref().and_then(|trial| {
+            trial.request_resource(&request, &processed_url).map(|(resource, version)| (trial.clone(), resource, version.to_owned()))
+        });
+        let display_patch = self.display_patches.iter()
+            .find(|p| p.recipe.accepts(&request, &processed_url)).cloned();
         let client = self.client.clone();
         let cookie_store = self.cookie_store.clone();
         ruffle_core::aola_panel_diagnostics::resource(processed_url.as_str(), "resource-request", 0);
@@ -232,7 +314,8 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
                 && self.cookie_store.cookies(&processed_url).is_none()
         });
 
-        match processed_url.scheme() {
+        let error_trial = lifecycle.clone();
+        let fetch: OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> = match processed_url.scheme() {
             "aoqi" => {
                 // Explicit local bundle scheme; remote HTTP requests are never redirected.
                 let asset = if processed_url.host_str().is_none() {
@@ -296,7 +379,7 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
                                 url: hit.response_url, response_body: ResponseBody::File(Ok(hit.bytes)),
                                 text_encoding, status: 200, redirected,
                             });
-                            return Ok(response);
+                            return Ok(aola_display_patch::wrap(display_patch, "cache", aola_lifecycle::wrap(lifecycle, "cache", response)));
                         }
                         Ok(_) => {}
                         Err(error) => tracing::warn!("Static resource cache read failed: {error}"),
@@ -320,6 +403,7 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
                 request_builder = request_builder.body(body_data);
 
                 let response = spawn_tokio(request_builder.send()).await.map_err(|e| {
+                    if let Some(patch) = &display_patch { patch.recipe.audit("network", "fetch-failed"); }
                     ruffle_core::aola_panel_diagnostics::resource(processed_url.as_str(), "resource-network-error", 0);
                     let inner = if e.is_connect() {
                         Error::InvalidDomain(processed_url.to_string())
@@ -344,6 +428,7 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
                 let cache_policy = cache.as_ref().filter(|_| cookie_store.cookies(response.url()).is_none())
                     .and_then(|_| AoqiCache::response_policy(&processed_url, response.url(), status, response.headers()));
                 if !response.status().is_success() {
+                    if let Some(patch) = &display_patch { patch.recipe.audit("network", "http-error"); }
                     let error = Error::HttpNotOk(
                         format!("Got {}", response.status()),
                         status,
@@ -360,11 +445,18 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
                     status,
                     redirected,
                 });
-                if let (Some(cache), Some(policy)) = (cache, cache_policy) {
-                    Ok(Box::new(CachingResponse::new(response, cache, processed_url, policy)) as Box<dyn SuccessResponse>)
-                } else { Ok(response) }
+                let response = if let (Some(cache), Some(policy)) = (cache, cache_policy) {
+                    Box::new(CachingResponse::new(response, cache, processed_url, policy)) as Box<dyn SuccessResponse>
+                } else { response };
+                Ok(aola_display_patch::wrap(display_patch, "network", aola_lifecycle::wrap(lifecycle, "network", response)))
             }),
+        };
+        if let Some((trial, resource, version)) = error_trial {
+            return Box::pin(async move {
+                fetch.await.inspect_err(|_| trial.reject(resource, &version, "fetch", "fetch-failed"))
+            });
         }
+        fetch
     }
 
     fn resolve_url(&self, url: &str) -> Result<Url, ParseError> {
@@ -690,6 +782,140 @@ mod tests {
         assert_eq!(response.body().await.unwrap(), aoqi_assets::get("host.swf").unwrap().bytes);
         for url in ["aoqi:///missing.swf", "aoqi://remote/host.swf"] {
             assert!(backend.fetch(Request::get(url.into())).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the archived notice SWF and the independently rebuilt candidate"]
+    async fn manual_notice_navigator_fetch_uses_real_reference_and_preserves_cached_source() {
+        check_display_patch("AOLA_TEST_NOTICE_FILES", "messagesendservice-notice.swf",
+            "messagesend/messagesendservice", "2026062579184482", false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the archived battle SWF and the independently rebuilt candidate"]
+    async fn manual_battle_navigator_fetch_uses_real_reference_and_preserves_cached_source() {
+        check_display_patch("AOLA_TEST_BATTLE_FILES", "petfightnew-skill.swf",
+            "pet/petfightnew", "261112849126071", true).await;
+    }
+
+    async fn check_display_patch(var: &str, output: &str, path: &str, version: &str, battle: bool) {
+        let bundle = PathBuf::from(std::env::var_os(var).expect(var));
+        let original = std::fs::read(bundle.join("original.swf")).unwrap();
+        let candidate = std::fs::read(bundle.join(output)).unwrap();
+        assert_ne!(original, candidate);
+        let url = Url::parse(&format!("https://aola.100bt.com/play/{path}~{version}.swf?v=1")).unwrap();
+        let old = Url::parse(&url.as_str().replace(version, "20200101")).unwrap();
+        let mismatch = Url::parse(&url.as_str().replace("v=1", "v=2")).unwrap();
+        let mut changed = original.clone();
+        *changed.last_mut().unwrap() ^= 1;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = AoqiCache::new(dir.path().into()).unwrap();
+        for (id, bytes) in [(&url, &original), (&old, &original), (&mismatch, &changed)] {
+            let policy = AoqiCache::response_policy(id, id, 200, &header::HeaderMap::new()).unwrap();
+            assert!(cache.store(id, &policy, bytes).unwrap());
+        }
+        for hidden in [false, true, false] {
+            let mut backend = new_test_backend(false).with_aoqi_cache(dir.path().into()).unwrap();
+            backend.client = None;
+            if hidden {
+                backend = if battle { backend.with_aola_battle(Some(&bundle)) }
+                          else { backend.with_aola_notice(Some(&bundle)) };
+            }
+            for (id, expected) in [(&url, if hidden { &candidate } else { &original }), (&old, &original), (&mismatch, &changed)] {
+                let response = backend.fetch(Request::get(id.to_string())).await.unwrap_or_else(|e| panic!("{}", e.error));
+                assert_eq!(response.url().as_ref(), id.as_str());
+                assert_eq!(response.status(), 200);
+                assert_eq!(response.body().await.unwrap().as_slice(), expected.as_slice());
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "transport smoke test requires permission to connect to the local loopback listener"]
+    async fn manual_swf_local_http_delivers_real_roundtrip_through_fetch() {
+        let root = PathBuf::from(std::env::var_os("AOLA_TEST_SWF_FILES").expect("AOLA_TEST_SWF_FILES"));
+        let original = std::fs::read(root.join("newpetpackage-original.swf")).unwrap();
+        let control = std::fs::read(root.join("newpetpackage-roundtrip.swf")).unwrap();
+        let util = std::fs::read(root.join("library_util~2026090340574444.swf")).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let proxy = format!("http://{address}");
+        let received = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let accepted = received.clone();
+        let url = "http://aola.100bt.com/play/pet/newpetpackage~2026111953323155.swf";
+        let util_url = "http://aola.100bt.com/play/library/util~2026090340574444.swf";
+        let served_util = util.clone();
+        let server = tokio::spawn(async move {
+            for (path, bytes) in [(util_url, served_util), (url, original)] {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                accepted.store(true, std::sync::atomic::Ordering::Relaxed);
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 8192);
+                    request.push(connection.read_u8().await.unwrap());
+                }
+                assert!(request.starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes()));
+                let headers = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
+                connection.write_all(headers.as_bytes()).await.unwrap();
+                connection.write_all(&bytes).await.unwrap();
+            }
+        });
+        let mut backend = new_test_backend(false).with_aola_lifecycle("roundtrip", &root, &root, false);
+        backend.client = Some(Rc::new(reqwest::Client::builder().proxy(Proxy::all(proxy).unwrap()).build().unwrap()));
+        for (path, expected) in [(util_url, &util), (url, &control)] {
+            let response = tokio::time::timeout(Duration::from_secs(10), backend.fetch(Request::get(path.into())))
+                .await.expect("loopback fixture should respond").unwrap_or_else(|e| {
+                    let probe = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1));
+                    panic!("loopback fixture: {}; accepted={}; transport probe={:?}", e.error,
+                        received.load(std::sync::atomic::Ordering::Relaxed), probe.err());
+                });
+            assert_eq!(&response.body().await.unwrap(), expected);
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the four SWFs produced by the local experiment packager"]
+    async fn aola_lifecycle_navigator_serves_real_candidate_only_after_util_in_same_player() {
+        let root = PathBuf::from(std::env::var_os("AOLA_TEST_SWF_FILES").expect("AOLA_TEST_SWF_FILES"));
+        let original = std::fs::read(root.join("newpetpackage-original.swf")).unwrap();
+        let control = std::fs::read(root.join("newpetpackage-roundtrip.swf")).unwrap();
+        let patched = std::fs::read(root.join("newpetpackage-lifecycle.swf")).unwrap();
+        let util = std::fs::read(root.join("library_util~2026090340574444.swf")).unwrap();
+        let pet_url = Url::parse("https://aola.100bt.com/play/pet/newpetpackage~2026111953323155.swf").unwrap();
+        let old_url = Url::parse("https://aola.100bt.com/play/pet/newpetpackage~2026102936286521.swf").unwrap();
+        let util_url = Url::parse("https://aola.100bt.com/play/library/util~2026090340574444.swf").unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = AoqiCache::new(cache_dir.path().into()).unwrap();
+        // Serve identical current bytes at the obsolete address as well: even an exact
+        // byte match cannot authorize the old resource identity.
+        for (url, bytes) in [(&pet_url, &original), (&old_url, &original), (&util_url, &util)] {
+            let policy = AoqiCache::response_policy(url, url, 200, &header::HeaderMap::new()).unwrap();
+            assert!(cache.store(url, &policy, bytes).unwrap());
+        }
+        let new_player = |mode: &str| {
+            let mut backend = new_test_backend(false).with_aoqi_cache(cache_dir.path().into()).unwrap()
+                .with_aola_lifecycle(mode, &root, &root, false);
+            backend.client = None;
+            backend
+        };
+        async fn read(backend: &ExternalNavigatorBackend<TestFutureSpawner, ()>, url: &Url) -> Vec<u8> {
+            backend.fetch(Request::get(url.to_string())).await.ok().unwrap().body().await.unwrap()
+        }
+        for (mode, output) in [("original", &original), ("roundtrip", &control), ("lifecycle", &patched)] {
+            let first = new_player(mode);
+            let second = new_player(mode);
+            assert_eq!(read(&first, &util_url).await, util);
+            assert_eq!(read(&second, &pet_url).await, original);
+            assert_eq!(&read(&first, &pet_url).await, output);
+            assert_eq!(read(&second, &util_url).await, util);
+            assert_eq!(read(&second, &pet_url).await, original);
+            let obsolete = new_player(mode);
+            assert_eq!(read(&obsolete, &util_url).await, util);
+            assert_eq!(read(&obsolete, &old_url).await, original);
+            assert_eq!(read(&obsolete, &pet_url).await, original);
         }
     }
 

@@ -102,6 +102,10 @@ pub struct Method<'gc>(Gc<'gc, MethodData<'gc>>);
 struct MethodData<'gc> {
     #[collect(require_static)]
     profile_name: std::cell::OnceCell<String>,
+    #[collect(require_static)]
+    swf_operation: super::swf_operation::Operation,
+    #[collect(require_static)]
+    detail_root: std::cell::Cell<Option<crate::pet_detail_profile::DetailRoot>>,
     /// The translation unit this function was defined in.
     txunit: TranslationUnit<'gc>,
 
@@ -225,6 +229,8 @@ impl<'gc> Method<'gc> {
             activation.gc(),
             MethodData {
                 profile_name: std::cell::OnceCell::new(),
+                swf_operation: super::swf_operation::Operation::for_method(&abc, abc_method.0),
+                detail_root: std::cell::Cell::new(None),
                 txunit,
                 abc: txunit.abc(),
                 abc_method: abc_method.0,
@@ -338,6 +344,18 @@ impl<'gc> Method<'gc> {
         .set(resolved_info);
 
         Ok(())
+    }
+
+    pub(super) fn swf_operation(self) -> super::swf_operation::Operation {
+        self.0.swf_operation
+    }
+
+    pub(super) fn mark_detail_root(self, root: crate::pet_detail_profile::DetailRoot) {
+        self.0.detail_root.set(Some(root));
+    }
+
+    pub(super) fn detail_root(self) -> Option<crate::pet_detail_profile::DetailRoot> {
+        self.0.detail_root.get()
     }
 
     pub(crate) fn profile_name(&self) -> &str {

@@ -22,6 +22,10 @@ impl<'gc> CallStack<'gc> {
         self.stack.pop();
     }
 
+    pub(super) fn callers(&self) -> impl Iterator<Item = Method<'gc>> + '_ {
+        self.stack.iter().rev().copied()
+    }
+
     pub fn display(&self, output: &mut WString) {
         for method in self.stack.iter().rev() {
             output.push_utf8("\n\tat ");

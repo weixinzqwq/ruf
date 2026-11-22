@@ -24,6 +24,49 @@ pub struct Response {
     pub redirected: bool,
 }
 
+/// MovieLoader and URLLoader request the entire body. Other consumers may
+/// stream the same URL and must keep their original chunk boundaries.
+pub(super) trait MovieBodyFilter: 'static {
+    async fn complete(self, bytes: Vec<u8>) -> Vec<u8>;
+    fn fallback(&self, reason: &'static str);
+}
+
+struct MovieResponse<F: MovieBodyFilter> {
+    inner: Box<dyn SuccessResponse>,
+    filter: Option<F>,
+}
+
+pub(super) fn filter_movie<F: MovieBodyFilter>(
+    inner: Box<dyn SuccessResponse>, filter: F,
+) -> Box<dyn SuccessResponse> {
+    Box::new(MovieResponse { inner, filter: Some(filter) })
+}
+
+impl<F: MovieBodyFilter> SuccessResponse for MovieResponse<F> {
+    fn url(&self) -> std::borrow::Cow<'_, str> { self.inner.url() }
+    fn set_url(&mut self, url: String) { self.inner.set_url(url); }
+    fn text_encoding(&self) -> Option<&'static Encoding> { self.inner.text_encoding() }
+    fn status(&self) -> u16 { self.inner.status() }
+    fn redirected(&self) -> bool { self.inner.redirected() }
+    fn expected_length(&self) -> Result<Option<u64>, Error> { self.inner.expected_length() }
+
+    fn body(self: Box<Self>) -> OwnedFuture<Vec<u8>, Error> {
+        let Self { inner, filter } = *self;
+        let Some(filter) = filter else { return inner.body() };
+        Box::pin(async move {
+            let bytes = inner.body().await.inspect_err(|_| filter.fallback("read-failed"))?;
+            Ok(filter.complete(bytes).await)
+        })
+    }
+
+    fn next_chunk(&mut self) -> OwnedFuture<Option<Vec<u8>>, Error> {
+        if let Some(filter) = self.filter.take() {
+            filter.fallback("streaming-official");
+        }
+        self.inner.next_chunk()
+    }
+}
+
 impl SuccessResponse for Response {
     fn url(&self) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Borrowed(&self.url)

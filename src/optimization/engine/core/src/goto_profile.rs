@@ -12,6 +12,11 @@ pub fn subtree_script_sleep_enabled() -> bool {
         && crate::aoqi_work::mode().sleep
 }
 
+pub fn goto_leaf_fast_path_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("AOLA_GOTO_LEAF_FAST_PATH").as_deref() == Ok("1"))
+}
+
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("AOLA_GOTO_PROFILE").as_deref() == Ok("1"))
@@ -26,20 +31,21 @@ pub fn work_name(index: usize) -> &'static str {
 pub enum Counter {
     ConstructVisits, ScriptVisits, ScriptCalls, OrphanVisits, OrphanExecuted,
     OrphanInvalid, OrphanSleepSkipped, BroadcastCandidates, BroadcastDispatched,
-    CleanupSlots, CleanupRemoved,
+    CleanupSlots, CleanupRemoved, ConstructLeafHits, ScriptLeafHits,
 }
 
-pub const COUNTER_NAMES: [&str; 11] = [
+pub const COUNTER_NAMES: [&str; 13] = [
     "movieClipConstructVisits", "movieClipScriptVisits", "scriptCalls", "orphanVisits",
     "orphanExecuted", "orphanInvalid", "orphanSleepSkipped", "broadcastCandidates",
-    "broadcastDispatched", "cleanupSlots", "cleanupRemoved",
+    "broadcastDispatched", "cleanupSlots", "cleanupRemoved", "movieClipConstructLeafHits",
+    "movieClipScriptLeafHits",
 ];
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PhaseCost {
     pub exclusive_ns: u64,
     pub calls: u64,
-    pub counts: [u64; 11],
+    pub counts: [u64; COUNTER_NAMES.len()],
 }
 
 #[derive(Debug, Default)]
@@ -270,6 +276,6 @@ mod tests {
         assert_eq!(next.phases[REMOVED_SCRIPTS].counts[Counter::ScriptVisits as usize], 3);
         assert_eq!(next.phases.iter().map(|p| p.exclusive_ns).sum::<u64>(), next.outer_total_ns);
         assert_eq!(work_name(REMOVED_SCRIPTS), "removedScripts");
-        assert_eq!(COUNTER_NAMES.len(), Counter::CleanupRemoved as usize + 1);
+        assert_eq!(COUNTER_NAMES.len(), Counter::ScriptLeafHits as usize + 1);
     }
 }

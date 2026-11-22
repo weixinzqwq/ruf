@@ -2,12 +2,16 @@
 use crate::aoqi_diagnostics::{PerformanceSnapshot, performance_interval, renderer_memory};
 use crate::gui::PresentationStats;
 use ruffle_core::Player;
+use ruffle_core::pet_detail_profile::{DetailMode, ResponseCost};
 use serde_json::json;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use winit::window::Window;
+
+pub(super) const BUILD: &str = "swf-lifecycle-pilot-v2";
 
 pub struct PerformanceLog {
     file: File,
@@ -57,15 +61,8 @@ impl PerformanceLog {
             "inclusiveCpuMs":row.total_ns as f64/1e6,"maxCallMs":row.max_ns as f64/1e6,
         })).collect::<Vec<_>>();
         let (details, dropped_details) = player.take_pet_detail_profile();
-        let details = details.into_iter().map(|r| json!({
-            "sequence":r.sequence,"stage":r.stage.map(|i|ruffle_core::tick_profile::STAGE_NAMES[i]).unwrap_or("outsideTick"),"totalMs":r.total_ns as f64/1e6,
-            "resourceCreationMs":r.resource_creation_ns as f64/1e6,"timedResourceCreations":r.resource_creations,
-            "meshRegistrationMs":r.mesh_registration_ns as f64/1e6,"queueSubmitMs":r.submit_ns as f64/1e6,
-            "bookkeepingMs":r.bookkeeping_ns as f64/1e6,"unlistedCalls":r.unlisted_calls,"unlistedSelfMs":r.unlisted_self_ns as f64/1e6,
-            "goto":goto_record(r.goto),
-            "methods":r.methods.into_iter().map(|m|json!({"category":ruffle_core::pet_detail_profile::category(&m.name),"source":m.name,"calls":m.calls,
-                "inclusiveMs":m.total_ns as f64/1e6,"selfMs":m.self_ns as f64/1e6,"maxMs":m.max_ns as f64/1e6})).collect::<Vec<_>>()
-        })).collect::<Vec<_>>();
+        let detail_mode = player.pet_detail_mode();
+        let details = detail_records(detail_mode, details, dropped_details);
         let viewport = player.renderer().viewport_dimensions();
         let size = window.inner_size();
         let mode = ruffle_core::aoqi_work::mode();
@@ -87,18 +84,30 @@ impl PerformanceLog {
                 "libraryGpuSweepCpuMs":gc.library_gpu_cache_sweep.total_ns as f64/1e6,
                 "orphanSlots":gc.orphan_slots});
         let row = json!({
-            "schema":7,"game":"aola","build":"aola-subtree-scripts-test-20261109",
+            "schema":7,"game":"aola","build":BUILD,"fluxPortBuild":"aola-flux-v1",
+            "petSwitchBuild":"pet-switch-leaf-v1","detailProfile":detail_mode.label(),
+            "gotoLeafFastPath":ruffle_core::goto_profile::goto_leaf_fast_path_enabled(),
+            "gotoProfile":ruffle_core::goto_profile::enabled(),"hostElapsedMs":crate::aola_host::elapsed_ms(),
             "subtreeScriptSleep":ruffle_core::goto_profile::subtree_script_sleep_enabled(),
             "unixMs":SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
             "petPatchMode":std::env::var("AOLA_PET_PATCH").unwrap_or_else(|_|"official".into()),
             "processId":std::process::id(),"movieGeneration":self.movie_generation,"final":final_sample,
             "runtimeFrameRateSetting":player.frame_rate(),"nativeFrameRateForced":player.is_frame_rate_forced(),
-            "optimizationMode":{"sleep":mode.sleep,"loading":mode.loading,"dedup":mode.dedup},
+            "optimizationMode":{"sleep":mode.sleep,"loading":mode.loading,"dedup":mode.dedup,
+                "backgroundZws":mode.background_for_movie(b"ZWS"),
+                "socketBudgetMs":ruffle_core::socket::dispatch_budget_from_env().map_or(0, |d| d.as_millis() as u64),
+                "blockSkillRequested":std::env::var_os("AOLA_BLOCK_SKILL").as_deref() == Some(std::ffi::OsStr::new("1")),
+                "hideNoticeRequested":std::env::var("AOLA_HIDE_NOTICE").as_deref() == Ok("1"),
+                "blockSkillRequested":std::env::var("AOLA_BLOCK_SKILL").as_deref() == Ok("1"),
+                "dxgiCachePressureRequested":std::env::var("AOLA_DXGI_CACHE_PRESSURE").as_deref() == Ok("1")},
+            "processResourceWorker":{
+                "completedJobs":ruffle_core::aoqi_work::BACKGROUND_JOBS.load(Ordering::Relaxed),
+                "totalWorkMs":ruffle_core::aoqi_work::BACKGROUND_NS.load(Ordering::Relaxed) as f64 / 1e6},
             "internalViewport":{"width":viewport.width,"height":viewport.height,"scaleFactor":viewport.scale_factor},
             "window":{"physicalWidth":size.width,"physicalHeight":size.height,"dpiScale":window.scale_factor()},
             "performanceInterval":interval,"gpu":renderer_memory(player.renderer()),
             "slowTickCallbacks":{"scope":"since-last-sample-inclusive-nested-callbacks-not-additive", "thresholdMs":5,"sourceLimit":32,"sources":slow_callbacks},
-            "petDetailResponses":{"scope":"AVM2-exec-boundaries-self-excludes-instrumented-children", "responses":details,"droppedResponses":dropped_details},
+            "petDetailResponses":details,
             "gc":gc_record,
 
             "sampleCpuMs":now.elapsed().as_secs_f64()*1000.0,
@@ -107,6 +116,56 @@ impl PerformanceLog {
         self.file.write_all(b"\n")?;
         self.file.flush()
     }
+}
+
+fn detail_records(mode: DetailMode, responses: Vec<ResponseCost>, dropped: u64) -> serde_json::Value {
+    let response_count = responses.len() as u64 + dropped;
+    let records = responses.into_iter().map(|r| {
+        let mut row = json!({
+            "sequence":r.sequence, "root":r.root.map(|root| root.label()),
+            "stage":r.stage.map(|i|ruffle_core::tick_profile::STAGE_NAMES[i]).unwrap_or("outsideTick"),
+            "totalMs":r.total_ns as f64/1e6,
+        });
+        if mode == DetailMode::Full {
+            let breakdown = json!({
+                "resourceCreationMs":r.resource_creation_ns as f64/1e6,"timedResourceCreations":r.resource_creations,
+                "meshRegistrationMs":r.mesh_registration_ns as f64/1e6,"queueSubmitMs":r.submit_ns as f64/1e6,
+                "bookkeepingMs":r.bookkeeping_ns as f64/1e6,"unlistedCalls":r.unlisted_calls,"unlistedSelfMs":r.unlisted_self_ns as f64/1e6,
+                "goto":goto_record(r.goto),
+                "orphanCensus":r.orphan_census.as_deref().map(orphan_census_record),
+                "methods":r.methods.into_iter().map(|m|json!({"category":ruffle_core::pet_detail_profile::category(&m.name),"source":m.name,"calls":m.calls,
+                    "inclusiveMs":m.total_ns as f64/1e6,"selfMs":m.self_ns as f64/1e6,"maxMs":m.max_ns as f64/1e6})).collect::<Vec<_>>(),
+            });
+            if let serde_json::Value::Object(fields) = breakdown {
+                row.as_object_mut().unwrap().extend(fields);
+            }
+        }
+        row
+    }).collect::<Vec<_>>();
+    let scope = match mode {
+        DetailMode::Summary => "outer-detail-root-wall-time",
+        DetailMode::Full => "AVM2-exec-boundaries-self-excludes-instrumented-children",
+    };
+    json!({"mode":mode.label(),"methodBreakdownMeasured":mode == DetailMode::Full,"scope":scope,
+        "responseCount":response_count,"responses":records,"droppedResponses":dropped})
+}
+
+fn orphan_census_record(c: &ruffle_core::orphan_census::Census) -> serde_json::Value {
+    let groups: Vec<_> = c.groups.iter().map(|(g, n)| json!({
+        "class":g.class, "movie":g.movie, "symbol":g.symbol, "playback":g.playback,
+        "leaf":g.leaf, "sampledRoots":n
+    })).collect();
+    json!({
+        "schema":1, "scope":"sampled-parentless-roots-after-detail",
+        "sampling":"evenly-spaced-weak-slots-in-list-order",
+        "sampleLimit":ruffle_core::orphan_census::SAMPLE_LIMIT,
+        "groupLimit":ruffle_core::orphan_census::GROUP_LIMIT,
+        "slots":c.slots,"sampled":c.sampled,"notSampled":c.slots-c.sampled,
+        "validRoots":c.valid_roots,"expired":c.expired,"reparented":c.reparented,
+        "unknownClass":c.unknown_class,"unknownMovie":c.unknown_movie,
+        "omittedRoots":c.omitted_roots,"omittedGroups":c.omitted_groups,
+        "groups":groups,"scanUs":c.scan_us
+    })
 }
 
 fn goto_record(stats: Option<Box<ruffle_core::goto_profile::GotoStats>>) -> serde_json::Value {
@@ -168,6 +227,23 @@ fn tick_interval(old: ruffle_core::PerformanceStats, now: ruffle_core::Performan
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn aola_summary_serializes_only_measured_detail_fields() {
+        use ruffle_core::pet_detail_profile::DetailRoot;
+        let response = || ResponseCost { sequence: 9, root: Some(DetailRoot::ViewSinglePet), total_ns: 2_500_000, ..Default::default() };
+        let summary = detail_records(DetailMode::Summary, vec![response()], 2);
+        assert_eq!(summary["mode"], "summary");
+        assert_eq!(summary["methodBreakdownMeasured"], false);
+        assert_eq!(summary["responseCount"], 3);
+        assert_eq!(summary["responses"][0], json!({"sequence":9,"root":"PetDataService/onViewSinglePet","stage":"outsideTick","totalMs":2.5}));
+        let full = detail_records(DetailMode::Full, vec![response()], 0);
+        assert_eq!(full["methodBreakdownMeasured"], true);
+        assert_eq!(full["responses"][0]["bookkeepingMs"], 0.0);
+        assert_eq!(full["responses"][0]["goto"]["enabled"], false);
+        assert_eq!(full["responses"][0]["methods"], json!([]));
+        assert_eq!(detail_records(DetailMode::Summary, vec![], 0)["mode"], "summary");
+    }
+
     #[test]
     fn aola_goto_log_keeps_exclusive_costs_and_nested_totals_separate() {
         use ruffle_core::{frame_profile::FrameWork, goto_profile::{Counter, GotoStats}};

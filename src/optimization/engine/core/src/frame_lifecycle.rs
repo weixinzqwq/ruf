@@ -143,12 +143,17 @@ pub fn run_inner_goto_frame<'gc>(
     // When performing goto, frame scripts behave the same as when entering a new frame
     // so no separate cleanup is performed on ones registered during frame script phase
     context.frame_script_cleanup_queue.clear();
+    let leaf_fast_path = crate::goto_profile::goto_leaf_fast_path_enabled();
 
     // Note - we do *not* call `enter_frame` or dispatch an `enterFrame` event
 
     *context.frame_phase = FramePhase::Construct;
     measure(context, FrameWork::OrphanConstruct, |context| {
-        OrphanManager::each_orphan_obj(context, |orphan, context| orphan.construct_frame(context));
+        if leaf_fast_path {
+            OrphanManager::each_orphan_obj(context, MovieClip::construct_goto_orphan);
+        } else {
+            OrphanManager::each_orphan_obj(context, |orphan, context| orphan.construct_frame(context));
+        }
     });
     measure(context, FrameWork::TimelineConstruct, |context| stage.construct_frame(context));
     broadcast_frame_constructed(context);
@@ -156,7 +161,11 @@ pub fn run_inner_goto_frame<'gc>(
     *context.frame_phase = FramePhase::FrameScripts;
     measure(context, FrameWork::ScriptTraversal, |context| stage.run_frame_scripts(context));
     measure(context, FrameWork::OrphanScripts, |context| {
-        OrphanManager::each_orphan_obj(context, |orphan, context| orphan.run_frame_scripts(context));
+        if leaf_fast_path {
+            OrphanManager::each_orphan_obj(context, MovieClip::run_goto_orphan_scripts);
+        } else {
+            OrphanManager::each_orphan_obj(context, |orphan, context| orphan.run_frame_scripts(context));
+        }
     });
 
     let removed_previous = context.tick_profile.goto.enter(crate::goto_profile::REMOVED_SCRIPTS);

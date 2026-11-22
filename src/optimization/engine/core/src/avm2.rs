@@ -47,6 +47,7 @@ pub mod api_version;
 mod array;
 pub mod bytearray;
 mod call_stack;
+mod swf_operation;
 mod class;
 mod dense_storage;
 mod domain;
