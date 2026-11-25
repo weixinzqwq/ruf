@@ -43,6 +43,9 @@ impl PerformanceLog {
     pub fn sample(&mut self, player: &Player, window: &Window, presentation: PresentationStats, final_sample: bool) -> io::Result<()> {
         let now = Instant::now();
         let gc = player.gc_memory_stats();
+        let ordinary_sample = player.take_ordinary_orphan_sample(
+            !final_sample && std::env::var_os("AOLA_ORDINARY_ORPHANS").is_some(),
+        );
         let snapshot = PerformanceSnapshot {
             player: player.performance_stats(), presentation,
             gc_ns: gc.total_ns, gc_slices: gc.slices,
@@ -51,6 +54,7 @@ impl PerformanceLog {
         let interval = self.previous.map_or(json!({"available":false,"reason":"first-sample-for-movie"}), |(time, previous)| {
             let mut interval = performance_interval(previous, snapshot, now.duration_since(time).as_secs_f64());
             interval["tickUpdate"] = tick_interval(previous.player, snapshot.player);
+            interval["hostPresentGaps"] = present_gaps(previous.presentation, presentation);
             interval
         });
         self.previous = Some((now, snapshot));
@@ -83,10 +87,23 @@ impl PerformanceLog {
                 "libraryGpuBitmapsReleased":gc.library_gpu_cache_sweep.bitmaps_released,
                 "libraryGpuSweepCpuMs":gc.library_gpu_cache_sweep.total_ns as f64/1e6,
                 "orphanSlots":gc.orphan_slots});
-        let row = json!({
-            "schema":7,"game":"aola","build":BUILD,"fluxPortBuild":"aola-flux-v1",
+        let mut row = json!({
+            "schema":7,"game":"aola","build":BUILD,"fluxPortBuild":"aola-flux-v1","myProPortBuild":"aola-mypro-v1",
+            "longRunBuild":"aola-weak-keys-battle-gc-v1",
+            "weakDictionary":{"inserted":gc.weak_dictionary_inserted, "pruned":gc.weak_dictionary_pruned},
+            "battleMaintenance":{"entries":gc.battle_entries, "exits":gc.battle_exits,
+                "policy":gc.battle_cleanup_policy, "mainCycles":gc.battle_main_cycles,
+                "fullFollowupCycles":gc.battle_full_followup_cycles,
+                "followupSlices":gc.battle_followup_slices, "pending":gc.battle_followup_pending},
+            "processMemory":crate::aoqi_host::process_memory().unwrap_or_else(|_| json!({"available":false})),
+            "audioDefinitions":player.audio().sound_definition_stats().map(|s| json!({
+                "registered":s.registered, "tracked":s.tracked, "activeInstances":s.active_instances,
+                "encodedBytes":s.encoded_bytes, "retired":s.retired,
+            })),
             "petSwitchBuild":"pet-switch-leaf-v1","detailProfile":detail_mode.label(),
             "gotoLeafFastPath":ruffle_core::goto_profile::goto_leaf_fast_path_enabled(),
+            "gotoOrphanIdle":ruffle_core::goto_profile::goto_orphan_idle_enabled(),
+            "gotoTargetOnly":ruffle_core::goto_profile::goto_target_only_mode(),
             "gotoProfile":ruffle_core::goto_profile::enabled(),"hostElapsedMs":crate::aola_host::elapsed_ms(),
             "subtreeScriptSleep":ruffle_core::goto_profile::subtree_script_sleep_enabled(),
             "unixMs":SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
@@ -95,13 +112,20 @@ impl PerformanceLog {
             "runtimeFrameRateSetting":player.frame_rate(),"nativeFrameRateForced":player.is_frame_rate_forced(),
             "optimizationMode":{"sleep":mode.sleep,"loading":mode.loading,"dedup":mode.dedup,
                 "backgroundZws":mode.background_for_movie(b"ZWS"),
+                "backgroundLargeCws":mode.background_for_large_cws(),
+                "directBitmapGroupsRequested":std::env::var("AOLA_DIRECT_BITMAP_GROUPS").as_deref() != Ok("0"),
+                "fuseGlowRequested":std::env::var("AOLA_FUSE_GLOW").as_deref() == Ok("1"),
                 "socketBudgetMs":ruffle_core::socket::dispatch_budget_from_env().map_or(0, |d| d.as_millis() as u64),
-                "blockSkillRequested":std::env::var_os("AOLA_BLOCK_SKILL").as_deref() == Some(std::ffi::OsStr::new("1")),
+                "hideTransformPortraitRequested":std::env::var("AOLA_HIDE_TRANSFORM_PORTRAIT").as_deref() == Ok("1"),
+                "skipBattleBackdropRequested":std::env::var("AOLA_SKIP_BATTLE_BACKDROP").as_deref() == Ok("1"),
+                "optimizeBackpackRequested":std::env::var("AOLA_OPTIMIZE_BACKPACK").as_deref() == Ok("1"),
+                "longRunMaintenance":ruffle_render::backend::aola_long_run_maintenance(),
                 "hideNoticeRequested":std::env::var("AOLA_HIDE_NOTICE").as_deref() == Ok("1"),
                 "blockSkillRequested":std::env::var("AOLA_BLOCK_SKILL").as_deref() == Ok("1"),
                 "dxgiCachePressureRequested":std::env::var("AOLA_DXGI_CACHE_PRESSURE").as_deref() == Ok("1")},
             "processResourceWorker":{
                 "completedJobs":ruffle_core::aoqi_work::BACKGROUND_JOBS.load(Ordering::Relaxed),
+                "completedLargeCws":ruffle_core::aoqi_work::BACKGROUND_LARGE_CWS_JOBS.load(Ordering::Relaxed),
                 "totalWorkMs":ruffle_core::aoqi_work::BACKGROUND_NS.load(Ordering::Relaxed) as f64 / 1e6},
             "internalViewport":{"width":viewport.width,"height":viewport.height,"scaleFactor":viewport.scale_factor},
             "window":{"physicalWidth":size.width,"physicalHeight":size.height,"dpiScale":window.scale_factor()},
@@ -112,10 +136,38 @@ impl PerformanceLog {
 
             "sampleCpuMs":now.elapsed().as_secs_f64()*1000.0,
         });
+        row["ordinaryOrphanMode"] = player.ordinary_orphan_mode().into();
+        row["optimizationMode"]["texturePoolOptimizationRequested"] = (std::env::var("AOLA_BATTLE_TEXTURE_POOL").as_deref() == Ok("1")).into();
+        row["ordinaryOrphanBranchPruneRequested"] = (std::env::var("AOLA_ORDINARY_BRANCH_PRUNE").as_deref() == Ok("1")).into();
+        row["ordinaryOrphanSample"] = ordinary_sample.as_ref().map(ordinary_orphan_sample_record).into();
+        row["battleMaintenance"]["inBattleGc"] = json!({
+            "catchupEnabled":gc.battle_gc_catchup_enabled, "catchupSlices":gc.battle_gc_catchup_slices,
+            "completedCycles":gc.battle_gc_cycles, "dropped":gc.battle_gc_dropped, "freed":gc.battle_gc_freed,
+        });
+        let (to_trace, to_retrace, ready_groups, root_pending) = gc.gc_mark_backlog;
+        row["gcMarkBacklog"] = json!({
+            "toTrace":to_trace, "toRetrace":to_retrace, "readyWeakKeyGroups":ready_groups, "rootPending":root_pending,
+        });
+        let _write_phase = final_sample.then(|| crate::aola_close_phases::phase("final-log-write"));
         serde_json::to_writer(&mut self.file, &row)?;
         self.file.write_all(b"\n")?;
         self.file.flush()
     }
+}
+
+fn present_gaps(before: PresentationStats, after: PresentationStats) -> serde_json::Value {
+    let limits = PresentationStats::GAP_LIMITS_MS;
+    let counts: [u64; PresentationStats::GAP_LIMITS_MS.len() + 1] =
+        std::array::from_fn(|i| after.gap_counts[i] - before.gap_counts[i]);
+    let samples = counts.iter().sum::<u64>();
+    let percentile = |p: u64| {
+        let rank = (samples * p).div_ceil(100);
+        let mut sum = 0;
+        counts.iter().position(|n| { sum += n; samples != 0 && sum >= rank })
+            .and_then(|index| limits.get(index).copied())
+    };
+    json!({"upperBoundsMs":limits,"counts":counts,"samples":samples,
+        "p95UpperMs":percentile(95), "p99UpperMs":percentile(99)})
 }
 
 fn detail_records(mode: DetailMode, responses: Vec<ResponseCost>, dropped: u64) -> serde_json::Value {
@@ -165,6 +217,28 @@ fn orphan_census_record(c: &ruffle_core::orphan_census::Census) -> serde_json::V
         "unknownClass":c.unknown_class,"unknownMovie":c.unknown_movie,
         "omittedRoots":c.omitted_roots,"omittedGroups":c.omitted_groups,
         "groups":groups,"scanUs":c.scan_us
+    })
+}
+
+fn ordinary_orphan_sample_record(s: &ruffle_core::orphan_census::OrdinarySnapshot) -> serde_json::Value {
+    let groups: Vec<_> = s.groups.iter().map(|(g, count)| json!({
+        "class":g.class, "movieGroup":g.movie, "symbol":g.symbol, "rootPlayback":g.playback,
+        "hasChildren":g.children, "rootPendingScript":g.pending_script,
+        "rootCurrentFrameHasScript":g.script_on_current_frame, "roots":count,
+    })).collect();
+    let receivers: Vec<_> = s.script_receivers.iter()
+        .map(|(class, count)| json!({"class": class, "calls": count})).collect();
+    json!({
+        "ordinaryFrame":s.frame, "inBattle":s.in_battle, "slots":s.slots,
+        "sampled":s.sampled, "invalid":s.invalid, "omittedRoots":s.omitted_roots,
+        "groups":groups,
+        "frameScriptReceivers": {
+            "directCalls": s.script_calls,
+            "callLimit": ruffle_core::orphan_census::SAMPLE_LIMIT,
+            "classLimit": ruffle_core::orphan_census::GROUP_LIMIT,
+            "omittedCalls": s.script_calls - s.script_receivers.values().sum::<usize>(),
+            "classes": receivers,
+        },
     })
 }
 
@@ -227,6 +301,21 @@ fn tick_interval(old: ruffle_core::PerformanceStats, now: ruffle_core::Performan
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aola_present_gap_percentiles_use_only_the_sample_interval() {
+        let mut old = PresentationStats::default();
+        old.gap_counts[0] = 320;
+        let mut new = old;
+        new.gap_counts[2] = 95;
+        new.gap_counts[7] = 3;
+        new.gap_counts[13] = 2;
+        let row = present_gaps(old, new);
+        assert_eq!(row["samples"], 100);
+        assert_eq!(row["p95UpperMs"], 20);
+        assert!(row["p99UpperMs"].is_null()); // The 99th interval is longer than 1 s.
+        assert!(present_gaps(new, new)["p95UpperMs"].is_null());
+    }
     #[test]
     fn aola_summary_serializes_only_measured_detail_fields() {
         use ruffle_core::pet_detail_profile::DetailRoot;

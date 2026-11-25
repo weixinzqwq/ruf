@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::sync::Arc;
 
 use crate::{
     avm1::{NativeObject, Object as Avm1Object},
@@ -7,7 +8,7 @@ use crate::{
     display_object::{self, DisplayObject, MovieClip, TDisplayObject},
     string::AvmString,
 };
-use gc_arena::Collect;
+use gc_arena::{Collect, Gc};
 pub use ruffle_common::buffer::Substream;
 use ruffle_common::duration::FloatDuration;
 use slotmap::{Key, SlotMap, new_key_type};
@@ -45,6 +46,47 @@ new_key_type! {
 }
 
 pub type DecodeError = decoders::Error;
+
+/// An owner's reference to the mixer's encoded sound data.
+#[derive(Clone, Collect)]
+#[collect(require_static)]
+pub struct SoundOwner {
+    _encoded: Arc<[u8]>,
+}
+
+/// Copies in symbol libraries and script objects retain the same GC-traced owner.
+#[derive(Clone, Copy, Collect)]
+#[collect(no_drop)]
+pub struct RegisteredSound<'gc> {
+    #[collect(require_static)]
+    pub handle: SoundHandle,
+    _owner: Option<Gc<'gc, SoundOwner>>,
+}
+
+impl std::fmt::Debug for RegisteredSound<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.handle.fmt(f)
+    }
+}
+
+impl<'gc> RegisteredSound<'gc> {
+    pub(crate) fn new(context: &mut UpdateContext<'gc>, handle: SoundHandle) -> Self {
+        let owner = context.audio.track_sound_definition(handle);
+        Self {
+            handle,
+            _owner: owner.map(|owner| Gc::new(context.gc(), owner)),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SoundDefinitionStats {
+    pub registered: usize,
+    pub tracked: usize,
+    pub active_instances: usize,
+    pub encoded_bytes: u64,
+    pub retired: u64,
+}
 
 #[derive(Eq, PartialEq, Clone, Copy, Debug)]
 pub enum SoundStreamWrapping {
@@ -103,6 +145,22 @@ pub trait AudioBackend: Any {
 
     /// Registers MP3 audio from an external source.
     fn register_mp3(&mut self, data: &[u8]) -> Result<SoundHandle, DecodeError>;
+
+    /// Called only when a new registration is transferred to a known owner.
+    fn track_sound_definition(&mut self, _sound: SoundHandle) -> Option<SoundOwner> {
+        None
+    }
+
+    /// Keep already tracked metadata available through final position and completion handling.
+    fn retain_sound_definition(&self, _sound: SoundHandle) -> Option<SoundOwner> {
+        None
+    }
+
+    fn maintain_sound_definitions(&mut self) {}
+
+    fn sound_definition_stats(&self) -> Option<SoundDefinitionStats> {
+        None
+    }
 
     /// Plays a sound.
     fn start_sound(
@@ -469,6 +527,7 @@ impl<'gc> AudioManager<'gc> {
                 .ok()?;
             let mut instance = SoundInstance {
                 sound: Some(sound),
+                _completion_owner: audio.retain_sound_definition(sound),
                 instance: handle,
                 display_object,
                 transform: display_object::SoundTransform::default(),
@@ -599,6 +658,7 @@ impl<'gc> AudioManager<'gc> {
             let handle = audio.start_stream(data, stream_info).ok()?;
             let instance = SoundInstance {
                 sound: None,
+                _completion_owner: None,
                 instance: handle,
                 display_object: Some(movie_clip.into()),
                 transform: display_object::SoundTransform::default(),
@@ -625,6 +685,7 @@ impl<'gc> AudioManager<'gc> {
             let handle = audio.start_substream(stream_data, stream_info)?;
             let instance = SoundInstance {
                 sound: None,
+                _completion_owner: None,
                 instance: handle,
                 display_object: Some(movie_clip.into()),
                 transform: display_object::SoundTransform::default(),
@@ -851,6 +912,7 @@ pub struct SoundInstance<'gc> {
     /// This will be `None` for stream sounds.
     #[collect(require_static)]
     sound: Option<SoundHandle>,
+    _completion_owner: Option<SoundOwner>,
 
     /// The display object that this sound is playing in, if any.
     /// Used for volume mixing and `Sound.stop()`.

@@ -1254,7 +1254,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                     if let Some(dictionary) = object.as_dictionary_object() {
                         let _ = self.pop_stack();
                         let _ = self.pop_stack();
-                        let value = dictionary.get_property_by_object(name_object);
+                        let value = dictionary.get_property_by_object(name_object, self.gc());
                         self.push_stack(value);
 
                         return Ok(());

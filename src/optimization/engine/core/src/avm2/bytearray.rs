@@ -138,19 +138,25 @@ impl ByteArrayStorage {
     /// Write bytes at any offset in the ByteArray
     /// Will automatically grow the ByteArray to fit the new buffer
     pub fn write_at(&mut self, buf: &[u8], offset: usize) -> Result<(), ByteArrayError> {
-        if offset.saturating_add(buf.len()) > u32::MAX as usize {
-            return Err(ByteArrayError::IndexOutOfBounds);
+        let end = offset
+            .checked_add(buf.len())
+            .filter(|&end| end <= u32::MAX as usize)
+            .ok_or(ByteArrayError::IndexOutOfBounds)?;
+        if let Some(dst) = self.bytes.get_mut(offset..end) {
+            dst.copy_from_slice(buf);
+            return Ok(());
         }
 
-        // We know this is safe as we've already checked it's u32::MAX or lower
-        let new_len = offset + buf.len();
-        if self.len() < new_len {
-            self.set_length(new_len);
+        // Only a gap needs zeroes. A large write such as LoaderInfo.bytes can
+        // initialize the new tail directly from the source data.
+        if offset > self.len() {
+            self.bytes.reserve(end - self.len());
+            self.bytes.resize(offset, 0);
         }
-        self.bytes
-            .get_mut(offset..new_len)
-            .expect("ByteArray write out of bounds")
-            .copy_from_slice(buf);
+        let (overlap, tail) = buf.split_at(self.len() - offset);
+        self.bytes[offset..].copy_from_slice(overlap);
+        self.bytes.extend_from_slice(tail);
+        self.position.set(self.position().min(end));
         Ok(())
     }
 
@@ -465,3 +471,122 @@ macro_rules! impl_read{
 
 impl_write!(write_float f32, write_double f64, write_int i32, write_unsigned_int u32, write_short i16, write_unsigned_short u16);
 impl_read!(read_float read_float_at 4; f32, read_double read_double_at 8; f64, read_int read_int_at 4; i32, read_unsigned_int read_unsigned_int_at 4; u32, read_short read_short_at 2; i16, read_unsigned_short read_unsigned_short_at 2; u16, read_byte read_byte_at 1; i8, read_unsigned_byte read_unsigned_byte_at 1; u8);
+
+#[cfg(test)]
+mod tests {
+    use super::{ByteArrayError, ByteArrayStorage, Endian, ObjectEncoding};
+    use std::cell::Cell;
+
+    #[test]
+    fn write_at_matches_overwrite_and_zero_extended_writes() {
+        let original = ByteArrayStorage {
+            bytes: vec![1, 2, 3, 4],
+            position: Cell::new(10),
+            endian: Endian::Big,
+            object_encoding: ObjectEncoding::Amf3,
+        };
+        let source = [9, 8, 7, 6, 5];
+        for offset in 0..=7 {
+            for length in 0..=source.len() {
+                let end = offset + length;
+                let mut expected = original.clone();
+                if expected.len() < end {
+                    expected.set_length(end);
+                }
+                expected.bytes[offset..end].copy_from_slice(&source[..length]);
+
+                let mut actual = original.clone();
+                actual.write_at(&source[..length], offset).unwrap();
+                assert_eq!(actual.bytes(), expected.bytes());
+                assert_eq!(actual.position(), expected.position());
+            }
+        }
+
+        let mut actual = original.clone();
+        for offset in [u32::MAX as usize, usize::MAX] {
+            assert_eq!(
+                actual.write_at(&source, offset),
+                Err(ByteArrayError::IndexOutOfBounds)
+            );
+            assert_eq!(actual.bytes(), original.bytes());
+            assert_eq!(actual.position(), original.position());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires AOLA_BYTEARRAY_PROBE_SWF pointing to a local SWF"]
+    fn loaderinfo_bytes_real_swf_write_probe() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        fn reference_write_at(
+            storage: &mut ByteArrayStorage,
+            buf: &[u8],
+            offset: usize,
+        ) -> Result<(), ByteArrayError> {
+            if offset.saturating_add(buf.len()) > u32::MAX as usize {
+                return Err(ByteArrayError::IndexOutOfBounds);
+            }
+            let end = offset + buf.len();
+            if end > storage.len() {
+                storage.set_length(end);
+            }
+            storage.bytes[offset..end].copy_from_slice(buf);
+            Ok(())
+        }
+
+        let path = std::env::var_os("AOLA_BYTEARRAY_PROBE_SWF").unwrap();
+        let input = std::fs::read(&path).unwrap();
+        let movie = swf::decompress_swf(input.as_slice()).unwrap();
+        let mut header = movie.header.swf_header().clone();
+        header.compression = swf::Compression::None;
+        let mut fake_header = Vec::new();
+        swf::write_swf(&header, &[], &mut fake_header).unwrap();
+        let offset = fake_header.len() - 2; // LoaderInfo.bytes overwrites the implicit End tag.
+        assert!(movie.data.len() >= 2);
+        let mut expected = fake_header[..offset].to_vec();
+        expected.extend_from_slice(&movie.data);
+        let length = u32::try_from(expected.len()).unwrap();
+        expected[4..8].copy_from_slice(&length.to_le_bytes());
+
+        let batch = |write: fn(&mut ByteArrayStorage, &[u8], usize) -> Result<(), ByteArrayError>| {
+            let mut elapsed = Duration::ZERO;
+            for i in 0..9 {
+                let mut storage = ByteArrayStorage {
+                    bytes: fake_header.clone(),
+                    position: Cell::new(offset),
+                    endian: Endian::Big,
+                    object_encoding: ObjectEncoding::Amf3,
+                };
+                let start = Instant::now();
+                write(&mut storage, black_box(&movie.data), offset).unwrap();
+                black_box(storage.bytes());
+                elapsed += start.elapsed();
+
+                storage.set_position(4);
+                storage.set_endian(Endian::Little);
+                storage.write_unsigned_int(length).unwrap();
+                storage.set_position(0);
+                storage.set_endian(Endian::Big);
+                assert!(storage.bytes() == expected, "FWS differs on getter {i}");
+                storage.set(i, 255); // DomainLoader writes one byte to each returned copy.
+            }
+            elapsed.as_micros()
+        };
+
+        println!("swf={path:?} input_bytes={} fws_bytes={length} tag_bytes={} getters=9 warmup_pairs=1 batches=12 zero_fill_bytes_avoided_per_batch={}",
+            input.len(), movie.data.len(), 9 * (movie.data.len() - 2));
+        batch(reference_write_at);
+        batch(ByteArrayStorage::write_at);
+        println!("batch,order,reference_us,direct_us");
+        for i in 0..12 {
+            let (order, reference, direct) = if i % 2 == 0 {
+                ("AB", batch(reference_write_at), batch(ByteArrayStorage::write_at))
+            } else {
+                let direct = batch(ByteArrayStorage::write_at);
+                ("BA", batch(reference_write_at), direct)
+            };
+            println!("{},{order},{reference},{direct}", i + 1);
+        }
+    }
+}

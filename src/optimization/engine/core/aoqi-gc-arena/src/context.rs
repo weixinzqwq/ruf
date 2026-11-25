@@ -1,6 +1,6 @@
-use alloc::vec::Vec;
+use alloc::{collections::BTreeMap, vec::Vec};
 use core::{
-    cell::{Cell, UnsafeCell},
+    cell::{Cell, RefCell, UnsafeCell},
     mem,
     ops::{ControlFlow, Deref, DerefMut},
 };
@@ -121,6 +121,27 @@ impl<'gc> Trace<'gc> for Context {
     fn trace_gc_weak(&mut self, gc: GcWeak<'gc, ()>) {
         Context::trace_weak(self, gc.inner.ptr)
     }
+
+    fn trace_ephemeron(&mut self, key: GcWeak<'gc, ()>, value: GcWeak<'gc, ()>) {
+        let key = key.inner.ptr;
+        let value = value.inner.ptr;
+        self.trace_weak(key);
+        self.trace_weak(value);
+        if !key.header().is_live() || !value.header().is_live()
+            || matches!(value.header().color(), GcColor::Gray | GcColor::Black)
+            || key.addr_eq(value)
+        {
+            return;
+        }
+        if matches!(key.header().color(), GcColor::Gray | GcColor::Black) {
+            Context::trace(self, value);
+        } else {
+            let values = self.ephemerons.get_mut().entry(key.as_ptr()).or_default();
+            if values.last().is_none_or(|last| !last.addr_eq(value)) {
+                values.push(value);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -157,6 +178,7 @@ pub(crate) enum Stop {
 
 pub(crate) struct Context {
     metrics: Metrics,
+    pub(crate) drop_observer: Option<fn(bool, usize)>,
     phase: Phase,
     #[cfg(feature = "tracing")]
     phase_span: tracing::Span,
@@ -187,6 +209,11 @@ pub(crate) struct Context {
     // A queue of gray objects that became gray as a result
     // of a write barrier.
     gray_again: Queue<GcPtr>,
+
+    // Key promotion wakes its dependent values, including chains crossing multiple dictionaries.
+    // The marker consumes them one edge at a time. Sweep discards unresolved edges per dead key.
+    ephemerons: RefCell<BTreeMap<*const (), Vec<GcPtr>>>,
+    ready_ephemerons: Queue<Vec<GcPtr>>,
 }
 
 impl Drop for Context {
@@ -215,7 +242,13 @@ impl Drop for Context {
         }
 
         let cx = PhaseGuard::enter(self, Some(Phase::Drop));
+        if let Some(observer) = cx.drop_observer {
+            observer(true, cx.metrics.total_gc_count());
+        }
         DropAll(&cx.metrics, cx.all.get());
+        if let Some(observer) = cx.drop_observer {
+            observer(false, cx.metrics.total_gc_count());
+        }
     }
 }
 
@@ -224,6 +257,7 @@ impl Context {
         let metrics = Metrics::new();
         Context {
             phase: Phase::Sleep,
+            drop_observer: None,
             #[cfg(feature = "tracing")]
             phase_span: PhaseGuard::span_for(&metrics, Phase::Sleep),
             metrics: metrics.clone(),
@@ -233,6 +267,8 @@ impl Context {
             root_needs_trace: true,
             gray: Queue::new(),
             gray_again: Queue::new(),
+            ephemerons: RefCell::new(BTreeMap::new()),
+            ready_ephemerons: Queue::new(),
         }
     }
 
@@ -265,7 +301,13 @@ impl Context {
 
     #[inline]
     pub(crate) fn gray_remaining(&self) -> bool {
-        !self.gray.is_empty() || !self.gray_again.is_empty() || self.root_needs_trace
+        !self.gray.is_empty() || !self.gray_again.is_empty() || !self.ready_ephemerons.is_empty()
+            || self.root_needs_trace
+    }
+
+    pub(crate) fn mark_backlog(&self) -> (usize, usize, usize, bool) {
+        (self.gray.len(), self.gray_again.len(), self.ready_ephemerons.len(),
+         self.phase == Phase::Mark && self.root_needs_trace)
     }
 
     // Do some collection work until either we have achieved our `target` (paying off debt or
@@ -484,8 +526,16 @@ impl Context {
                 // Only marking the *first* time counts as a mark metric.
                 if color == GcColor::White {
                     self.metrics.mark_gc_marked(1);
+                } else {
+                    self.wake_ephemerons(gc_ptr);
                 }
             }
+        }
+    }
+
+    fn wake_ephemerons(&self, key: GcPtr) {
+        if let Some(values) = self.ephemerons.borrow_mut().remove(&key.as_ptr()) {
+            self.ready_ephemerons.push(values);
         }
     }
 
@@ -558,6 +608,8 @@ impl Context {
             // Only marking the *first* time counts as a mark metric.
             if color == GcColor::White {
                 self.metrics.mark_gc_marked(1);
+            } else {
+                self.wake_ephemerons(gc_ptr);
             }
         }
     }
@@ -610,6 +662,13 @@ impl Context {
             mem::forget(guard);
 
             ControlFlow::Continue(())
+        } else if let Some(mut values) = self.ready_ephemerons.pop() {
+            let value = values.pop().expect("promoted ephemeron key had no values");
+            if !values.is_empty() {
+                self.ready_ephemerons.push(values);
+            }
+            Context::trace(self, value);
+            ControlFlow::Continue(())
         } else if self.root_needs_trace {
             // We treat the root object as gray if `root_needs_trace` is set, and we process it at
             // the end of the gray queue for the same reason as the "gray again" objects.
@@ -624,6 +683,7 @@ impl Context {
     fn sweep_one(&mut self) -> ControlFlow<()> {
         let Some(mut sweep) = self.sweep else {
             self.sweep_prev.set(None);
+            debug_assert!(self.ephemerons.get_mut().is_empty());
             return ControlFlow::Break(());
         };
 
@@ -664,6 +724,9 @@ impl Context {
             // is still alive. We can only deallocate the `GcPtr`, once there are no weak pointers
             // left.
             GcColor::WhiteWeak => {
+                // A pending key stays weak-white until swept or promoted. Discard its edges
+                // here to avoid freeing every untriggered dictionary entry in a single step.
+                self.ephemerons.get_mut().remove(&sweep.as_ptr());
                 self.sweep_prev.set(Some(sweep));
                 sweep_header.set_color(GcColor::White);
                 if sweep_header.is_live() {
@@ -809,6 +872,11 @@ impl<T> Queue<T> {
 
     fn is_empty(&self) -> bool {
         unsafe { (*self.vec.get().cast_const()).is_empty() }
+    }
+
+    fn len(&self) -> usize {
+        // The single-threaded collector cannot mutate the queue during this read.
+        unsafe { (*self.vec.get().cast_const()).len() }
     }
 
     fn push(&self, val: T) {

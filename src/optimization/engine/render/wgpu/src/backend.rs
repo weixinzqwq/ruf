@@ -43,6 +43,10 @@ use tracing::instrument;
 use wgpu::SubmissionIndex;
 use wgpu_profiler::{GpuProfiler, GpuProfilerSettings};
 
+#[cfg(all(test, windows))]
+#[path = "small_upload_tests.rs"]
+mod small_upload_tests;
+
 /// Creates a wgpu instance with Ruffle's required configuration.
 ///
 /// This disables indirect call validation because wgpu's validation runs a compute
@@ -1036,6 +1040,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     | wgpu::TextureUsages::COPY_SRC,
             });
 
+        self.active_frame.small_upload_slots = 0;
         self.descriptors.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -1095,7 +1100,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             depth_or_array_layers: 1,
         };
 
-        self.active_frame.submit_direct(&self.descriptors);
+        self.active_frame.before_texture_upload(&self.descriptors, extent);
         self.descriptors.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture.texture,
@@ -1154,15 +1159,14 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             texture.texture.height(),
             wgpu::TextureFormat::Rgba8Unorm,
         );
+        let (encoder, belt) = self.active_frame.recording();
         surface.draw_commands_and_copy_to(
             frame_output.view(),
             RenderTargetMode::FreshWithTexture(target.get_texture()),
             &self.descriptors,
-            &mut self.active_frame.staging_belt,
+            belt,
             &self.dynamic_transforms,
-            &mut self
-                .profiler
-                .scope("Offscreen commands", &mut self.active_frame.command_encoder),
+            &mut self.profiler.scope("Offscreen commands", encoder),
             &self.meshes,
             commands,
             LayerRef::Current,
@@ -1218,11 +1222,12 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             buffer: None,
         };
 
+        let (encoder, belt) = self.active_frame.recording();
         let applied_filter = self.descriptors.filters.apply(
             &self.descriptors,
-            &mut self.active_frame.command_encoder,
+            encoder,
             &mut self.offscreen_texture_pool,
-            &mut self.active_frame.staging_belt,
+            belt,
             FilterSource {
                 bindings: None,
                 view: None,
@@ -1253,7 +1258,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             return None;
         }
 
-        self.active_frame.command_encoder.copy_texture_to_texture(
+        encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: applied_filter.color_texture(),
                 mip_level: 0,
@@ -1392,7 +1397,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             ShaderMode::ShaderJob,
             arguments,
             &target_texture.texture,
-            &mut self.active_frame.command_encoder,
+            self.active_frame.recording().0,
             Some(wgpu::RenderPassColorAttachment {
                 view: frame_output.view(),
                 resolve_target: None,
@@ -1612,10 +1617,13 @@ pub struct ActiveFrame {
     pub staging_belt: wgpu::util::StagingBelt,
     pub command_encoder: wgpu::CommandEncoder,
     draws_since_flush: u32,
+    batch_small_uploads: bool,
+    small_upload_slots: u8,
 }
 
 impl ActiveFrame {
     const MAX_DRAWS_PER_FLUSH: u32 = 100;
+    const MAX_SMALL_UPLOADS: u8 = 8;
 
     pub fn new(descriptors: &Descriptors) -> Self {
         Self {
@@ -1624,6 +1632,30 @@ impl ActiveFrame {
                 .create_command_encoder(&Default::default()),
             staging_belt: wgpu::util::StagingBelt::new(descriptors.device.clone(), 65536),
             draws_since_flush: 0,
+            batch_small_uploads: ruffle_render::backend::aola_long_run_maintenance(),
+            small_upload_slots: 0,
+        }
+    }
+
+    // A queued write executes before commands in the next submit. Break upload runs
+    // before recording even if the operation may return early (e.g. a clipped filter).
+    fn recording(&mut self) -> (&mut wgpu::CommandEncoder, &mut wgpu::util::StagingBelt) {
+        self.small_upload_slots = 0;
+        (&mut self.command_encoder, &mut self.staging_belt)
+    }
+
+    fn before_texture_upload(&mut self, descriptors: &Descriptors, extent: wgpu::Extent3d) {
+        // Only combine small queue writes following an upload that flushed the encoder.
+        // Eight 64x64 RGBA updates need at most 128 KiB of DX12 row-padded copy data.
+        let small = self.batch_small_uploads && extent.width <= 64 && extent.height <= 64;
+        if small && self.small_upload_slots > 0 {
+            self.small_upload_slots -= 1;
+            descriptors.resource_metrics.record_work(|s| s.small_upload_submissions_skipped += 1);
+        } else {
+            self.submit_direct(descriptors);
+            if small {
+                self.small_upload_slots = Self::MAX_SMALL_UPLOADS - 1;
+            }
         }
     }
 
@@ -1635,6 +1667,7 @@ impl ActiveFrame {
     ) -> SubmissionIndex {
         let started = web_time::Instant::now();
         self.draws_since_flush = 0;
+        self.small_upload_slots = 0;
         self.staging_belt.finish();
         let staging_finish_ns = started.elapsed().as_nanos() as u64;
         #[cfg(not(target_arch = "wasm32"))]
@@ -1691,6 +1724,7 @@ impl ActiveFrame {
     pub fn submit_direct(&mut self, descriptors: &Descriptors) -> SubmissionIndex {
         let started = web_time::Instant::now();
         self.draws_since_flush = 0;
+        self.small_upload_slots = 0;
         self.staging_belt.finish();
         let staging_finish_ns = started.elapsed().as_nanos() as u64;
         #[cfg(not(target_arch = "wasm32"))]

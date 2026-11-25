@@ -1,0 +1,300 @@
+MyPro v1.0.1：“脚本内容”的实现与 Winsock Hook 核查
+分析日期：2026-11-25
+样本：MyPro v1.0.1.exe
+SHA256：c15066170707be57ff4e2b124435817f401d46ec446f773a4ae5a51fdc208a68
+
+一、结论
+
+已确认的脚本实现是：WebView 面板 + Rust 宿主脚本/命令调度 + Ruffle ExternalInterface + 定制 SWF 注册的游戏接口。发送步骤调用游戏已有的 SocketServerClient，沿用既有连接。
+
+已闭合的底层网络链是 Ruffle Navigator 异步任务 → Tokio → Mio/标准库 Socket 包装 → 普通 ws2_32!send / ws2_32!recv。当前未发现这条脚本/收发链修改 Winsock IAT 或函数入口的证据。因此，将其主要实现称为“内建脚本桥接、游戏应用层报文观察与调用”准确；不能仅凭“拦截”按钮或 send/recv 导入称其为 Winsock Hook。
+
+分析仅静态读取上传样本、内嵌 HTML/JS、SWF ABC 和本机指令。未运行程序、登录游戏或向服务器发包。上述结论不等于证明整个二进制任何角落都绝无其他 Hook。
+
+
+二、先区分两套“脚本”
+
+1. 工坊的“脚本内容”
+   编辑框接受命令文本。页面不解释其全部指令，点击执行时发：
+       ipc.emit("ExecuteDevToolsScript", [content, count, delay, true]);
+   四个参数分别是文本、执行次数、轮次延时、开始/停止标志。
+   点击停止时发：
+       ipc.emit("ExecuteDevToolsScript", ["", 0, 0, false]);
+   宿主用 DevStatus 和 ExecuteDevScriptComplete 回传状态。
+   前端 SaveMyaScript / ReadMyaScript 用于保存/读入文本；本分析未完整还原磁盘文件的包装格式。
+
+2. 内置“脚本”列表
+   很多实际逻辑就在 HTML 的 JavaScript 中，包括标题映射、数据表、async 函数、循环、定时、回包判断和停止处理。
+   简单序列经 parseSequence / runSteps 执行：
+       “丨”分隔步骤；s=整数 表示毫秒延时；
+       普通字符串步骤调用 SendPacket，然后固定等待 200ms 继续。
+   复杂流程经 runManagedScript 的 session 对象执行：
+       send → SendPacket
+       result → SendAndGetResult → scriptResult，前端超时 5 秒
+       petBag → GetPetBag → petBagResult，前端超时 6 秒
+       scene → ChangeScene
+       auto → SetAuto
+       waitBattle → GetBattleState，初始等待 3 秒、以后每 250ms 检查
+   另有内置 runAolaScript，按竖线或换行分割，只显式处理 #send/#auto/#wait。
+   不应把这个 JS 解析器与工坊的原生命令解析器混为一套。
+
+   简单 runSteps 不等待每个服务器业务操作完成。SendPacket 返回 false 主要用于结束时提示错误；界面“执行完毕”不等于所有业务请求成功。
+   停止和互斥也不是所有类型统一实现：MANAGED 有取消状态、计时器清理和恢复设置；简单序列没有同样的完整停止逻辑。
+
+
+三、工坊文本的原生入口和解析器
+
+原生 IPC 分发函数位于首选 VA 0x1401e9f30..0x1401efcf1，ImageBase=0x140000000。
+ExecuteDevToolsScript 在 0x1401ea774 附近用重叠的 16 字节比较匹配，并非必须以完整可搜索字符串存在。
+
+开始路径：
+   0x1401ef53a → 0x14001e850
+   0x14001e86a → 解析器 0x140184730
+   解析成功后，0x14001e8d4 → 任务提交函数 0x140028b80
+
+停止路径：
+   0x1401ef1d9 → 0x14001e160
+   清除运行状态，并产生 ExecuteDevScriptComplete(false)。
+
+原生解析器已确认匹配：
+   send  ：0x140184b28，JSON 业务请求，检查 id/cmd/param。
+   time  ：0x140184b35，毫秒延时。
+   auto  ：0x140184b42，true/false 开关，执行时使用 auto 回调。
+   room  ：0x140184b4f，字符串参数，使用 room 回调。
+   wait  ：0x140184b5c，无参数的等待步骤。
+   activ ：0x140184a40 附近，两段字符串参数，使用 huodong 回调。
+   scene ：0x140184a5a 附近，字符串参数，使用 scene 回调。
+
+解析器使用 ASCII 竖线 | 分段，再识别 #命令=参数。周期更新函数 0x14002a430 推进指令、延时、循环和停止状态。send 步骤提交 send1 后设置约 200ms 的下一步节拍，这不是服务器业务确认。
+
+这是预定义操作组成的命令语言；已核对的工坊入口不把整段用户文本当 JavaScript 源码 eval，也不是只按脚本名称挑选一个固定按钮动作。
+
+#wait 的已见原生调度：
+   初始等待 3 秒；
+   检查游戏状态字段，仍在等待状态时每 250ms 重查；
+   总等待上限 600 秒；
+   状态结束后等待 1 秒，调用 close 回调，再等 1 秒，推进下一步。
+该状态字段为 player+0x692；运行分支入口 0x14002c284，跳转表 0x14143113c，超时字符串位于 0x14142ea60，内容为“等待战斗结束超时”。它用于战斗流程的状态等待，不是任意 TCP 回包的通用同步等待器。它也不保证曾经观察到战斗开始：初始 3 秒后状态已为 false 时，就会继续关闭与后续步骤。
+
+
+四、网页如何进入 Rust 宿主
+
+除面板 HTML 外，样本中还有一份注入的 IPC 启动脚本，EXE raw 0x14fd716 起。核心是：
+
+   ipc.emit(channel, args, callback)
+       → 分配 reqId（有回调时）
+       → JSON.stringify({ reqId, channel, args })
+       → window.ipc.postMessage(...)
+
+底层 Wry/WebView2 桥在 EXE raw 0x150190e 附近：
+   window.ipc.postMessage(s)
+       → window.chrome.webview.postMessage(s)
+
+宿主返回两类消息：
+   window.__aolaResolve(reqId, result)
+       → 解决一次 IPC 调用的回调；
+   window.__aolaDispatch(channel, args)
+       → 分发 scriptResult、DevStatus、addDevRow 等异步事件。
+
+这里的 reqId 是网页与宿主之间的 IPC 关联号，不应等同于游戏网络协议里的事务号。一次 IPC 调用成功、发送请求被接受、游戏业务响应成功，是不同的状态。
+
+SendPacket 的原生分支也已闭合：
+   0x1401ea5a0..0x1401ea5bc 匹配 SendPacket；
+   0x1401ec111 开始解析请求字符串；
+   0x1401eee5c 调用 0x14001def0。
+helper 0x14001def0 检查已注册回调名称 send1，把名称和转换后的参数放入宿主待调用队列。这与下节 SWF 实际注册的 send1 对应。
+
+
+五、真正的发包入口在定制 socketclient.swf
+
+以下方法编号属于解压后的 socketclient SWF 的 ABC104：
+   ABC 名称 mmo/framework/comm/SocketClient。
+   构造器 m187，SWF 偏移 0x3cde1。
+
+构造器实际注册：
+   ExternalInterface.addCallback("send1", sendXtMessage1);
+   ExternalInterface.addCallback("sendAndCallBack", sendXtMessage2);
+   ExternalInterface.addCallback("room", joinRoom);
+
+根据 m36（SWF 0x3aaf6）字节码整理的伪代码：
+
+   function sendXtMessage1(packet) {
+       socketServerClient.sendXtMessage(
+           packet.id,
+           packet.cmd,
+           packet.param,
+           "xml",
+           -1
+       );
+   }
+
+resetSocket（m21，SWF 0x3a5d8）从
+   mmo.ServerClient.instance.socketServerClient
+取得现有通信客户端。该发送入口没有新建一条独立的游戏登录连接。
+
+含义：
+   id 是该底层调用的扩展标识；
+   cmd 是业务命令；
+   param 是业务参数对象。
+脚本侧的 JSON 是业务对象表达。最终线上字节如何序列化、封装或作其他处理，由下层游戏客户端及网络实现负责；不能把脚本文本 JSON 直接当作 TCP 原始字节。
+
+宿主对战斗、场景和活动的控制也使用类似接口。start.swf 的 Load 构造器实际注册 19 个回调，包含：
+   huodong → 加载并显示活动面板；
+   scene → 调用场景管理器；
+   auto → 修改自动技能开关；
+   close → 战斗状态下关闭战斗面板；
+   showpackage / closepackage → 背包面板控制。
+所以脚本能力既有网络业务请求，也有直接调用游戏对象的方法。
+
+
+六、回包如何让脚本继续
+
+sendAndCallBack（m37，SWF 0x3ab3d）先按 packet.cmd 安装一次性 AS3 事件监听，然后调用现有 socketServerClient 发出请求。
+
+监听收到对应事件时移除自己，并经 m185（SWF 0x3ab20）执行：
+   ExternalInterface.call("onSyncResult", event.params);
+
+这不是在 AS3 中写一个阻塞等待网络的死循环。监听匹配键是 cmd，不能由此推导每条请求有独立的网络事务 ID。
+
+原生侧进一步核对：
+   0x1401a894b 附近比较 "onSyncResult" 的立即数字段；
+   0x1401a959d 分支将参数转换/序列化为宿主文本值；
+   0x1401a9d41 调用 0x1400263b0；
+   helper 清除当前等待标志，将结果推入共享结果队列；
+   UI 事件收集器 0x1401e1570 从相同队列构造 scriptResult。
+队列字段：以共享数据基址计为 +0x300；长度 +0x318。以 Arc 基址计长度为 +0x330，正好对应 UI 收集器读取位置。
+
+sendAndCallBack 宿主 helper 0x1400276a0 在新的等待请求开始前检查已有 pending 状态；占用时返回“正在读取返回值，请稍候”。因此这条等待路径有单个在途请求约束，不能宣称它天然支持任意数量的并发同命令请求。
+
+普通收包另外经过 SocketClient.onExtensionResponse（m32，SWF 0x3a8c9）：
+   已解析的 event.params.dataObj
+       → ExternalInterface.call("on_recv", dataObj)
+       → 正常游戏命令分发。
+此处的宿主参数是 AS3 业务对象，不是 recv() 原始缓冲区。
+
+
+七、“拦截”按钮的真实作用
+
+前端按钮发送：
+   ipc.emit("SetIntercept", [enabled]);
+
+结合 SWF 与 native，已闭合路径是：
+   普通游戏 SocketClient.sendXtMessage
+       → ExternalInterface.call("on_send", {id,cmd,param})
+       → Rust 对业务对象序列化并保存日志
+       → 事件收集器生成 addDevRow
+       → 工坊表格显示发送记录
+       → 用户可把记录追加为 #send=... 的脚本文本
+
+关键 native 证据：
+   SetIntercept 匹配：0x1401eab97
+   UI 开关写入：0x1401eedd5，app+0x15f
+   记录开关写入：0x1401eee15，Mutex+0x69b
+   on_send 路由：0x1401a7af3
+   调用记录 helper：0x1401a8feb → 0x140020fb0
+   检查记录开关：0x1400210f4，data+0x693
+   构造 addDevRow：0x1401e5709
+
+指针关系：
+   Mutex = Arc + 0x10
+   data = Arc + 0x18
+   Mutex+0x69b = data+0x693
+以上是同一个共享记录开关。
+
+记录块有上限：
+   序列化字符串超过 32768 字节不入日志；
+   日志最多保留 200 条，满时移除旧记录；
+   某些指定业务命令不记录。
+这些规则丢弃的是日志，不据此丢弃游戏的发送。
+
+为什么可以确认这一点：
+   SWF 的 on_send 调用使用 callpropvoid，宿主返回值被丢弃；
+   返回后游戏继续调用 socketServerClient.sendXtMessage。
+因此 UI 中“拦截”在这条开关路径上指消息采集/记录，不是扣住请求等待用户放行。
+
+必须保留两个区别：
+1. on_send 的 native handler 还会维护部分业务状态，不能把整个 handler 都概括成只有日志。
+2. 脚本 send1/sendAndCallBack 直接调用下层 socketServerClient，绕过普通包装层的 on_send 与 ExtMap 转换。因此这个观察点不能保证记录所有脚本自己发出的消息。
+
+on_recv 也丢弃宿主返回值。不过 m32 对两个指定命令的 pmview 分支实际使用宿主返回值重建 dataObj；这是确实存在的业务对象改写。不能将其扩大成任意回包都被通用过滤，也不能因 on_send/on_recv 本身是通知而断言程序完全不修改业务数据。
+
+
+八、底层为什么会有 Winsock，但不构成 Hook 证据
+
+主 Socket 异步任务：VA 0x1400be840..0x1400c061c。
+任务日志和 panic 元数据指向：
+   ruffle/frontend-utils/src/backends/navigator.rs
+
+读链：
+   0x1400bf15d → 0x140783de0
+       → Tokio readiness 0x140789b60
+       → 0x14079d980
+       → std wrapper 0x14134e290
+       → 主 IAT 0x14142cc70 = ws2_32!recv
+
+写链：
+   0x1400bf6f5 → 0x140783df0
+       → Tokio readiness 0x140789940
+       → 0x14079dbc0
+       → std wrapper 0x14134e7d0
+       → 主 IAT 0x14142cc78 = ws2_32!send
+
+读取使用 8192 字节缓冲区，写侧处理部分发送；WouldBlock/readiness 和 WSAGetLastError 属于正常 Socket I/O 处理。
+
+主程序导入 send、recv、connect、WSASend 等，只能证明它使用 Windows 网络 API。要证明 Winsock Hook，还需看见改写目标函数入口/导入项、重定向到自定义代理等控制流证据。已核对路径没有这样的正证据。
+
+容易误判的两组名称：
+1. VirtualProtect
+   已识别的一组调用是本程序 .fptable 动态 API 地址缓存临时可写后恢复只读；目标 VA 0x142425000，与 Winsock IAT 不同。
+   另一组来自 memmap2 的文件映射保护。不能据此认定修补 Winsock。
+
+2. SetWindowsHookExW / SetWinEventHook
+   外层文件 raw 0x1b85aab 起有内嵌 PE，产品名“勇芳_鼠标精灵”，版本 3.1.0.873，描述为录制/回放鼠标操作。
+   相关 USER32 Hook 导入位于这个工具中。它们不是主程序 Winsock API Hook 的证明。
+
+样本还存在 “socket relay lock” 和自身可选 relay 配置；本次未完整还原其配置来源及协议，不据其名称推定 Hook，也不把它当作已闭合脚本观察点。
+
+
+九、版本与复核信息
+
+内嵌 socketclient：
+   EXE raw 0x1565950，CWS 压缩存储 109030 字节；
+   解压 267599 字节；
+   SHA256 31c3367f4b2bb39d9eea5cdb37252912cb066545c61e6db00ad4557a81abe958。
+
+内嵌 start：
+   EXE raw 0x1550150，ZWS 压缩存储 4617 字节；
+   解压 9218 字节；
+   SHA256 6a0071dc803030f587f34607e45e854bdbdd1a1dcc6cf7478e63def6a50deeb6。
+
+这两份 SWF 与上传的 1.0.0 内嵌版本逐字节相同，不能把这些桥接能力全部称为 1.0.1 新增。
+
+面板复核：
+   panel_1.0.1_14ae5a1.html
+   parseSequence / runSteps / runManagedScript / runAolaScript
+   工坊 ExecuteDevToolsScript、SetIntercept、addDevRow、ExecuteDevScriptComplete
+
+反汇编复核：
+   script_host/1401e9f30.asm：IPC 分发
+   script_host/14001def0.asm：send1 排队
+   script_host/1400276a0.asm：sendAndCallBack 排队与在途限制
+   script_ui/native_parser_140184730.asm：工坊命令解析
+   script_ui/native_schedule_140028b80.asm：工坊任务提交
+   script_swf/socket_bridge.asm.txt：AS3 双向接口
+   script_swf/native_intercept_key.asm.txt：记录开关和 addDevRow
+   script_network/io_chain.asm.txt、winsock_wrappers.asm.txt：普通 Winsock 调用
+
+所有 0x140... 原生地址为该样本首选 VA，实际运行地址可能受 ASLR 影响；SWF 偏移明确相对于解压内容，不能混用。
+
+
+十、用于理解接口含义的官方参考
+
+1. ActionScript ExternalInterface
+   https://airsdk.dev/reference/actionscript/3.0/flash/external/ExternalInterface.html
+   addCallback 注册供宿主调用的 AS3 方法，call 调用宿主暴露的方法。
+   文档只解释 API 语义；MyPro 的具体使用以本报告的样本代码为证据。
+
+2. Microsoft Winsock send
+   https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-send
+   send 向已连接 Socket 发送数据；调用它不意味着进行了 Hook，发送函数成功也不能单独证明上层业务成功。
+

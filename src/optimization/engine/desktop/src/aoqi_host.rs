@@ -525,7 +525,7 @@ fn string(args: &[Value], index: usize) -> Result<&str, String> {
     args.get(index).and_then(Value::as_str).ok_or_else(|| format!("Argument {index} must be a string"))
 }
 
-fn process_memory() -> Result<Value, String> {
+pub(crate) fn process_memory() -> Result<Value, String> {
     use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();

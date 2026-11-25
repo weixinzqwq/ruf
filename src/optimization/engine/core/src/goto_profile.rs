@@ -17,6 +17,20 @@ pub fn goto_leaf_fast_path_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("AOLA_GOTO_LEAF_FAST_PATH").as_deref() == Ok("1"))
 }
 
+pub fn goto_orphan_idle_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("AOLA_GOTO_ORPHAN_IDLE").as_deref() == Ok("1"))
+}
+
+pub fn goto_target_only_mode() -> &'static str {
+    static MODE: OnceLock<&str> = OnceLock::new();
+    MODE.get_or_init(|| match std::env::var("AOLA_GOTO_TARGET_ONLY").as_deref() {
+        Ok("battle") => "battle",
+        Ok("1") => "all",
+        _ => "off",
+    })
+}
+
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("AOLA_GOTO_PROFILE").as_deref() == Ok("1"))
@@ -31,14 +45,14 @@ pub fn work_name(index: usize) -> &'static str {
 pub enum Counter {
     ConstructVisits, ScriptVisits, ScriptCalls, OrphanVisits, OrphanExecuted,
     OrphanInvalid, OrphanSleepSkipped, BroadcastCandidates, BroadcastDispatched,
-    CleanupSlots, CleanupRemoved, ConstructLeafHits, ScriptLeafHits,
+    CleanupSlots, CleanupRemoved, ConstructLeafHits, ScriptLeafHits, OrphanGotoIdleSkipped,
 }
 
-pub const COUNTER_NAMES: [&str; 13] = [
+pub const COUNTER_NAMES: [&str; 14] = [
     "movieClipConstructVisits", "movieClipScriptVisits", "scriptCalls", "orphanVisits",
     "orphanExecuted", "orphanInvalid", "orphanSleepSkipped", "broadcastCandidates",
     "broadcastDispatched", "cleanupSlots", "cleanupRemoved", "movieClipConstructLeafHits",
-    "movieClipScriptLeafHits",
+    "movieClipScriptLeafHits", "orphanGotoIdleSkipped",
 ];
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -276,6 +290,6 @@ mod tests {
         assert_eq!(next.phases[REMOVED_SCRIPTS].counts[Counter::ScriptVisits as usize], 3);
         assert_eq!(next.phases.iter().map(|p| p.exclusive_ns).sum::<u64>(), next.outer_total_ns);
         assert_eq!(work_name(REMOVED_SCRIPTS), "removedScripts");
-        assert_eq!(COUNTER_NAMES.len(), Counter::ScriptLeafHits as usize + 1);
+        assert_eq!(COUNTER_NAMES.len(), Counter::OrphanGotoIdleSkipped as usize + 1);
     }
 }

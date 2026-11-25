@@ -82,10 +82,15 @@ use tracing::instrument;
 use web_time::Instant;
 
 mod aoqi_gc;
+pub(crate) use aoqi_gc::BattleMaintenance;
+mod close_phases;
+use close_phases::DropBoundary;
 #[cfg(test)]
 mod aola_library_tests;
 #[cfg(test)]
 mod aola_goto_tests;
+#[cfg(test)]
+mod aola_weak_dictionary_tests;
 
 #[cfg(feature = "default_font")]
 pub const FALLBACK_DEVICE_FONT: &[u8] = include_bytes!("../assets/notosans.subset.ttf.gz");
@@ -177,7 +182,11 @@ impl<'gc> MouseData<'gc> {
 struct GcRootData<'gc> {
     root_swf: SwfMovie<'gc>,
 
+    #[collect(require_static)]
+    _before_library_drop: DropBoundary,
     library: Library<'gc>,
+    #[collect(require_static)]
+    _after_library_drop: DropBoundary,
 
     /// The root of the display object hierarchy.
     ///
@@ -328,8 +337,23 @@ pub struct GcMemoryStats {
     pub gc_lifetime_allocated: u64,
     pub gc_lifetime_dropped: u64,
     pub gc_lifetime_freed: u64,
+    pub gc_mark_backlog: (usize, usize, usize, bool),
+    pub weak_dictionary_inserted: u64,
+    pub weak_dictionary_pruned: u64,
     pub completed_cycles: u64,
     pub periodic_cycles: u64,
+    pub battle_entries: u64,
+    pub battle_exits: u64,
+    pub battle_cleanup_policy: &'static str,
+    pub battle_main_cycles: u64,
+    pub battle_full_followup_cycles: u64,
+    pub battle_followup_slices: u64,
+    pub battle_followup_pending: bool,
+    pub battle_gc_catchup_enabled: bool,
+    pub battle_gc_catchup_slices: u64,
+    pub battle_gc_cycles: u64,
+    pub battle_gc_dropped: u64,
+    pub battle_gc_freed: u64,
     pub known_movies: usize,
     pub known_movie_bytes: usize,
     pub library_characters: usize,
@@ -392,7 +416,9 @@ pub struct Player {
     needs_render: bool,
 
     renderer: Box<dyn RenderBackend>,
+    _after_renderer_drop: DropBoundary,
     audio: Box<dyn AudioBackend>,
+    _after_audio_drop: DropBoundary,
     navigator: Box<dyn NavigatorBackend>,
     storage: Box<dyn StorageBackend>,
     log: Box<dyn LogBackend>,
@@ -404,9 +430,12 @@ pub struct Player {
 
     rng: AvmRng,
 
+    _before_arena_release: DropBoundary,
     gc_arena: Rc<RefCell<GcArena>>,
+    _after_arena_release: DropBoundary,
     gc_slice: Duration,
     gc_scheduler: aoqi_gc::Scheduler,
+    battle_maintenance: BattleMaintenance,
     performance: PerformanceStats,
     frame_profile: crate::frame_profile::FrameProfiler,
     tick_profile: crate::tick_profile::TickProfiler,
@@ -483,6 +512,8 @@ pub struct Player {
     /// Debug UI windows
     #[cfg(feature = "egui")]
     debug_ui: Rc<RefCell<crate::debug_ui::DebugUi>>,
+    // Keep this last: Player::drop returns before Rust drops the fields above.
+    _after_player_fields: DropBoundary,
 }
 
 impl Player {
@@ -495,7 +526,9 @@ impl Player {
     pub fn gc_memory_stats(&self) -> GcMemoryStats {
         // Use the post-collection inventory. Upgrading all weak movies here
         // during marking would turn diagnostics into a new retention root.
-        let inventory = self.enter_arena(|_, root, _| root.library.movie_inventory());
+        let (inventory, weak_keys) = self.enter_arena(|_, root, _| {
+            (root.library.movie_inventory(), root.avm2.weak_dictionary_stats.get())
+        });
         let arena = self.gc_arena.borrow();
         let phase = match arena.collection_phase() {
             gc_arena::arena::CollectionPhase::Sleeping => "sleeping",
@@ -510,8 +543,24 @@ impl Player {
             gc_lifetime_allocated: arena.metrics().lifetime_allocated(),
             gc_lifetime_dropped: arena.metrics().lifetime_dropped(),
             gc_lifetime_freed: arena.metrics().lifetime_freed(),
+            gc_mark_backlog: arena.mark_backlog(),
+            weak_dictionary_inserted: weak_keys.inserted,
+            weak_dictionary_pruned: weak_keys.pruned,
             completed_cycles: self.gc_scheduler.completed_cycles,
             periodic_cycles: self.gc_scheduler.periodic_cycles,
+            battle_entries: self.battle_maintenance.entries,
+            battle_exits: self.battle_maintenance.exits,
+            battle_cleanup_policy: if !ruffle_render::backend::aola_long_run_maintenance() { "off" }
+                else if self.battle_maintenance.legacy_followup_only { "legacy-slice" } else { "main-and-followup" },
+            battle_main_cycles: self.battle_maintenance.main_cycles,
+            battle_full_followup_cycles: self.battle_maintenance.full_followup_cycles,
+            battle_followup_slices: self.battle_maintenance.followup_slices,
+            battle_followup_pending: self.battle_maintenance.pending(),
+            battle_gc_catchup_enabled: self.battle_maintenance.catchup_enabled,
+            battle_gc_catchup_slices: self.battle_maintenance.catchup_slices,
+            battle_gc_cycles: self.battle_maintenance.combat_cycles,
+            battle_gc_dropped: self.battle_maintenance.combat_dropped,
+            battle_gc_freed: self.battle_maintenance.combat_freed,
             known_movies: inventory.movies,
             known_movie_bytes: inventory.bytes,
             library_characters: inventory.characters,
@@ -551,17 +600,38 @@ impl Player {
         self.tick_profile.take_slow()
     }
 
-    fn collect_frame_gc(&mut self) {
-        let interval = Duration::from_secs_f64(1.0 / self.frame_rate.max(1.0))
-            .max(Duration::from_millis(1));
-        self.collect_gc_with_interval(interval);
+    pub fn ordinary_orphan_mode(&self) -> &'static str {
+        crate::orphan_manager::ordinary_orphan_mode()
     }
 
-    fn collect_gc_with_interval(&mut self, interval: Duration) {
+    /// Return the previous requested sample and optionally arm the next ordinary Enter pass.
+    pub fn take_ordinary_orphan_sample(&self, request_next: bool) -> Option<crate::orphan_census::OrdinarySnapshot> {
+        self.frame_profile.ordinary_sample_requested.set(request_next);
+        self.frame_profile.ordinary_sample.take()
+    }
+
+    fn collect_frame_gc(&mut self, frame_work: Duration) {
+        let interval = Duration::from_secs_f64(1.0 / self.frame_rate.max(1.0))
+            .max(Duration::from_millis(1));
+        self.collect_gc_with_interval(interval, frame_work);
+    }
+
+    fn collect_gc_with_interval(&mut self, interval: Duration, frame_work: Duration) {
         let cycles = self.gc_scheduler.completed_cycles;
-        self.gc_scheduler.collect_for_frame(&mut self.gc_arena.borrow_mut(), self.gc_slice, interval);
+        let battle_report = self.gc_scheduler.collect_for_frame(&mut self.gc_arena.borrow_mut(), self.gc_slice, interval, frame_work,
+            &mut self.battle_maintenance, Instant::now(), |arena| arena.mutate(|_, root| {
+                let root = root.data.borrow();
+                (root.library.registered_movie_count(), root.avm2.weak_dictionary_stats.get().pruned)
+            })).map(|report| (report, Instant::now()));
         if self.gc_scheduler.completed_cycles != cycles {
             self.enter_arena_mut(|mc, root, _| root.library.after_collection(mc));
+            self.audio.maintain_sound_definitions();
+        }
+        if let Some((report, start)) = battle_report {
+            let maintenance_time = start.elapsed();
+            let (movies, pruned) = self.enter_arena(|_, root, _|
+                (root.library.registered_movie_count(), root.avm2.weak_dictionary_stats.get().pruned));
+            report.finish_maintenance(&mut self.battle_maintenance, movies, pruned, maintenance_time);
         }
     }
 
@@ -690,7 +760,7 @@ impl Player {
     pub fn tick(&mut self, dt: FloatDuration) {
         use crate::tick_profile::TickWork;
         if !self.is_playing() {
-            self.collect_frame_gc();
+            self.collect_frame_gc(Duration::ZERO);
             return;
         }
 
@@ -774,7 +844,7 @@ impl Player {
         // Collect once after all frame/timer/stream work, not once per update.
         // Repeated host wakeups inside one frame share the same collection slot.
         self.tick_profile.switch(TickWork::Gc);
-        self.collect_frame_gc();
+        self.collect_frame_gc(aoqi_gc::estimated_tick_work(tick_started.elapsed(), dt, frame_duration));
         let tick_finished = Instant::now();
         self.tick_profile.finish(tick_finished);
         let ns = tick_finished.duration_since(tick_started).as_nanos() as u64;
@@ -2276,7 +2346,7 @@ impl Player {
         self.performance.max_frame_ns = self.performance.max_frame_ns.max(ns);
         // Exporters/tests may advance frames without using the host tick loop.
         if !self.in_tick {
-            self.collect_gc_with_interval(Duration::ZERO);
+            self.collect_gc_with_interval(Duration::ZERO, Duration::ZERO);
         }
     }
 
@@ -2539,6 +2609,7 @@ impl Player {
             ) = gc_root.update_context_params();
 
             let mut update_context = UpdateContext {
+                battle_maintenance: &mut this.battle_maintenance,
                 frame_profile: &mut this.frame_profile,
                 tick_profile: &mut this.tick_profile,
                 player_version: this.player_version,
@@ -2840,7 +2911,12 @@ impl Player {
 
 impl Drop for Player {
     fn drop(&mut self) {
+        close_phases::record("player-drop", "begin");
+        close_phases::record("shared-object-flush", "begin");
         self.flush_shared_objects();
+        close_phases::record("shared-object-flush", "end");
+        // The fields ahead of renderer are Copy scalars.
+        close_phases::record("player-renderer-drop", "begin");
     }
 }
 
@@ -3216,7 +3292,9 @@ impl PlayerBuilder {
                 external_interface_provider,
                 fs_command_provider,
             ),
+            _before_library_drop: DropBoundary::BeforeRootLibrary,
             library: Library::empty(),
+            _after_library_drop: DropBoundary::AfterRootLibrary,
             load_manager: LoadManager::new(),
             mouse_data: MouseData {
                 custom_cursors: FnvHashSet::default(),
@@ -3291,6 +3369,8 @@ impl PlayerBuilder {
         let player = Arc::new_cyclic(|self_ref| {
             Mutex::new(Player {
                 // Backends
+                _after_renderer_drop: DropBoundary::AfterRenderer,
+                _after_audio_drop: DropBoundary::AfterAudio,
                 audio,
                 log,
                 navigator,
@@ -3350,7 +3430,11 @@ impl PlayerBuilder {
 
                 // GC data
                 gc_slice: aoqi_gc::slice_duration(),
+                _before_arena_release: DropBoundary::BeforeArena,
+                _after_arena_release: DropBoundary::AfterArena,
+                _after_player_fields: DropBoundary::AfterPlayerFields,
                 gc_scheduler: Default::default(),
+                battle_maintenance: BattleMaintenance::from_config(),
                 performance: Default::default(),
                 frame_profile: Default::default(),
                 tick_profile: Default::default(),
@@ -3370,6 +3454,9 @@ impl PlayerBuilder {
 
         // Finalize configuration and load the movie.
         let mut player_lock = player.lock().unwrap();
+        if close_phases::enabled() {
+            player_lock.gc_arena.borrow_mut().set_drop_observer(close_phases::gc_drop_edge);
+        }
         player_lock.gc_arena.borrow().metrics().set_pacing(gc_arena::metrics::Pacing {
             sleep_factor: aoqi_gc::sleep_factor(),
             ..Default::default()

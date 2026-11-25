@@ -37,6 +37,17 @@ pub struct PresentationStats {
     pub frames: u64,
     pub cpu_ns: u64,
     pub max_cpu_ns: u64,
+    pub gap_counts: [u64; PresentationStats::GAP_LIMITS_MS.len() + 1],
+}
+
+impl PresentationStats {
+    // Inclusive upper bounds. The last counter holds intervals longer than 1 s.
+    pub const GAP_LIMITS_MS: [u64; 13] = [8, 16, 20, 25, 33, 40, 50, 67, 100, 150, 250, 500, 1000];
+
+    fn record_gap(&mut self, gap: Duration) {
+        let index = Self::GAP_LIMITS_MS.partition_point(|&ms| gap > Duration::from_millis(ms));
+        self.gap_counts[index] += 1;
+    }
 }
 
 pub struct GuiController {
@@ -57,6 +68,8 @@ pub struct GuiController {
     no_gui: bool,
     fixed_movie_resolution: bool,
     presentation_stats: PresentationStats,
+    track_present_gaps: bool,
+    previous_present: Option<Instant>,
     theme_controller: ThemeController,
     #[cfg(feature = "tracy_images")]
     tracy_frame_captures: crate::tracy::FrameCapturesHolder,
@@ -197,6 +210,8 @@ impl GuiController {
             no_gui,
             fixed_movie_resolution,
             presentation_stats: Default::default(),
+            track_present_gaps: preferences.cli.aola_host,
+            previous_present: None,
             theme_controller,
             #[cfg(feature = "tracy_images")]
             tracy_frame_captures,
@@ -298,6 +313,7 @@ impl GuiController {
         tracing::info!("Opening {}", content_descriptor.describe());
 
         self.close_movie(player);
+        self.previous_present = None;
         let movie_view = MovieView::new(
             self.movie_view_renderer.clone(),
             &self.descriptors.device,
@@ -576,7 +592,11 @@ impl GuiController {
 
         self.window.pre_present_notify();
         self.descriptors.queue.present(surface_texture);
-        let ns = presentation_started.elapsed().as_nanos() as u64;
+        let presented = Instant::now();
+        let ns = presented.duration_since(presentation_started).as_nanos() as u64;
+        if self.track_present_gaps && let Some(last) = self.previous_present.replace(presented) {
+            self.presentation_stats.record_gap(presented.duration_since(last));
+        }
         self.presentation_stats.frames += 1;
         self.presentation_stats.cpu_ns += ns;
         self.presentation_stats.max_cpu_ns = self.presentation_stats.max_cpu_ns.max(ns);

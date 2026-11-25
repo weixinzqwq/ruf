@@ -37,9 +37,6 @@ fn main_vertex(in: VertexInput) -> VertexOutput {
 
 @fragment
 fn main_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
-    let inner = filter_args.inner > 0u;
-    let knockout = filter_args.knockout > 0u;
-    let composite_source = filter_args.composite_source > 0u;
     var blur = textureSample(blurred, texture_sampler, in.blur_uv).a;
     var dest = textureSample(texture, texture_sampler, in.source_uv);
 
@@ -47,6 +44,32 @@ fn main_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         blur = 0.0;
     }
 
+    return compose_glow(blur, dest);
+}
+
+@group(1) @binding(1) var blur_sampler: sampler;
+@group(3) @binding(0) var<uniform> last_blur: BlurArgs;
+
+@vertex
+fn fused_vertex(in: VertexInput) -> VertexOutput {
+    let pos = vec4<f32>(in.position.x * 2.0 - 1.0, 1.0 - in.position.y * 2.0, 0.0, 1.0);
+    let shift = vec2<f32>(last_blur.dir_x, last_blur.dir_y) * last_blur.m;
+    return VertexOutput(pos, in.source_uv, in.blur_uv - shift);
+}
+
+@fragment
+fn fused_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+    let blurred_color = box_blur(blurred, blur_sampler, in.blur_uv, last_blur);
+    // box_blur already rounds to an eight-bit value before normalization.
+    // Only alpha is consumed by the glow composition.
+    let dest = textureSample(texture, texture_sampler, in.source_uv);
+    return compose_glow(blurred_color.a, dest);
+}
+
+fn compose_glow(blur: f32, dest: vec4<f32>) -> vec4<f32> {
+    let inner = filter_args.inner > 0u;
+    let knockout = filter_args.knockout > 0u;
+    let composite_source = filter_args.composite_source > 0u;
     // [NA] It'd be nice to use hardware blending but the operation is too complex :( Only knockouts would work.
 
     // Start with 1 alpha because we'll be multiplying the whole thing

@@ -2,8 +2,9 @@ use crate::avm2::Multiname;
 use crate::avm2::activation::Activation;
 use crate::avm2::error::{Error, make_error_1001};
 use crate::avm2::method::{Method, MethodKind, ParamConfig};
-use crate::avm2::object::{ClassObject, FunctionObject};
+use crate::avm2::object::{ClassObject, FunctionObject, TObject};
 use crate::avm2::scope::ScopeChain;
+use crate::avm2::swf_operation::Operation;
 use crate::avm2::traits::TraitKind;
 use crate::avm2::value::Value;
 use crate::string::WString;
@@ -243,6 +244,10 @@ pub fn exec<'gc>(
     let panel_trace = crate::aola_panel_diagnostics::enabled()
         && crate::aola_panel_diagnostics::begin_method(method.profile_name());
     let detail = activation.context.tick_profile.begin_detail(method.detail_root(), || method.profile_name());
+    let operation = method.swf_operation();
+    let previous_managers = if operation == Operation::DisposeFight {
+        activation.context.battle_maintenance.managers_returned.take()
+    } else { None };
     let result = if detail == crate::tick_profile::DetailCall::FullRoot {
         exec_detail_root(method, scope, receiver, bound_superclass, user_arguments, activation, callee)
     } else {
@@ -253,16 +258,8 @@ pub fn exec<'gc>(
     if detail == crate::tick_profile::DetailCall::FullRoot {
         crate::orphan_census::after_response(activation.context);
     }
-    let operation = method.swf_operation();
-    if operation.observes_return() && result.is_ok() {
-        let stack = activation.context.avm2.call_stack();
-        let stack = stack.borrow();
-        // exec_inner has already popped the successfully returned method.
-        let mut callers = stack.callers().map(|m| m.swf_operation());
-        let mut parent = || callers.next().unwrap_or(super::swf_operation::Operation::Other);
-        if let Some(label) = operation.event(parent(), parent()) {
-            tracing::info!(target: "aola_swf_operation", operation = label);
-        }
+    if operation != Operation::Other {
+        observe_swf_return(operation, receiver, result.is_ok(), previous_managers, activation);
     }
     if crate::aola_panel_diagnostics::armed() {
         if let Err(error) = &result {
@@ -271,6 +268,33 @@ pub fn exec<'gc>(
         if panel_trace { crate::aola_panel_diagnostics::emit(method.profile_name(), "method-return", u64::from(result.is_ok()), ""); }
     }
     result
+}
+
+// Only the handful of bound battle/backpack methods need this frame.
+#[cold]
+#[inline(never)]
+fn observe_swf_return<'gc>(operation: Operation, receiver: Value<'gc>, succeeded: bool,
+    previous_managers: Option<usize>, activation: &mut Activation<'_, 'gc>) {
+    if operation == Operation::DisposeFight {
+        activation.context.battle_maintenance.finish_dispose(previous_managers,
+            receiver.as_object().map(|o| o.as_ptr() as usize), succeeded, web_time::Instant::now(),
+            ruffle_render::backend::aola_long_run_maintenance());
+    } else if operation == Operation::ConstructFight && succeeded {
+        if let Some(obj) = receiver.as_object() {
+            activation.context.battle_maintenance.enter(obj.as_ptr() as usize);
+        }
+    } else if (operation.observes_return() || operation == Operation::DisposeFightManagers) && succeeded {
+        let stack = activation.context.avm2.call_stack();
+        let stack = stack.borrow();
+        // exec_inner has already popped the successfully returned method.
+        let mut callers = stack.callers().map(|m| m.swf_operation());
+        let parent = callers.next().unwrap_or(Operation::Other);
+        if operation == Operation::DisposeFightManagers && parent == Operation::DisposeFight {
+            activation.context.battle_maintenance.managers_returned = receiver.as_object().map(|o| o.as_ptr() as usize);
+        } else if let Some(label) = operation.event(parent, callers.next().unwrap_or(Operation::Other)) {
+            tracing::info!(target: "aola_swf_operation", operation = label);
+        }
+    }
 }
 
 // Keep the large renderer counter snapshot out of every AVM call's stack frame.

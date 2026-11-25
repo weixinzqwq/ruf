@@ -20,6 +20,80 @@ fn bitmap(renderer: &mut WgpuRenderBackend<TextureTarget>) -> BitmapHandle {
     renderer.register_bitmap(Bitmap::new(32, 24, BitmapFormat::Rgba, pixels)).unwrap()
 }
 
+#[test]
+#[ignore = "explicit DX12 comparison of isolated and direct bitmap groups"]
+fn disjoint_bitmap_groups_match_isolation_on_dx12() {
+    let mut renderer = WgpuRenderBackend::for_offscreen(
+        (160, 80), wgpu::Backends::DX12, wgpu::PowerPreference::HighPerformance,
+    ).unwrap();
+    let bitmap = bitmap(&mut renderer);
+    let enabled = std::env::var("AOLA_DIRECT_BITMAP_GROUPS").as_deref() != Ok("0");
+    println!("adapter={} direct_bitmap_groups_enabled={enabled}", renderer.descriptors().adapter.get_info().name);
+    let mut hits = 0;
+    let mut comparisons = 0;
+    let mut saved_surfaces = 0;
+    for quality in [StageQuality::Low, StageQuality::High] {
+        renderer.set_quality(quality);
+        for mode in [BlendMode::Normal, BlendMode::Layer, BlendMode::Add, BlendMode::Subtract, BlendMode::Screen, BlendMode::Multiply] {
+            for (case, spacing) in [("separated", 49.0), ("touching", 32.0), ("overlap", 31.0), ("fractional", 32.25), ("masked", 49.0)] {
+                let mut group = CommandList::new();
+                for (i, x) in [8.0, 8.0 + spacing, 117.0].into_iter().enumerate() {
+                    let region = if i == 1 { PixelRegion::for_region(3, 2, 19, 18) }
+                        else { PixelRegion::for_whole_size(32, 24) };
+                    group.commands.push(Command::RenderBitmap {
+                        bitmap: bitmap.clone(), region, smoothing: i != 1,
+                        pixel_snapping: PixelSnapping::Never,
+                        transform: Transform { matrix: Matrix::translate(
+                            Twips::from_pixels(x), Twips::from_pixels(8.0),
+                        ), ..Default::default() },
+                    });
+                }
+                let scene = |reference| {
+                    let mut group = group.clone();
+                    if reference {
+                        // In-bounds transparent primitive forces isolation without changing its extent.
+                        group.commands.push(Command::DrawRect {
+                            color: Color::TRANSPARENT, matrix: Matrix::translate(Twips::from_pixels(10.0), Twips::from_pixels(10.0)),
+                        });
+                    }
+                    let mut scene = CommandList::new();
+                    scene.commands.push(Command::DrawRect {
+                        color: Color::from_rgba(0x79538790), matrix: Matrix::scale(61.0, 61.0),
+                    });
+                    let blend = Command::Blend(group, RenderBlendMode::Builtin(mode));
+                    if case == "masked" {
+                        let mask = Command::DrawRect { color: Color::WHITE, matrix: Matrix::scale(70.0, 23.0) };
+                        scene.commands.extend([Command::PushMask, mask.clone(), Command::ActivateMask, blend,
+                            Command::DeactivateMask, mask, Command::PopMask]);
+                    } else {
+                        scene.commands.push(blend);
+                    }
+                    scene
+                };
+                let before = renderer.resource_stats().unwrap().work;
+                renderer.submit_frame(Color::from_rgba(0x47698fb0), scene(true), vec![]);
+                let reference = renderer.capture_frame().unwrap();
+                let middle = renderer.resource_stats().unwrap().work;
+                renderer.submit_frame(Color::from_rgba(0x47698fb0), scene(false), vec![]);
+                let trial = renderer.capture_frame().unwrap();
+                let after = renderer.resource_stats().unwrap().work;
+                let expected = u64::from(enabled && mode != BlendMode::Multiply && matches!(case, "separated" | "touching"));
+                assert_eq!(middle.direct_bitmap_groups - before.direct_bitmap_groups, 0);
+                assert_eq!(after.direct_bitmap_groups - middle.direct_bitmap_groups, expected);
+                let reference_surfaces = middle.surface_passes - before.surface_passes;
+                let trial_surfaces = after.surface_passes - middle.surface_passes;
+                assert_eq!(reference_surfaces, trial_surfaces + expected);
+                let difference = reference.as_raw().iter().zip(trial.as_raw()).map(|(a,b)| a.abs_diff(*b)).max().unwrap();
+                assert_eq!(difference, 0, "{quality:?} {mode:?} {case}");
+                comparisons += 1;
+                hits += expected;
+                saved_surfaces += reference_surfaces - trial_surfaces;
+            }
+        }
+    }
+    println!("comparisons={comparisons} max_channel_difference=0 direct_groups={hits} saved_surfaces={saved_surfaces}");
+}
+
 fn scene(bitmap: &BitmapHandle, mode: BlendMode, reference: bool, fractional: bool, count: u32) -> CommandList {
     let mut commands = CommandList::new();
     // Overlapping opaque and translucent destination colors exercise blending.

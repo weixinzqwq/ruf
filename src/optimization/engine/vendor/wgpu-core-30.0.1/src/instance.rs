@@ -722,6 +722,7 @@ impl Drop for Surface {
         if let Some(present) = self.presentation.lock().take() {
             for (&backend, surface) in &self.surface_per_backend {
                 if backend == present.device.backend() {
+                    let _phase = hal::aola_close::Phase::begin("wgpu-surface-unconfigure");
                     unsafe { surface.unconfigure(present.device.raw()) };
                 }
             }
@@ -1132,6 +1133,7 @@ impl Global {
     }
 
     pub fn surface_drop(&self, id: SurfaceId) {
+        let _phase = hal::aola_close::Phase::begin("wgpu-surface-handle-release");
         profiling::scope!("Surface::drop");
 
         api_log!("Surface::drop {id:?}");

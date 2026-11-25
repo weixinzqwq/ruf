@@ -4,6 +4,7 @@ mod aola_lifecycle;
 mod aola_swf_capture;
 mod aola_skin_recipe;
 mod aola_display_patch;
+mod aola_backpack_edits;
 mod aola_battle_edits;
 mod aola_notice_edits;
 
@@ -205,6 +206,19 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
             BATTLE.audit("config", "enabled");
         } else {
             BATTLE.audit("config", "invalid-reference");
+        }
+        self
+    }
+
+    pub fn with_aola_backpack(mut self, bundle: Option<&Path>) -> Self {
+        use aola_display_patch::{ARCHIVED_BACKPACK, DisplayPatch, SUPPLIED_BACKPACK};
+        for recipe in [&SUPPLIED_BACKPACK, &ARCHIVED_BACKPACK] {
+            if let Some(root) = bundle {
+                self.display_patches.push(Arc::new(DisplayPatch::new(recipe, root)));
+                recipe.audit("config", "enabled");
+            } else {
+                recipe.audit("config", "invalid-reference");
+            }
         }
         self
     }
@@ -799,6 +813,47 @@ mod tests {
             "pet/petfightnew", "261112849126071", true).await;
     }
 
+    #[tokio::test]
+    #[ignore = "requires both backpack references and independently rebuilt candidates"]
+    async fn manual_backpack_navigator_fetch_checks_both_versions_and_preserves_cache() {
+        let bundle = PathBuf::from(std::env::var_os("AOLA_TEST_BACKPACK_FILES").unwrap());
+        let read = |name| std::fs::read(bundle.join(name)).unwrap();
+        let supplied = read("supplied.swf");
+        let archived = read("archived.swf");
+        let supplied_optimized = read("supplied-optimized.swf");
+        let archived_optimized = read("archived-optimized.swf");
+        let mut changed = supplied.clone();
+        *changed.last_mut().unwrap() ^= 1;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = AoqiCache::new(dir.path().into()).unwrap();
+        let cases = [
+            (".swf", &supplied, &supplied_optimized),
+            ("~123.swf", &supplied, &supplied_optimized),
+            ("~2026111953323155.swf", &archived, &archived_optimized),
+            ("~2026111953323155.swf?v=1", &supplied, &supplied),
+            ("~123.swf?v=1", &archived, &archived),
+            (".swf?v=1", &changed, &changed),
+        ];
+        for (suffix, bytes, _) in cases {
+            let url = Url::parse(&format!("https://aola.100bt.com/play/pet/newpetpackage{suffix}")).unwrap();
+            let policy = AoqiCache::response_policy(&url, &url, 200, &header::HeaderMap::new()).unwrap();
+            assert!(cache.store(&url, &policy, bytes).unwrap());
+        }
+        for enabled in [false, true, false] {
+            let mut backend = new_test_backend(false).with_aoqi_cache(dir.path().into()).unwrap();
+            backend.client = None;
+            if enabled { backend = backend.with_aola_backpack(Some(&bundle)); }
+            for (suffix, bytes, optimized) in cases {
+                let url = format!("https://aola.100bt.com/play/pet/newpetpackage{suffix}");
+                let response = backend.fetch(Request::get(url.clone())).await.unwrap_or_else(|e| panic!("{}", e.error));
+                assert_eq!(response.url().as_ref(), url);
+                assert_eq!(response.status(), 200);
+                let expected = if enabled { optimized } else { bytes };
+                assert!(response.body().await.unwrap().as_slice() == expected.as_slice(), "{suffix}");
+            }
+        }
+    }
+
     async fn check_display_patch(var: &str, output: &str, path: &str, version: &str, battle: bool) {
         let bundle = PathBuf::from(std::env::var_os(var).expect(var));
         let original = std::fs::read(bundle.join("original.swf")).unwrap();
@@ -832,6 +887,57 @@ mod tests {
         }
     }
 
+    async fn serve_swf_fixture(mut connection: TcpStream, url: &str, bytes: &[u8]) {
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            assert!(request.len() < 8192);
+            request.push(connection.read_u8().await.unwrap());
+        }
+        assert!(request.starts_with(format!("GET {url} HTTP/1.1\r\n").as_bytes()));
+        let headers = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
+        connection.write_all(headers.as_bytes()).await.unwrap();
+        connection.write_all(bytes).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires both rebuilt backpack fixtures and a local loopback listener"]
+    async fn manual_backpack_local_http_patches_network_and_caches_both_originals() {
+        let root = PathBuf::from(std::env::var_os("AOLA_TEST_BACKPACK_FILES").expect("AOLA_TEST_BACKPACK_FILES"));
+        let cases = [
+            ("http://aola.100bt.com/play/pet/newpetpackage.swf", "supplied"),
+            ("http://aola.100bt.com/play/pet/newpetpackage~2026111953323155.swf", "archived"),
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixtures = root.clone();
+        let server = tokio::spawn(async move {
+            for (url, name) in cases {
+                let (connection, _) = listener.accept().await.unwrap();
+                let bytes = std::fs::read(fixtures.join(format!("{name}.swf"))).unwrap();
+                serve_swf_fixture(connection, url, &bytes).await;
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mut online = new_test_backend(false).with_aola_cache(dir.path().into()).unwrap()
+            .with_aola_backpack(Some(&root));
+        online.client = Some(Rc::new(reqwest::Client::builder()
+            .no_proxy().proxy(Proxy::all(format!("http://{address}")).unwrap())
+            .resolve("aola.100bt.com", address)
+            .timeout(Duration::from_secs(15)).build().unwrap()));
+        let mut offline = new_test_backend(false).with_aola_cache(dir.path().into()).unwrap();
+        offline.client = None;
+        for (navigator, suffix) in [(&online, "-optimized.swf"), (&offline, ".swf")] {
+            for (url, name) in cases {
+                let expected = std::fs::read(root.join(format!("{name}{suffix}"))).unwrap();
+                let response = navigator.fetch(Request::get(url.into())).await.unwrap_or_else(|e| panic!("{}", e.error));
+                assert_eq!(response.status(), 200);
+                assert_eq!(response.url().as_ref(), url);
+                assert!(response.body().await.unwrap() == expected, "{name}{suffix}");
+            }
+        }
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "transport smoke test requires permission to connect to the local loopback listener"]
     async fn manual_swf_local_http_delivers_real_roundtrip_through_fetch() {
@@ -849,17 +955,9 @@ mod tests {
         let served_util = util.clone();
         let server = tokio::spawn(async move {
             for (path, bytes) in [(util_url, served_util), (url, original)] {
-                let (mut connection, _) = listener.accept().await.unwrap();
+                let (connection, _) = listener.accept().await.unwrap();
                 accepted.store(true, std::sync::atomic::Ordering::Relaxed);
-                let mut request = Vec::new();
-                while !request.ends_with(b"\r\n\r\n") {
-                    assert!(request.len() < 8192);
-                    request.push(connection.read_u8().await.unwrap());
-                }
-                assert!(request.starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes()));
-                let headers = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
-                connection.write_all(headers.as_bytes()).await.unwrap();
-                connection.write_all(&bytes).await.unwrap();
+                serve_swf_fixture(connection, path, &bytes).await;
             }
         });
         let mut backend = new_test_backend(false).with_aola_lifecycle("roundtrip", &root, &root, false);

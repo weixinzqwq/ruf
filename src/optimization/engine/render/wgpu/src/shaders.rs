@@ -53,12 +53,12 @@ impl Shaders {
         let blur_filter = make_filter_shader(
             device,
             "filter/blur.wgsl",
-            include_str!("../shaders/filter/blur.wgsl"),
+            concat!(include_str!("../shaders/filter/blur_kernel.wgsl"), "\n", include_str!("../shaders/filter/blur.wgsl")),
         );
         let glow_filter = make_filter_shader(
             device,
             "filter/glow.wgsl",
-            include_str!("../shaders/filter/glow.wgsl"),
+            concat!(include_str!("../shaders/filter/blur_kernel.wgsl"), "\n", include_str!("../shaders/filter/glow.wgsl")),
         );
         let bevel_filter = make_filter_shader(
             device,

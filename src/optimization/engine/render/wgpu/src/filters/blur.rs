@@ -27,13 +27,19 @@ struct BlurUniform {
     last_weight: f32,
 }
 
+pub(super) struct BlurTargets {
+    pub output: CommandTarget,
+    pub scratch: CommandTarget,
+    pub deferred_uniform: Option<wgpu::BindGroup>,
+}
+
 pub struct BlurFilter {
-    bind_group_layout: wgpu::BindGroupLayout,
+    pub(super) bind_group_layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     vertex_buffer: wgpu::Buffer,
     #[cfg(test)]
     uniform_buffer: wgpu::Buffer,
-    uniform_cache: FilterUniformCache,
+    pub(super) uniform_cache: FilterUniformCache,
     vertices_size: wgpu::BufferSize,
     #[cfg(test)]
     uniform_size: wgpu::BufferSize,
@@ -152,12 +158,12 @@ impl BlurFilter {
         source: &FilterSource,
         filter: &BlurFilterArgs,
     ) -> Option<CommandTarget> {
-        self.apply_with_scratch(descriptors, texture_pool, draw_encoder, staging_belt, source, filter)
-            .map(|(blurred, _scratch)| blurred)
+        self.apply_with_scratch(descriptors, texture_pool, draw_encoder, staging_belt, source, filter, false)
+            .map(|targets| targets.output)
     }
 
     /// Keep the unused ping-pong target for the caller's following filter pass.
-    pub fn apply_with_scratch(
+    pub(super) fn apply_with_scratch(
         &self,
         descriptors: &Descriptors,
         texture_pool: &mut TexturePool,
@@ -165,7 +171,8 @@ impl BlurFilter {
         staging_belt: &mut StagingBelt,
         source: &FilterSource,
         filter: &BlurFilterArgs,
-    ) -> Option<(CommandTarget, CommandTarget)> {
+        defer_last_vertical: bool,
+    ) -> Option<BlurTargets> {
         if filter.num_passes() == 0
             || (filter.blur_x.to_f32() <= 1.0 && filter.blur_y.to_f32() <= 1.0)
         {
@@ -217,7 +224,7 @@ impl BlurFilter {
 
         let source_view = source.view.cloned().unwrap_or_else(|| source.texture.create_view(&Default::default()));
         let mut first = true;
-        for _ in 0..(filter.num_passes() as usize) {
+        for pass in 0..filter.num_passes() {
             for i in 0..2 {
                 let horizontal = i % 2 == 0;
                 let strength = if horizontal {
@@ -303,6 +310,15 @@ impl BlurFilter {
                     .unwrap_or_else(|| self.uniform_cache.get(descriptors, bytemuck::bytes_of(&uniform)));
                 descriptors.resource_metrics.record_work(|s| s.filter_uniform_prepare_ns += prepare_started.elapsed().saturating_sub(uniform_bind_time).as_nanos() as u64);
 
+                if defer_last_vertical && !horizontal && pass + 1 == filter.num_passes() {
+                    // The caller requires at least one horizontal pass first.
+                    return Some(BlurTargets {
+                        output: flip,
+                        scratch: flop,
+                        deferred_uniform: Some(uniform_group),
+                    });
+                }
+
                 self.render_with_uniform_buffers(
                     descriptors,
                     draw_encoder,
@@ -323,24 +339,16 @@ impl BlurFilter {
             // Nothing happened, don't return an empty unused texture
             None
         } else {
-            Some((flip, flop))
+            Some(BlurTargets { output: flip, scratch: flop, deferred_uniform: None })
         }
     }
 
-    fn render_with_uniform_buffers(
+    pub(super) fn texture_group(
         &self,
         descriptors: &Descriptors,
-        draw_encoder: &mut CommandEncoder,
-        pipeline: &RenderPipeline,
-        destination: &CommandTarget,
         source: &TextureView,
-        vertices: BufferSlice,
-        uniform_group: &wgpu::BindGroup,
-        source_target: Option<&CommandTarget>,
-        source_bindings: Option<&crate::buffer_pool::BlurBindings>,
-    ) {
-        let bind_started = web_time::Instant::now();
-        let create_group = || descriptors
+    ) -> wgpu::BindGroup {
+        descriptors
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
                 label: create_debug_label!("Filter group").as_deref(),
@@ -357,8 +365,23 @@ impl BlurFilter {
                         ),
                     },
                 ],
-            });
+            })
+    }
 
+    fn render_with_uniform_buffers(
+        &self,
+        descriptors: &Descriptors,
+        draw_encoder: &mut CommandEncoder,
+        pipeline: &RenderPipeline,
+        destination: &CommandTarget,
+        source: &TextureView,
+        vertices: BufferSlice,
+        uniform_group: &wgpu::BindGroup,
+        source_target: Option<&CommandTarget>,
+        source_bindings: Option<&crate::buffer_pool::BlurBindings>,
+    ) {
+        let bind_started = web_time::Instant::now();
+        let create_group = || self.texture_group(descriptors, source);
         let filter_group = if !super::uniform_cache::streamed_reference()
             && let Some(source_target) = source_target {
             source_target.filter_bind_group(descriptors, 0, create_group)

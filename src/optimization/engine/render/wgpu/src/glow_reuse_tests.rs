@@ -46,10 +46,14 @@ fn glow_pixels_and_pressure_allocations_on_dx12() {
         renderer.set_texture_pool_limits(TexturePoolLimits { idle_bytes: budget, idle_frames: 120 });
         for crop in [false, true] { for case in 0..8 {
             let destination = renderer.create_empty_texture(NonZeroU32::new(80).unwrap(), NonZeroU32::new(60).unwrap()).unwrap();
-            let before = renderer.resource_stats().unwrap().temporary_texture.created_count;
+            let before = renderer.resource_stats().unwrap();
             let sync = renderer.apply_filter(source.clone(), if crop {(7,5)} else {(0,0)},
                 if crop {(40,30)} else {(64,48)}, destination.clone(), if crop {(-3,2)} else {(2,2)}, filter(case)).unwrap();
-            let created = renderer.resource_stats().unwrap().temporary_texture.created_count - before;
+            let after = renderer.resource_stats().unwrap();
+            let created = after.temporary_texture.created_count - before.temporary_texture.created_count;
+            let enabled = std::env::var("AOLA_FUSE_GLOW").as_deref() == Ok("1");
+            let expected_fused = enabled && !crop && matches!(case, 0 | 1 | 2 | 7);
+            assert_eq!(after.work.fused_glow_passes - before.work.fused_glow_passes, u64::from(expected_fused));
             if budget == 0 {
                 assert_eq!(created, if case == 3 || case == 4 { 1 } else { 2 });
             }
@@ -86,9 +90,12 @@ fn glow_pool_pressure_on_dx12() {
     let mut handles=Vec::new();
     for phase in 0..3 { crate::backend_work_tests::render(&mut renderer,phase,true,true,true,&mut handles);renderer.capture_frame().unwrap(); }
     let before=renderer.resource_stats().unwrap();
+    let mut elapsed = std::time::Duration::ZERO;
     for phase in 3..15 {
+        let started = std::time::Instant::now();
         crate::backend_work_tests::render(&mut renderer,phase,true,true,true,&mut handles);
         renderer.device().poll(wgpu::PollType::Wait {submission_index:None,timeout:Some(std::time::Duration::from_secs(10))}).unwrap();
+        elapsed += started.elapsed();
         if [3,7,14].contains(&phase) {
             let pixels=renderer.capture_frame().unwrap();let name=format!("glow-pressure-{phase}.rgba");
             if let Some(reference)=&reference {
@@ -103,6 +110,12 @@ fn glow_pool_pressure_on_dx12() {
     let after=renderer.resource_stats().unwrap();
     assert_eq!(after.work.queue_submissions-before.work.queue_submissions,12);
     assert_eq!(after.work.filter_calls[2]-before.work.filter_calls[2],38*12);
+    let fused = after.work.fused_glow_passes - before.work.fused_glow_passes;
+    let blurs = after.work.blur_passes - before.work.blur_passes;
+    let enabled = std::env::var("AOLA_FUSE_GLOW").as_deref() == Ok("1");
+    assert_eq!(fused, if enabled { 38 * 12 } else { 0 });
+    assert_eq!(blurs + fused, 38 * 12 * 4);
+    println!("fused_glow passes={fused} separate_blurs={blurs} total_ms={:.3}", elapsed.as_secs_f64() * 1000.0);
     println!("glow_pressure frames=12 created={} evicted={} rejected={} hits={} misses={}",
         after.temporary_texture.created_count-before.temporary_texture.created_count,
         after.temporary_pool_pressure_evictions-before.temporary_pool_pressure_evictions,

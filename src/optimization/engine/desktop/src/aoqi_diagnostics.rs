@@ -104,17 +104,35 @@ pub(crate) fn performance_interval(before: PerformanceSnapshot, after: Performan
         "name":name,"exclusiveCpuMs":ms(p.frame_update.exclusive_ns[i],old.frame_update.exclusive_ns[i]),
         "calls":delta(p.frame_update.calls[i],old.frame_update.calls[i]),
     })).collect();
+    let ordinary_phase = |i: usize| {
+        let now = p.frame_update.ordinary_orphans[i];
+        let previous = old.frame_update.ordinary_orphans[i];
+        json!({
+            "invalidRoots": delta(now.invalid_roots, previous.invalid_roots),
+            "sleepingRoots": delta(now.sleeping_roots, previous.sleeping_roots),
+            "scriptlessRoots": delta(now.scriptless_roots, previous.scriptless_roots),
+            "dispatchedRoots": delta(now.dispatched_roots, previous.dispatched_roots),
+            "sleepingDescendants": delta(now.sleeping_descendants, previous.sleeping_descendants),
+            "scriptlessDescendants": delta(now.scriptless_descendants, previous.scriptless_descendants),
+        })
+    };
     let frame_update = json!({
         "scope":"run_frame-exclusive-including-preload-returns", "stages":frame_stages,
         "startedFrames":delta(p.frame_update.started_frames,old.frame_update.started_frames),
         "completedFrames":delta(p.frame_update.completed_frames,old.frame_update.completed_frames),
         "preloadReturns":delta(p.frame_update.preload_returns,old.frame_update.preload_returns),
         "nestedGotos":delta(p.frame_update.nested_gotos,old.frame_update.nested_gotos),
+        "targetOnlyGotos":delta(p.frame_update.target_only_gotos,old.frame_update.target_only_gotos),
         "scriptCalls":delta(p.frame_update.script_calls,old.frame_update.script_calls),
         "orphanVisits":delta(p.frame_update.orphan_visits,old.frame_update.orphan_visits),
         "orphanExecuted":delta(p.frame_update.orphan_executed,old.frame_update.orphan_executed),
         "orphanInvalid":delta(p.frame_update.orphan_invalid,old.frame_update.orphan_invalid),
         "orphanSleepSkipped":delta(p.frame_update.orphan_sleep_skipped,old.frame_update.orphan_sleep_skipped),
+        "orphanGotoIdleSkipped":delta(p.frame_update.orphan_goto_idle_skipped,old.frame_update.orphan_goto_idle_skipped),
+        "ordinaryOrphans": {
+            "enter": ordinary_phase(0), "construct": ordinary_phase(1), "scripts": ordinary_phase(2),
+            "directFrameScriptCalls": delta(p.frame_update.ordinary_orphan_script_calls, old.frame_update.ordinary_orphan_script_calls),
+        },
         "broadcastCandidates":delta(p.frame_update.broadcast_candidates,old.frame_update.broadcast_candidates),
         "broadcastDispatched":delta(p.frame_update.broadcast_dispatched,old.frame_update.broadcast_dispatched),
     });
@@ -128,12 +146,29 @@ pub(crate) fn performance_interval(before: PerformanceSnapshot, after: Performan
         .iter().enumerate().map(|(i,name)| json!({"name":name,
             "calls":delta(w.filter_calls[i],old_w.filter_calls[i]),
             "cpuMs":ms(w.filter_ns[i],old_w.filter_ns[i])})).collect();
-    let temporary_allocations: Vec<_> = ["msaaColor","singleSampleColor","stencil","other"]
+    let kinds = ["msaaColor","singleSampleColor","stencil","other"];
+    let areas = ["upTo64Squared","upTo256Squared","upTo512Squared","belowStageArea","stageAreaOrLarger"];
+    let temporary_allocations: Vec<_> = kinds
         .iter().enumerate().map(|(i,name)| json!({"name":name,
             "created":delta(w.temporary_created[i],old_w.temporary_created[i]),
             "createdTexels":delta(w.temporary_created_texels[i],old_w.temporary_created_texels[i]),
             "createdEstimatedBytes":delta(w.temporary_created_bytes[i],old_w.temporary_created_bytes[i]),
             "creationCpuMs":ms(w.temporary_creation_ns[i],old_w.temporary_creation_ns[i])})).collect();
+    let mut size_requests = serde_json::Map::new();
+    let mut pool_misses = serde_json::Map::new();
+    for (bin, area) in areas.iter().enumerate() {
+        size_requests.insert((*area).to_owned(), json!(delta(w.temporary_size_requests[bin], old_w.temporary_size_requests[bin])));
+    }
+    for (kind, name) in kinds.iter().enumerate() {
+        let mut counts = serde_json::Map::new();
+        for (bin, area) in areas.iter().enumerate() {
+            counts.insert((*area).to_owned(), json!({
+                "missingBucket":delta(w.temporary_pool_missing_bucket[kind][bin],old_w.temporary_pool_missing_bucket[kind][bin]),
+                "emptyBucket":delta(w.temporary_pool_empty_bucket[kind][bin],old_w.temporary_pool_empty_bucket[kind][bin]),
+            }));
+        }
+        pool_misses.insert((*name).to_owned(), Value::Object(counts));
+    }
     let mut render_stages = json!({
             "eventMs":ms(p.render_event_ns,old.render_event_ns),
             "sceneBuildMs":ms(p.render_build_ns,old.render_build_ns),
@@ -188,9 +223,10 @@ pub(crate) fn performance_interval(before: PerformanceSnapshot, after: Performan
     for (i,key) in ["dx12CommandListResetMs","dx12CommandListCreateMs","dx12CommandListNameMs","dx12CommandStateClearMs"].into_iter().enumerate() {
         render_stages[key] = json!(ms(w.native_command_recording[i],old_w.native_command_recording[i]));
     }
-    json!({"available":true,"seconds":seconds,"filterWork":filters,"temporaryAllocations":temporary_allocations,
+    let mut report = json!({"available":true,"seconds":seconds,"filterWork":filters,"temporaryAllocations":temporary_allocations,
         "filterSetup":{"uniformCacheHits":delta(w.filter_uniform_cache_hits,old_w.filter_uniform_cache_hits),
             "uniformCacheMisses":delta(w.filter_uniform_cache_misses,old_w.filter_uniform_cache_misses),
+            "fusedGlowPasses":delta(w.fused_glow_passes,old_w.fused_glow_passes),
             "uniformCacheEvictions":delta(w.filter_uniform_cache_evictions,old_w.filter_uniform_cache_evictions),
             "uniformUploads":delta(w.filter_uniform_uploads,old_w.filter_uniform_uploads),
             "uniformPrepareMs":ms(w.filter_uniform_prepare_ns,old_w.filter_uniform_prepare_ns),
@@ -207,11 +243,7 @@ pub(crate) fn performance_interval(before: PerformanceSnapshot, after: Performan
             "paddedTargets":delta(w.blend_padded_targets,old_w.blend_padded_targets),
             "paddingPixels":delta(w.blend_padding_pixels,old_w.blend_padding_pixels),
             "parentCopyPixels":delta(w.blend_parent_copy_pixels,old_w.blend_parent_copy_pixels)},
-        "temporarySizeRequests":{"upTo64Squared":delta(w.temporary_size_requests[0],old_w.temporary_size_requests[0]),
-            "upTo256Squared":delta(w.temporary_size_requests[1],old_w.temporary_size_requests[1]),
-            "upTo512Squared":delta(w.temporary_size_requests[2],old_w.temporary_size_requests[2]),
-            "belowStageArea":delta(w.temporary_size_requests[3],old_w.temporary_size_requests[3]),
-            "stageAreaOrLarger":delta(w.temporary_size_requests[4],old_w.temporary_size_requests[4])},
+        "temporarySizeRequests":size_requests,
         "logicalFps":delta(p.frames,old.frames) as f64/seconds,
         "presentedFps":delta(present.frames,old_present.frames) as f64/seconds,
         "tickCpuMs":ms(p.tick_ns,old.tick_ns),"averageTickMs":average(delta(p.tick_ns,old.tick_ns),delta(p.ticks,old.ticks)),
@@ -248,8 +280,10 @@ pub(crate) fn performance_interval(before: PerformanceSnapshot, after: Performan
             "commands":delta(w.draw_commands,old_w.draw_commands),
             "queueSubmissions":delta(w.queue_submissions,old_w.queue_submissions),
             "directSubmissions":delta(w.direct_submissions,old_w.direct_submissions),
+            "smallUploadSubmissionsSkipped":delta(w.small_upload_submissions_skipped,old_w.small_upload_submissions_skipped),
             "cacheEntriesExamined":delta(w.cache_entries_examined,old_w.cache_entries_examined),
             "directBitmapBlends":delta(w.direct_bitmap_blends,old_w.direct_bitmap_blends),
+            "directBitmapGroups":delta(w.direct_bitmap_groups,old_w.direct_bitmap_groups),
             "poolPressureCandidates":delta(w.pool_pressure_candidates,old_w.pool_pressure_candidates),
             "fullTextureFilterQuads":delta(w.full_texture_filter_quads,old_w.full_texture_filter_quads),
             "croppedFilterVertexUploads":delta(w.cropped_filter_vertex_uploads,old_w.cropped_filter_vertex_uploads)},
@@ -265,7 +299,9 @@ pub(crate) fn performance_interval(before: PerformanceSnapshot, after: Performan
         "temporaryPoolPressureEvictions":delta(after.resources.temporary_pool_pressure_evictions,before.resources.temporary_pool_pressure_evictions),
         "temporaryPoolReturnRejections":delta(after.resources.temporary_pool_return_rejections,before.resources.temporary_pool_return_rejections),
         "temporaryPoolProbationRejections":delta(after.resources.temporary_pool_probation_rejections,before.resources.temporary_pool_probation_rejections),
-        "temporaryPoolRecurrentMisses":delta(after.resources.temporary_pool_recurrent_misses,before.resources.temporary_pool_recurrent_misses)})
+        "temporaryPoolRecurrentMisses":delta(after.resources.temporary_pool_recurrent_misses,before.resources.temporary_pool_recurrent_misses)});
+    report["temporaryPoolMissesByKindAndArea"] = Value::Object(pool_misses);
+    report
 }
 
 pub struct MemoryLog {
@@ -342,6 +378,18 @@ mod tests {
         after.player.frame_update.calls[0] = 5;
         before.player.frame_update.orphan_visits = 50;
         after.player.frame_update.orphan_visits = 95;
+        before.player.frame_update.target_only_gotos = 3;
+        after.player.frame_update.target_only_gotos = 10;
+        before.player.frame_update.ordinary_orphans[0].dispatched_roots = 20;
+        after.player.frame_update.ordinary_orphans[0].dispatched_roots = 22;
+        before.player.frame_update.ordinary_orphans[1].scriptless_roots = 4;
+        after.player.frame_update.ordinary_orphans[1].scriptless_roots = 11;
+        before.player.frame_update.ordinary_orphans[2].sleeping_descendants = 10;
+        after.player.frame_update.ordinary_orphans[2].sleeping_descendants = 23;
+        before.player.frame_update.ordinary_orphans[2].scriptless_descendants = 5;
+        after.player.frame_update.ordinary_orphans[2].scriptless_descendants = 11;
+        before.player.frame_update.ordinary_orphan_script_calls = 10;
+        after.player.frame_update.ordinary_orphan_script_calls = 12;
         before.player.frame_update.script_calls = 20;
         after.player.frame_update.script_calls = 23;
         let report = performance_interval(before, after, 5.0);
@@ -350,7 +398,15 @@ mod tests {
         assert_eq!(update["stages"][0]["exclusiveCpuMs"], 3.0);
         assert_eq!(update["stages"][0]["calls"], 3);
         assert_eq!(update["orphanVisits"], 45);
+        assert_eq!(update["targetOnlyGotos"], 7);
         assert_eq!(update["scriptCalls"], 3);
+        let ordinary = &update["ordinaryOrphans"];
+        assert_eq!(ordinary["enter"]["dispatchedRoots"], 2);
+        assert_eq!(ordinary["construct"]["scriptlessRoots"], 7);
+        assert_eq!(ordinary["scripts"]["scriptlessRoots"], 0);
+        assert_eq!(ordinary["scripts"]["sleepingDescendants"], 13);
+        assert_eq!(ordinary["scripts"]["scriptlessDescendants"], 6);
+        assert_eq!(ordinary["directFrameScriptCalls"], 2);
     }
 
     use super::*;
@@ -410,6 +466,7 @@ mod tests {
         before.player.discarded_frame_time_ns=200_000_000;
         before.resources.work.main_draw_ns=150_000_000;
         before.resources.work.direct_bitmap_blends=30;
+        before.resources.work.direct_bitmap_groups=10;
         before.resources.work.command_finish_ns=11_000_000;
         before.resources.work.queue_execute_ns=6_000_000;
         before.resources.work.filter_calls[1]=20;
@@ -424,11 +481,14 @@ mod tests {
         before.resources.work.filter_bind_group_reuses=100;
         before.resources.work.filter_pass_encode_ns=3_000_000;
         before.resources.work.blur_passes=500;
+        before.resources.work.fused_glow_passes=20;
         before.resources.work.glow_static_vertex_draws=120;
         before.resources.work.glow_vertex_uploads=10;
         before.resources.work.temporary_created_texels[0]=1000;
         before.resources.work.temporary_created_bytes[0]=16000;
         before.resources.work.temporary_size_requests=[10,20,30,40,50];
+        before.resources.work.temporary_pool_missing_bucket[1][3]=90;
+        before.resources.work.temporary_pool_empty_bucket[1][3]=40;
         before.resources.work.blend_targets=100;
         before.resources.work.bounded_blend_targets=20;
         before.resources.work.blend_full_pixels=84000000;
@@ -442,6 +502,7 @@ mod tests {
         after.player.discarded_frame_time_ns+=50_000_000;
         after.resources.work.main_draw_ns+=9_000_000;
         after.resources.work.direct_bitmap_blends+=7;
+        after.resources.work.direct_bitmap_groups+=2;
         after.resources.work.command_finish_ns+=3_000_000;
         before.resources.work.native_submit_ns=[1_000_000;29];
         after.resources.work.native_submit_ns=std::array::from_fn(|i| (i as u64+2)*1_000_000);
@@ -462,11 +523,15 @@ mod tests {
         after.resources.work.filter_bind_group_reuses+=7;
         after.resources.work.filter_pass_encode_ns+=300_000;
         after.resources.work.blur_passes+=15;
+        after.resources.work.fused_glow_passes+=8;
         after.resources.work.glow_static_vertex_draws+=4;
         after.resources.work.glow_vertex_uploads+=1;
         after.resources.work.temporary_created_texels[0]+=500;
         after.resources.work.temporary_created_bytes[0]+=8000;
         after.resources.work.temporary_size_requests=[11,22,33,44,55];
+        after.resources.work.temporary_pool_missing_bucket[1][3]+=2;
+        after.resources.work.temporary_pool_empty_bucket[1][3]+=7;
+        after.resources.work.temporary_pool_empty_bucket[2][0]+=1;
         after.resources.work.blend_targets+=4;
         after.resources.work.bounded_blend_targets+=3;
         after.resources.work.blend_full_pixels+=3360000;
@@ -479,9 +544,10 @@ mod tests {
         assert_eq!(report["renderStages"]["sceneBuildMs"],4.0);
         assert_eq!(report["filterSetup"],json!({"uniformCacheHits":10,"uniformCacheMisses":2,"uniformCacheEvictions":1,
             "uniformUploads":3,"uniformPrepareMs":0.1,"bindGroupMs":0.2,"bindGroupReuses":7,"passEncodeMs":0.3,"blurPasses":15,
-            "glowStaticVertexDraws":4,"glowVertexUploads":1}));
+            "fusedGlowPasses":8,"glowStaticVertexDraws":4,"glowVertexUploads":1}));
         assert_eq!(report["renderStages"]["mainDrawMs"],9.0);
         assert_eq!(report["renderCounts"]["directBitmapBlends"],7);
+        assert_eq!(report["renderCounts"]["directBitmapGroups"],2);
         assert_eq!(report["discardedFrameTimeMs"],50.0);
         assert_eq!(report["renderStages"]["commandFinishMs"],3.0);
         for (i,key) in ["nativeCommandEncodeMs","nativeBufferInitMs","nativeTextureInitMs","nativeBarrierMs","nativeDriverSubmitMs","nativeMaintainMs","nativePendingWritesMs"].into_iter().enumerate() {
@@ -539,6 +605,10 @@ mod tests {
         assert_eq!(report["temporaryAllocations"][0],json!({"name":"msaaColor","created":3,"creationCpuMs":2.0,"createdTexels":500,"createdEstimatedBytes":8000}));
         assert_eq!(report["blendArea"],json!({"targets":4,"boundedTargets":3,"fullTargetPixels":3360000,"allocatedTargetPixels":850000,"paddedTargets":2,"paddingPixels":700,"parentCopyPixels":10000}));
         assert_eq!(report["temporarySizeRequests"],json!({"upTo64Squared":1,"upTo256Squared":2,"upTo512Squared":3,"belowStageArea":4,"stageAreaOrLarger":5}));
+        let misses = &report["temporaryPoolMissesByKindAndArea"];
+        assert_eq!(misses["singleSampleColor"]["belowStageArea"],json!({"missingBucket":2,"emptyBucket":7}));
+        assert_eq!(misses["stencil"]["upTo64Squared"],json!({"missingBucket":0,"emptyBucket":1}));
+        assert_eq!(misses["msaaColor"]["stageAreaOrLarger"],json!({"missingBucket":0,"emptyBucket":0}));
     }
     #[test]
     fn resource_report_distinguishes_owner_estimates_from_gpu_residency() {

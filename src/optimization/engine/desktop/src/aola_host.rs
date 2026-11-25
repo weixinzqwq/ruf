@@ -96,20 +96,39 @@ pub fn record_panic(info: &std::panic::PanicHookInfo<'_>) {
 pub struct DiagnosticLayer;
 
 pub fn diagnostic_enabled(meta: &tracing::Metadata<'_>) -> bool {
-    matches!(meta.target(), "aola_notice" | "aola_battle") || meta.target() == "aola_swf_lifecycle" || meta.target() == "aola_swf_operation" || meta.target() == "aola_pet_patch" || meta.target() == "aola_panel_diagnostic" || meta.target() == "avm_trace" || *meta.level() <= tracing::Level::WARN
+    if meta.target() == "aola_close_phase" { return crate::aola_close_phases::configured(); }
+    matches!(meta.target(), "aola_notice" | "aola_battle" | "aola_backpack") || meta.target() == "aola_swf_lifecycle" || meta.target() == "aola_swf_operation" || meta.target() == "aola_pet_patch" || meta.target() == "aola_panel_diagnostic" || meta.target() == "avm_trace" || *meta.level() <= tracing::Level::WARN
 }
 
 #[derive(Default)]
-struct SwfOperation(Option<&'static str>);
+struct SwfOperation(serde_json::Map<String, serde_json::Value>);
 
 impl Visit for SwfOperation {
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "operation" {
-            self.0 = ["panel-created", "view-switch", "panel-cleanup", "classify-return"]
-                .into_iter().find(|&name| name == value);
+        if (field.name() == "operation" && matches!(value, "panel-created" | "view-switch" | "panel-cleanup"
+                | "classify-return" | "battle-enter" | "battle-exit" | "battle-main-gc" | "battle-followup-gc"))
+            || (field.name() == "mode" && matches!(value, "finish-cycle" | "slice")) {
+            self.0.insert(field.name().into(), value.into());
+        }
+    }
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if matches!(field.name(), "battleId" | "registeredMovies" | "registeredMoviesAfter" | "nodesBefore"
+            | "nodesAfter" | "dropped" | "freed" | "weakEntriesPruned" | "cyclesCompleted" | "gcUs" | "maintenanceUs") {
+            self.0.insert(field.name().into(), value.into());
         }
     }
     fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+}
+
+fn swf_operation_event(event: &Event<'_>) -> Option<serde_json::Value> {
+    if event.metadata().target() != "aola_swf_operation" { return None; }
+    let mut fields = SwfOperation::default();
+    event.record(&mut fields);
+    fields.0.get("operation")?;
+    fields.0.insert("type".into(), "swf-operation".into());
+    fields.0.insert("build".into(), crate::aola_diagnostics::BUILD.into());
+    fields.0.insert("elapsedMs".into(), (elapsed_ms() as u64).into());
+    Some(fields.0.into())
 }
 
 #[derive(Default)]
@@ -184,20 +203,19 @@ impl Visit for ErrorCode {
 
 impl<S: Subscriber> Layer<S> for DiagnosticLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        if event.metadata().target() == "aola_close_phase" {
+            crate::aola_close_phases::on_event(event);
+            return;
+        }
         if event.metadata().target() == "aola_swf_operation" {
-            let mut fields = SwfOperation::default();
-            event.record(&mut fields);
-            if let Some(operation) = fields.0 {
-                write_event(json!({"type":"swf-operation", "operation":operation,
-                    "build":crate::aola_diagnostics::BUILD, "elapsedMs":elapsed_ms()}));
-            }
+            if let Some(row) = swf_operation_event(event) { write_event(row); }
             return;
         }
         let target = event.metadata().target();
-        if matches!(target, "aola_swf_lifecycle" | "aola_notice" | "aola_battle") {
+        if matches!(target, "aola_swf_lifecycle" | "aola_notice" | "aola_battle" | "aola_backpack") {
             let mut fields = SwfLifecycleFields::default();
             event.record(&mut fields);
-            fields.0.insert("type".into(), match target { "aola_notice" => "notice-swf", "aola_battle" => "battle-swf", _ => "swf-lifecycle" }.into());
+            fields.0.insert("type".into(), match target { "aola_notice" => "notice-swf", "aola_battle" => "battle-swf", "aola_backpack" => "backpack-swf", _ => "swf-lifecycle" }.into());
             fields.0.insert("build".into(), crate::aola_diagnostics::BUILD.into());
             fields.0.insert("elapsedMs".into(), (elapsed_ms() as u64).into());
             write_event(fields.0.into());
@@ -260,22 +278,38 @@ pub struct AolaInterface {
     hide_notice: bool,
     observed_notice_channels: Cell<u8>,
     block_skill: bool,
-    observed_battle_effect: Cell<bool>,
+    hide_transform_portrait: bool,
+    skip_battle_backdrop: bool,
+    observed_battle_effects: Cell<u8>,
 }
 
 impl AolaInterface {
-    pub fn new(hide_notice: bool, block_skill: bool) -> Self {
-        Self { hide_notice, observed_notice_channels: Cell::new(0), block_skill, observed_battle_effect: Cell::new(false) }
+    pub fn new(hide_notice: bool, block_skill: bool, hide_transform_portrait: bool, skip_battle_backdrop: bool) -> Self {
+        Self {
+            hide_notice, block_skill, hide_transform_portrait, skip_battle_backdrop,
+            observed_notice_channels: Cell::new(0), observed_battle_effects: Cell::new(0),
+        }
     }
 
     fn skill_result(&self, args: &[Value]) -> Value {
-        if !matches!(arguments(args), [Value::String(name)] if name == "wanyu-zhichao") {
-            return Value::Bool(false);
+        let [Value::String(name)] = arguments(args) else { return Value::Bool(false) };
+        let (bit, blocked) = match name.as_str() {
+            "wanyu-zhichao" => (1, self.block_skill),
+            "transform-portrait-yiren" => (2, self.hide_transform_portrait),
+            "transform-portrait-jiuri" => (4, self.hide_transform_portrait),
+            "transform-portrait-juexing" => (8, self.hide_transform_portrait),
+            "transform-portrait-dengshen" => (16, self.hide_transform_portrait),
+            "transform-portrait-zhenli" => (32, self.hide_transform_portrait),
+            "battle-backdrop-gq" => (64, self.skip_battle_backdrop),
+            "battle-backdrop-xinghui" => (128, self.skip_battle_backdrop),
+            _ => return Value::Bool(false),
+        };
+        let observed = self.observed_battle_effects.get();
+        if blocked && observed & bit == 0 {
+            self.observed_battle_effects.set(observed | bit);
+            record("battle-effect", name);
         }
-        if !self.observed_battle_effect.replace(true) {
-            record("battle-effect", "wanyu-zhichao");
-        }
-        Value::Bool(self.block_skill)
+        Value::Bool(blocked)
     }
 
     fn notice_result(&self, args: &[Value]) -> Value {
@@ -520,20 +554,79 @@ impl LoginBrowser {
 mod tests {
     use super::*;
     #[test]
+    fn aola_battle_gc_events_keep_the_numeric_per_cleanup_counters() {
+        use tracing_subscriber::prelude::*;
+        struct Capture(Arc<Mutex<Vec<serde_json::Value>>>);
+        impl<S: Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+                if let Some(row) = swf_operation_event(event) { self.0.lock().unwrap().push(row); }
+            }
+        }
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(Capture(rows.clone())), || {
+            for operation in ["battle-main-gc", "battle-followup-gc"] {
+                tracing::info!(target: "aola_swf_operation", operation, mode = "finish-cycle", battleId = 1u64,
+                    registeredMovies = 306u64, registeredMoviesAfter = 301u64, nodesBefore = 17u64,
+                    nodesAfter = 10u64, dropped = 8u64, freed = 7u64, weakEntriesPruned = 2u64,
+                    cyclesCompleted = 1u64, gcUs = 42u64, maintenanceUs = 17u64, other = "ignored");
+            }
+        });
+        let rows = rows.lock().unwrap();
+        assert_eq!(rows.len(), 2);
+        for (row, operation) in rows.iter().zip(["battle-main-gc", "battle-followup-gc"]) {
+            assert_eq!(row["operation"], operation);
+            assert_eq!(row["mode"], "finish-cycle");
+            for (name, value) in [("battleId", 1), ("registeredMovies", 306), ("registeredMoviesAfter", 301),
+                ("nodesBefore", 17), ("nodesAfter", 10), ("dropped", 8), ("freed", 7),
+                ("weakEntriesPruned", 2), ("cyclesCompleted", 1), ("gcUs", 42), ("maintenanceUs", 17)] {
+                assert_eq!(row[name].as_u64(), Some(value));
+            }
+            assert!(row.get("other").is_none());
+        }
+    }
+
+    #[test]
     fn aola_notice_callback_shares_one_boolean_and_records_each_channel_once() {
         for enabled in [false, true] {
-            let interface = AolaInterface::new(enabled, !enabled);
-            assert!(matches!(interface.skill_result(&[]), Value::Bool(false)));
-            assert!(matches!(interface.skill_result(&[Value::String("other".into())]), Value::Bool(false)));
-            assert!(!interface.observed_battle_effect.get());
-            assert!(matches!(interface.skill_result(&[Value::String("wanyu-zhichao".into())]), Value::Bool(v) if v != enabled));
-            assert!(interface.observed_battle_effect.get());
+            let interface = AolaInterface::new(enabled, false, false, false);
             for name in ["random", "honor", "title", "broadcast", "coming", "random"] {
                 assert!(matches!(interface.notice_result(&[Value::String(name.into())]), Value::Bool(v) if v == enabled));
             }
             assert_eq!(interface.observed_notice_channels.get(), 31);
             assert!(matches!(interface.notice_result(&[]), Value::Bool(v) if v == enabled));
             assert_eq!(interface.observed_notice_channels.get(), 63);
+        }
+    }
+    #[test]
+    fn aola_battle_callbacks_gate_portraits_and_attack_independently() {
+        for mask in 0..8 {
+            let (block_skill, hide_portrait, skip_backdrop) = (mask & 1 != 0, mask & 2 != 0, mask & 4 != 0);
+            let interface = AolaInterface::new(false, block_skill, hide_portrait, skip_backdrop);
+            let skill = Value::String("wanyu-zhichao".into());
+            for malformed in [vec![], vec![Value::Bool(true)], vec![Value::String("other".into())],
+                vec![skill.clone(), skill.clone()]] {
+                assert!(matches!(interface.skill_result(&malformed), Value::Bool(false)));
+            }
+            assert_eq!(interface.observed_battle_effects.get(), 0);
+            let mut expected_mask = 0;
+            for (name, bit, enabled) in [
+                ("transform-portrait-yiren", 2, hide_portrait),
+                ("wanyu-zhichao", 1, block_skill),
+                ("transform-portrait-jiuri", 4, hide_portrait),
+                ("transform-portrait-juexing", 8, hide_portrait),
+                ("transform-portrait-dengshen", 16, hide_portrait),
+                ("transform-portrait-zhenli", 32, hide_portrait),
+                ("battle-backdrop-gq", 64, skip_backdrop),
+                ("battle-backdrop-xinghui", 128, skip_backdrop),
+            ] {
+                if enabled { expected_mask |= bit; }
+                let channel = Value::String(name.into());
+                for argument in [channel.clone(), Value::List(vec![channel])] {
+                    let result = interface.skill_result(&[argument]);
+                    assert!(matches!(result, Value::Bool(v) if v == enabled));
+                    assert_eq!(interface.observed_battle_effects.get(), expected_mask);
+                }
+            }
         }
     }
     #[test]

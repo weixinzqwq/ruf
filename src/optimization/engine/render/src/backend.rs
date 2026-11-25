@@ -18,6 +18,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 use swf::{Color, Rectangle, Twips};
 
+/// Shared by the desktop resource pools and audio mixer. Read once per process.
+pub fn aola_long_run_maintenance() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("AOLA_LONG_RUN_MAINTENANCE").as_deref() == Ok("1"))
+}
+
 pub struct BitmapCacheEntry {
     pub handle: BitmapHandle,
     pub commands: CommandList,
@@ -79,6 +85,9 @@ pub struct RenderWorkStats {
     pub temporary_created_bytes: [u64; 4],
     /// Request area bins: <=64^2, <=256^2, <=512^2, <1200*700, remaining.
     pub temporary_size_requests: [u64; 5],
+    /// Request misses by temporary_created kind and temporary_size_requests area.
+    pub temporary_pool_missing_bucket: [[u64; 5]; 4],
+    pub temporary_pool_empty_bucket: [[u64; 5]; 4],
     pub blend_targets: u64,
     pub bounded_blend_targets: u64,
     pub blend_full_pixels: u64,
@@ -95,6 +104,7 @@ pub struct RenderWorkStats {
     pub filter_bind_group_reuses: u64,
     pub filter_pass_encode_ns: u64,
     pub blur_passes: u64,
+    pub fused_glow_passes: u64,
     pub glow_static_vertex_draws: u64,
     pub glow_vertex_uploads: u64,
     pub full_texture_filter_quads: u64,
@@ -109,8 +119,11 @@ pub struct RenderWorkStats {
     pub draw_commands: u64,
     pub queue_submissions: u64,
     pub direct_submissions: u64,
+    pub small_upload_submissions_skipped: u64,
     pub cache_entries_examined: u64,
     pub direct_bitmap_blends: u64,
+    /// Multi-bitmap groups composited without an intermediate surface.
+    pub direct_bitmap_groups: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

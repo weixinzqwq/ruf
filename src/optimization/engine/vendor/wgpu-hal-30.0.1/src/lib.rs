@@ -264,6 +264,12 @@ pub mod noop;
 pub mod vulkan;
 
 pub mod auxil;
+#[doc(hidden)]
+pub mod aola_close;
+#[doc(hidden)]
+pub use aola_close::{
+    aola_close_resource_process_totals, aola_close_resource_totals, aola_set_close_resource_timing,
+};
 pub mod api {
     #[cfg(dx12)]
     pub use super::dx12::Api as Dx12;

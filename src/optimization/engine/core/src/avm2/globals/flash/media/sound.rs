@@ -290,6 +290,7 @@ pub fn load_compressed_data_from_byte_array<'gc>(
     let handle = activation.context.audio.register_mp3(bytes).map_err(|e| {
         Error::rust_error(format!("Failed to register sound from bytearray: {e:?}").into())
     })?;
+    let registered = crate::backend::audio::RegisteredSound::new(activation.context, handle);
 
     let progress_evt =
         EventObject::progress_event(activation, "progress", bytes.len(), bytes.len());
@@ -297,7 +298,7 @@ pub fn load_compressed_data_from_byte_array<'gc>(
     Avm2::dispatch_event(activation.context, progress_evt, this_object);
 
     this.read_and_call_id3_event(activation, bytes);
-    this.set_sound(activation.context, handle);
+    this.set_sound(activation.context, registered);
 
     Ok(Value::Undefined)
 }

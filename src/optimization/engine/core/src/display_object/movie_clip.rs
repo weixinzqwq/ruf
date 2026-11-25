@@ -821,6 +821,7 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn set_has_pending_script(self, value: bool) {
+        if value && self.base().goto_orphan_idle() { self.base().wake_timeline(); }
         self.0.has_pending_script.set(value);
     }
 
@@ -2453,7 +2454,7 @@ impl<'gc> MovieClip<'gc> {
 
     /// Conservative no-work predicate; event broadcasts are dispatched separately.
     pub(crate) fn timeline_can_sleep(self) -> bool {
-        self.movie().is_action_script_3() && !self.playing() && self.initialized()
+        !self.playing() && self.movie().is_action_script_3() && self.initialized()
             && self.0.object2.get().is_some()
             && (self.header_frames() == 0 || self.frames_loaded() >= i32::from(self.header_frames()))
             && !self.base().should_skip_next_enter_frame()
@@ -2463,6 +2464,17 @@ impl<'gc> MovieClip<'gc> {
             // Construct queues the script later; a fresh goto must reach that phase first.
             && (!self.has_frame_script(self.current_frame()) || self.last_queued_script_frame() == Some(self.current_frame()))
             && (!self.has_pending_script() || self.last_queued_script_frame() == Some(self.current_frame()))
+    }
+
+    /// Playback advances in Enter. With no pending construction or registered
+    /// scripts, the remaining phases may be idle even for a playing clip.
+    pub(crate) fn idle_during_inner_goto(self) -> bool {
+        self.initialized() && self.0.object2.get().is_some() && self.movie().is_action_script_3()
+            && (self.header_frames() == 0 || self.frames_loaded() >= i32::from(self.header_frames()))
+            && !self.0.loop_queued() && !self.has_pending_script() && self.0.queued_goto.get().is_none()
+            && self.0.cell.borrow().frame_scripts.is_empty()
+            && !self.is_executing_avm2_frame_script()
+            && !self.0.contains_flag(MovieClipFlags::RUNNING_CONSTRUCT_FRAME)
     }
 
     pub fn run_local_frame_scripts(self, context: &mut UpdateContext<'gc>) {
@@ -2496,7 +2508,7 @@ impl<'gc> MovieClip<'gc> {
                         .unwrap()
                         .avm2_domain();
 
-                    let previous = context.frame_profile.enter(crate::frame_profile::FrameWork::ScriptExecution);
+                    let previous = context.frame_profile.enter_frame_script(|sample| sample.record_frame_script(avm2_object));
                     let goto_previous = context.tick_profile.goto.enter(crate::frame_profile::FrameWork::ScriptExecution as usize);
                     context.tick_profile.goto.count(crate::goto_profile::Counter::ScriptCalls, 1);
                     if context.frame_profile.is_active() { context.frame_profile.stats.script_calls += 1; }
@@ -2543,20 +2555,60 @@ impl<'gc> MovieClip<'gc> {
     // Buttons, loaders and calls re-entering from AS use their original entry points.
     pub(crate) fn construct_goto_orphan(object: DisplayObject<'gc>, context: &mut UpdateContext<'gc>) {
         match object {
-            DisplayObject::MovieClip(clip) => clip.construct_subtree::<true>(context),
+            DisplayObject::MovieClip(clip) => clip.construct_subtree::<true, false>(context),
             other => other.construct_frame(context),
         }
     }
 
     pub(crate) fn run_goto_orphan_scripts(object: DisplayObject<'gc>, context: &mut UpdateContext<'gc>) {
         match object {
-            DisplayObject::MovieClip(clip) => clip.run_scripts_subtree::<true>(context),
+            DisplayObject::MovieClip(clip) => clip.run_scripts_subtree::<true, false>(context),
             other => other.run_frame_scripts(context),
         }
     }
 
+    pub(crate) fn walk_ordinary_orphan<const SCRIPTS: bool>(
+        object: DisplayObject<'gc>, parent: Option<DisplayObject<'gc>>, context: &mut UpdateContext<'gc>,
+    ) {
+        // AS can reparent a later sibling after this render list was captured.
+        // Follow the original dispatch at a stale edge, including all its descendants.
+        let linked = parent.is_none_or(|parent| crate::orphan_manager::is_child_of(object, parent));
+        if linked {
+            if parent.is_some() {
+                let sleeping = object.base().timeline_quiet();
+                if sleeping || crate::orphan_manager::goto_idle_subtree::<false>(object) {
+                    if context.frame_profile.is_active() {
+                        let phase = if SCRIPTS { 2 } else { 1 };
+                        let stats = &mut context.frame_profile.stats.ordinary_orphans[phase];
+                        if sleeping { stats.sleeping_descendants += 1; }
+                        else { stats.scriptless_descendants += 1; }
+                    }
+                    return;
+                }
+            }
+            match object {
+                DisplayObject::MovieClip(clip) => {
+                    if SCRIPTS { clip.run_scripts_subtree::<false, true>(context); }
+                    else { clip.construct_subtree::<false, true>(context); }
+                    return;
+                }
+                // Loader forwards its construct and script phases to its render list.
+                // The loader itself is never marked idle.
+                DisplayObject::LoaderDisplay(loader) => {
+                    for child in loader.iter_render_list() {
+                        Self::walk_ordinary_orphan::<SCRIPTS>(child, Some(object), context);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if SCRIPTS { object.run_frame_scripts(context); }
+        else { object.construct_frame(context); }
+    }
+
     /// Construct objects placed on this frame.
-    fn construct_subtree<const GOTO_ORPHAN: bool>(self, context: &mut UpdateContext<'gc>) {
+    fn construct_subtree<const GOTO_ORPHAN: bool, const ORDINARY_BRANCH: bool>(self, context: &mut UpdateContext<'gc>) {
         context.tick_profile.goto.count(crate::goto_profile::Counter::ConstructVisits, 1);
         if GOTO_ORPHAN && self.0.initialized() && self.0.object2.get().is_some()
             && !self.0.loop_queued() && self.num_children() == 0
@@ -2622,6 +2674,8 @@ impl<'gc> MovieClip<'gc> {
 
                     if GOTO_ORPHAN {
                         Self::construct_goto_orphan(child, context);
+                    } else if ORDINARY_BRANCH {
+                        Self::walk_ordinary_orphan::<false>(child, Some(self.into()), context);
                     } else {
                         child.construct_frame(context);
                     }
@@ -2636,7 +2690,7 @@ impl<'gc> MovieClip<'gc> {
         }
     }
 
-    fn run_scripts_subtree<const GOTO_ORPHAN: bool>(self, context: &mut UpdateContext<'gc>) {
+    fn run_scripts_subtree<const GOTO_ORPHAN: bool, const ORDINARY_BRANCH: bool>(self, context: &mut UpdateContext<'gc>) {
         context.tick_profile.goto.count(crate::goto_profile::Counter::ScriptVisits, 1);
         // Reuse the orphan sleep proof and its mutation invalidation for child subtrees.
         // Construction and frame-event broadcasts still run through their original paths.
@@ -2656,6 +2710,8 @@ impl<'gc> MovieClip<'gc> {
         for child in self.iter_render_list() {
             if GOTO_ORPHAN {
                 Self::run_goto_orphan_scripts(child, context);
+            } else if ORDINARY_BRANCH {
+                Self::walk_ordinary_orphan::<true>(child, Some(self.into()), context);
             } else {
                 child.run_frame_scripts(context);
             }
@@ -2666,22 +2722,8 @@ impl<'gc> MovieClip<'gc> {
         let has_pending_script = self.has_frame_script(self.0.current_frame.get());
         self.set_has_pending_script(has_pending_script);
     }
-}
 
-impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
-    fn base(self) -> Gc<'gc, DisplayObjectBase<'gc>> {
-        HasPrefixField::as_prefix_gc(self.raw_interactive())
-    }
-
-    fn id(self) -> CharacterId {
-        self.0.id()
-    }
-
-    fn movie(self) -> SwfMovie<'gc> {
-        self.0.movie()
-    }
-
-    fn enter_frame(self, context: &mut UpdateContext<'gc>) {
+    pub(crate) fn enter_subtree<const ORDINARY_ORPHAN: bool>(self, context: &mut UpdateContext<'gc>) {
         let skip_frame = self.base().should_skip_next_enter_frame();
         //Child removals from looping gotos appear to resolve in reverse order.
         for child in self.iter_render_list().rev() {
@@ -2698,7 +2740,27 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                 // FIXME - does this propagate through non-movie-clip children (Loader/Button)?
                 child.base().set_skip_next_enter_frame(true);
             }
-            child.enter_frame(context);
+            if ORDINARY_ORPHAN {
+                if child.base().timeline_quiet() {
+                    if context.frame_profile.is_active() {
+                        context.frame_profile.stats.ordinary_orphans[0].sleeping_descendants += 1;
+                    }
+                    continue;
+                }
+                if let DisplayObject::MovieClip(clip) = child {
+                    clip.enter_subtree::<true>(context);
+                } else {
+                    child.enter_frame(context);
+                    // A supported leaf has only its own state to check. Leave
+                    // button and loader state machines on their ordinary path.
+                    if matches!(child, DisplayObject::Bitmap(_) | DisplayObject::Graphic(_)
+                        | DisplayObject::MorphShape(_) | DisplayObject::Text(_)) {
+                        crate::orphan_manager::sleeping_subtree(child);
+                    }
+                }
+            } else {
+                child.enter_frame(context);
+            }
         }
 
         if skip_frame {
@@ -2731,14 +2793,40 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                 }
             }
         }
+
+        // Build proofs bottom-up while visiting active roots. Rechecking only
+        // immediate children avoids a recursive sleep scan at every level.
+        if ORDINARY_ORPHAN && self.timeline_can_sleep() && self.iter_render_list().all(|child|
+            child.base().timeline_quiet() && crate::orphan_manager::is_child_of(child, self.into()))
+        {
+            self.base().mark_timeline_quiet();
+        }
+    }
+}
+
+impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
+    fn base(self) -> Gc<'gc, DisplayObjectBase<'gc>> {
+        HasPrefixField::as_prefix_gc(self.raw_interactive())
+    }
+
+    fn id(self) -> CharacterId {
+        self.0.id()
+    }
+
+    fn movie(self) -> SwfMovie<'gc> {
+        self.0.movie()
+    }
+
+    fn enter_frame(self, context: &mut UpdateContext<'gc>) {
+        self.enter_subtree::<false>(context);
     }
 
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
-        self.construct_subtree::<false>(context);
+        self.construct_subtree::<false, false>(context);
     }
 
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
-        self.run_scripts_subtree::<false>(context);
+        self.run_scripts_subtree::<false, false>(context);
     }
 
     fn render_self(self, context: &mut RenderContext<'_, 'gc>) {
@@ -4007,8 +4095,9 @@ impl<'gc, 'a> MovieClipShared<'gc> {
     ) -> Result<(), Error> {
         let sound = reader.read_define_sound()?;
         if let Ok(handle) = context.audio.register_sound(&sound) {
+            let registered = crate::backend::audio::RegisteredSound::new(context, handle);
             self.library_mut(context)
-                .register_character(sound.id, Character::Sound(handle));
+                .register_character(sound.id, Character::Sound(registered));
         } else {
             tracing::error!(
                 "MovieClip::define_sound: Unable to register sound ID {}",

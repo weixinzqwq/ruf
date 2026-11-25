@@ -7,7 +7,12 @@ use fnv::FnvHashMap;
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+pub(crate) fn battle_texture_pool_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("AOLA_BATTLE_TEXTURE_POOL").as_deref() == Ok("1"))
+}
 
 type PoolInner<T, D> = Mutex<PoolStorage<T, D>>;
 type Constructor<Type, Description> = Box<dyn Fn(&Descriptors, &Description) -> Type>;
@@ -144,7 +149,7 @@ struct TextureBucket<T = PooledTexture, D: BufferDescription = AlwaysCompatible>
 struct IdleIndex {
     by_access: [BTreeMap<u64, TextureKey>; 2],
     // One entry per bucket, including empty buckets with outstanding textures.
-    // Hits update the bucket itself. Recheck its age only when it could expire.
+    // Hits update the bucket itself. Recheck only when a trim or expiry is due.
     by_frame: BTreeMap<u64, Vec<TextureKey>>,
     returns: Arc<Mutex<Vec<TextureKey>>>,
     pending: Vec<TextureKey>,
@@ -153,21 +158,41 @@ struct IdleIndex {
 impl IdleIndex {
     fn expire<T, D: BufferDescription>(
         &mut self, pools: &mut FnvHashMap<TextureKey, TextureBucket<T, D>>,
-        frame: u64, idle_frames: u64,
+        frame: u64, idle_frames: u64, long_run: bool,
     ) {
+        // As in pressure eviction, protect the current and previous frame's working set.
+        let check_age = if long_run { idle_frames.min(2) } else { idle_frames };
+        let expiry_age = if long_run { idle_frames.min(31) } else { idle_frames };
         while let Some((&oldest, _)) = self.by_frame.first_key_value() {
-            if frame.saturating_sub(oldest) < idle_frames {
+            if frame.saturating_sub(oldest) < check_age {
                 break;
             }
             let (_, keys) = self.by_frame.pop_first().unwrap();
             for key in keys {
                 let bucket = &pools[&key];
-                if frame.saturating_sub(bucket.last_used) >= idle_frames {
-                    self.remove(key, bucket.last_access);
-                    pools.remove(&key);
+                let age = frame.saturating_sub(bucket.last_used);
+                let next = if age < check_age {
+                    bucket.last_used
+                } else if age < expiry_age {
+                    // Blur alternates two renderable single-sample RGBA targets of
+                    // the same size. Keep the pair across short animation gaps.
+                    let keep = if battle_texture_pool_enabled() && key.is_filter_target() { 2 } else { 1 };
+                    bucket.pool.available.lock().unwrap().items.truncate(keep);
+                    // The next check is due at last_used + expiry_age.
+                    bucket.last_used + (expiry_age - check_age)
                 } else {
-                    self.by_frame.entry(bucket.last_used).or_default().push(key);
-                }
+                    self.remove(key, bucket.last_access);
+                    // Each checked-out PoolEntry owns a Weak to this storage. Retain its
+                    // return path while expiring idle siblings. A zero age disables retention.
+                    if long_run && check_age != 0 && Arc::weak_count(&bucket.pool.available) > 0 {
+                        bucket.pool.clear_available();
+                        frame + (expiry_age - check_age)
+                    } else {
+                        pools.remove(&key);
+                        continue;
+                    }
+                };
+                self.by_frame.entry(next).or_default().push(key);
             }
         }
     }
@@ -202,7 +227,13 @@ fn evict_to_fit<T, D: BufferDescription>(
     if bytes > limit { return (0, 0); }
     // Preserve the existing cold-MSAA-first policy. Access order also orders
     // last-used frames, so a recent oldest entry ends this class immediately.
-    for kind in 0..2 {
+    // A new MSAA dimension can displace a cold MSAA owner, but do not trade
+    // many small single-sample targets for it until its key is requested again.
+    let new_msaa = battle_texture_pool_enabled() && request.is_some_and(|(key, _)| {
+        key.sample_count > 1 && !pools.contains_key(&key)
+    });
+    let classes = if new_msaa { 1 } else { 2 };
+    for kind in 0..classes {
         while budget.used.load(Ordering::Relaxed).saturating_add(bytes) > limit {
             let Some((&access, &key)) = index.by_access[kind].first_key_value() else { break; };
             visited += 1;
@@ -260,11 +291,20 @@ impl TexturePool {
     }
 
     pub fn set_limits(&mut self, limits: TexturePoolLimits) {
+        let age_changed = self.limits.idle_frames != limits.idle_frames
+            && ruffle_render::backend::aola_long_run_maintenance();
         self.limits = limits;
         self.idle_budget.limit.store(limits.idle_bytes, Ordering::Relaxed);
-        if self.idle_budget.used.load(Ordering::Relaxed) > limits.idle_bytes {
+        if age_changed || self.idle_budget.used.load(Ordering::Relaxed) > limits.idle_bytes {
             let pools = self.pools.lock().unwrap();
             let mut index = self.idle_index.lock().unwrap();
+            if age_changed {
+                // Existing second-stage checks were scheduled for the previous limits.
+                index.by_frame.clear();
+                for (&key, bucket) in pools.iter() {
+                    index.by_frame.entry(bucket.last_used).or_default().push(key);
+                }
+            }
             index.drain_returns(&pools);
             evict_to_fit(&pools, &mut index, &self.idle_budget, 0, None);
         }
@@ -275,7 +315,8 @@ impl TexturePool {
     pub fn end_frame(&mut self) {
         let frame = self.frame.load(Ordering::Relaxed);
         let mut pools = self.pools.lock().unwrap();
-        self.idle_index.lock().unwrap().expire(&mut pools, frame, self.limits.idle_frames);
+        self.idle_index.lock().unwrap().expire(&mut pools, frame, self.limits.idle_frames,
+            ruffle_render::backend::aola_long_run_maintenance());
         drop(pools);
         self.prune_globals();
         self.frame.fetch_add(1, Ordering::Relaxed);
@@ -352,13 +393,7 @@ impl TexturePool {
             }));
             let device = descriptors.device.clone();
             let pool = pool.with_tracking(Box::new(move |texture: &PooledTexture, _, elapsed| {
-                let kind = match key.format {
-                    wgpu::TextureFormat::Stencil8 | wgpu::TextureFormat::Depth24PlusStencil8 => 2,
-                    wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb
-                    | wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
-                    | wgpu::TextureFormat::Rgba16Float => if key.sample_count > 1 { 0 } else { 1 },
-                    _ => 3,
-                };
+                let kind = key.metric_kind();
                 metrics.record_work(|s| {
                     s.temporary_created[kind] += 1;
                     s.temporary_created_texels[kind] += u64::from(key.size.width) * u64::from(key.size.height);
@@ -384,6 +419,10 @@ impl TexturePool {
             let texels = u64::from(size.width) * u64::from(size.height);
             let bin = match texels { 0..=4096 => 0, 4097..=65536 => 1, 65537..=262144 => 2, 262145..=839999 => 3, _ => 4 };
             s.temporary_size_requests[bin] += 1;
+            if !reused {
+                let misses = if seen { &mut s.temporary_pool_empty_bucket } else { &mut s.temporary_pool_missing_bucket };
+                misses[key.metric_kind()][bin] += 1;
+            }
         });
         let mut entry = bucket.pool.take(descriptors, AlwaysCompatible);
         index.sync(key, bucket);
@@ -429,6 +468,22 @@ struct TextureKey {
 }
 
 impl TextureKey {
+    fn is_filter_target(&self) -> bool {
+        self.sample_count == 1 && self.format == wgpu::TextureFormat::Rgba8Unorm
+            && self.usage == wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST
+    }
+
+    fn metric_kind(&self) -> usize {
+        match self.format {
+            wgpu::TextureFormat::Stencil8 | wgpu::TextureFormat::Depth24PlusStencil8 => 2,
+            wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb
+            | wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+            | wgpu::TextureFormat::Rgba16Float => usize::from(self.sample_count == 1),
+            _ => 3,
+        }
+    }
+
     fn estimated_bytes(&self) -> u64 {
         // All currently pooled targets use these color/stencil formats.
         // Treat unknown formats conservatively as 16 bytes per texel.
@@ -851,17 +906,57 @@ mod tests {
             pools.insert(key(width), TextureBucket { pool, last_used, last_access: width.into() });
             index.by_frame.entry(first_used).or_default().push(key(width));
         }
-        index.expire(&mut pools, 1, 2);
+        index.expire(&mut pools, 1, 2, false);
         assert_eq!(pools.len(), 3);
-        index.expire(&mut pools, 2, 2);
+        index.expire(&mut pools, 2, 2, false);
         assert_eq!(pools.len(), 2);
         assert!(!pools.contains_key(&key(1)));
-        index.expire(&mut pools, 3, 2);
+        index.expire(&mut pools, 3, 2, false);
         assert_eq!(pools.len(), 1);
         assert!(pools.contains_key(&key(3)));
-        index.expire(&mut pools, 3, 0);
+        index.expire(&mut pools, 3, 0, false);
         assert!(pools.is_empty());
         assert!(index.by_frame.is_empty());
+    }
+
+    #[test]
+    fn long_run_expiry_preserves_borrowed_return_path_and_trims_only_cold_siblings() {
+        let budget = Arc::new(IdleBudget::default());
+        let drops = Arc::new(AtomicU64::new(0));
+        let metrics = Arc::new(ResourceMetrics::default());
+        let pool = BufferPool::<DropProbe, Size>::new(Box::new(|_, _| panic!("CPU-only")));
+        let mut index = IdleIndex::default();
+        let key = key(1);
+        {
+            let mut idle = pool.available.lock().unwrap();
+            idle.shared_idle_budget = Some((budget.clone(), 32));
+            idle.idle_notice = Some((index.returns.clone(), key));
+            for _ in 0..4 { idle.put(item(&metrics, &drops, 32)); }
+        }
+        let borrowed = PoolEntry {
+            item: pool.available.lock().unwrap().take_compatible(&Size(32)),
+            pool: Arc::downgrade(&pool.available),
+        };
+        let mut pools = FnvHashMap::default();
+        pools.insert(key, TextureBucket { pool, last_used: 0, last_access: 1 });
+        index.by_frame.entry(0).or_default().push(key);
+        index.drain_returns(&pools);
+        index.expire(&mut pools, 1, 120, true);
+        assert_eq!(budget.used.load(Ordering::Relaxed), 96);
+        index.expire(&mut pools, 2, 120, true);
+        assert_eq!(budget.used.load(Ordering::Relaxed), 32);
+        index.expire(&mut pools, 31, 120, true);
+        assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+        assert!(index.by_access.iter().all(BTreeMap::is_empty));
+        assert_eq!(drops.load(Ordering::Relaxed), 3);
+        drop(borrowed);
+        assert_eq!(budget.used.load(Ordering::Relaxed), 32);
+        index.drain_returns(&pools);
+        assert_eq!(index.by_access[0].len(), 1);
+        index.expire(&mut pools, 62, 120, true);
+        assert!(pools.is_empty());
+        assert!(index.by_frame.is_empty());
+        assert_eq!(drops.load(Ordering::Relaxed), 4);
     }
 
     #[test]

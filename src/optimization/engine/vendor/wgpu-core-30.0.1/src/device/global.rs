@@ -1922,6 +1922,7 @@ impl Global {
     }
 
     pub fn device_drop(&self, device_id: DeviceId) {
+        let _phase = hal::aola_close::Phase::begin("wgpu-device-handle-release");
         profiling::scope!("Device::drop");
         api_log!("Device::drop {device_id:?}");
 
@@ -1992,6 +1993,7 @@ impl Global {
     }
 
     pub fn queue_drop(&self, queue_id: QueueId) {
+        let _phase = hal::aola_close::Phase::begin("wgpu-queue-handle-release");
         profiling::scope!("Queue::drop");
         api_log!("Queue::drop {queue_id:?}");
 

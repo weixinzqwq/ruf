@@ -2,7 +2,11 @@ param(
     [ValidateSet('optimization','launcher')][string]$Component='optimization',
     [ValidateSet('metadata','check','test','build','swf-build','swf-test','swf-loopback','pet-switch-build','flux-build')][string]$Action='metadata',
     [string]$OutputDirectory='',
-    [string]$RoundtripDirectory=''
+    [string]$RoundtripDirectory='',
+    [switch]$ClosePhases,
+    [switch]$OrphanGoto,
+    [switch]$BattleRender,
+    [switch]$BattleTexturePool
 )
 $ErrorActionPreference='Stop'
 $taskRoot=Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -12,13 +16,17 @@ $taskRust=Join-Path $taskRoot 'toolchain\rust-1.99.1\bin'
 $taskJava=Join-Path $taskRoot 'toolchain\jdk-21.0.12.1+1\bin'
 $taskVendor=(Join-Path $taskRoot 'deps\vendor').Replace('\','/')
 $taskSwfAction=$Action -in @('swf-build','swf-test','swf-loopback')
+if ($ClosePhases -and $Action -ne 'flux-build') { throw '-ClosePhases requires -Action flux-build.' }
+if ($OrphanGoto -and $Action -ne 'flux-build') { throw '-OrphanGoto requires -Action flux-build.' }
+if ($BattleRender -and $Action -ne 'flux-build') { throw '-BattleRender requires -Action flux-build.' }
+if ($BattleTexturePool -and $Action -ne 'flux-build') { throw '-BattleTexturePool requires -Action flux-build.' }
 if (($taskSwfAction -or $Action -in @('pet-switch-build','flux-build')) -and $Component -ne 'optimization') { throw 'These experiments require -Component optimization.' }
 if ($RoundtripDirectory -and !$taskSwfAction) { throw '-RoundtripDirectory requires an SWF action.' }
 if ($Action -in @('swf-test','swf-loopback') -and $OutputDirectory) { throw '-OutputDirectory selects a new distribution for swf-build.' }
 if ($Action -in @('swf-build','pet-switch-build','flux-build')) {
     $taskPrefix=switch ($Action) {
         'pet-switch-build' { 'aola-pet-switch-' }
-        'flux-build' { 'aola-flux-' }
+        'flux-build' { if ($BattleTexturePool) { 'aola-battle-texture-pool-' } elseif ($BattleRender) { 'aola-battle-render-' } elseif ($OrphanGoto) { 'aola-orphan-goto-' } elseif ($ClosePhases) { 'aola-close-phases-' } else { 'aola-flux-' } }
         default { 'aola-swf-lifecycle-' }
     }
     if (!$OutputDirectory) { $OutputDirectory=Join-Path $taskRoot ("dist\$taskPrefix"+(Get-Date -Format 'yyyyMMdd-HHmmss')) }
@@ -87,7 +95,12 @@ try {
                 if ($LASTEXITCODE -ne 0) { throw 'Optimization desktop build failed.' }
                 $taskBinary=Join-Path $env:CARGO_TARGET_DIR 'release\ruffle_desktop.exe'
                 if ($Action -eq 'flux-build') {
-                    & $taskPython (Join-Path $PSScriptRoot 'swf-patches\flux_package.py') --executable $taskBinary --output $OutputDirectory
+                    $taskPackageArgs = @('--executable', $taskBinary, '--output', $OutputDirectory)
+                    if ($ClosePhases) { $taskPackageArgs += '--close-phases' }
+                    if ($OrphanGoto) { $taskPackageArgs += '--orphan-goto' }
+                    if ($BattleRender) { $taskPackageArgs += '--battle-render' }
+                    if ($BattleTexturePool) { $taskPackageArgs += '--battle-texture-pool' }
+                    & $taskPython (Join-Path $PSScriptRoot 'swf-patches\flux_package.py') @taskPackageArgs
                 } elseif ($Action -eq 'pet-switch-build') {
                     & $taskPython (Join-Path $PSScriptRoot 'swf-patches\pet_switch_package.py') --executable $taskBinary --output $OutputDirectory
                 } else {

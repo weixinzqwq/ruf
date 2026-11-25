@@ -84,6 +84,58 @@ fn filter_parameter_eviction_preserves_pixels_on_dx12() {
 }
 
 #[test]
+#[ignore = "DX12 paired timing of the last blur pass and glow, including GPU completion"]
+fn fused_glow_sizes_on_dx12() {
+    use crate::filters::FUSE_GLOW_OVERRIDE;
+
+    for small in [true, false] {
+        let mut renderer = WgpuRenderBackend::for_offscreen(
+            (1200, 700), wgpu::Backends::DX12, wgpu::PowerPreference::HighPerformance,
+        ).unwrap();
+        renderer.set_quality(StageQuality::High);
+        let mut handles = Vec::new();
+        // Compile both pipelines and fill the texture pool on this device.
+        for fuse in [false, true] {
+            FUSE_GLOW_OVERRIDE.set(Some(fuse));
+            for phase in 0..4 {
+                draw(&mut renderer, phase, true, small, &mut handles);
+                renderer.capture_frame().unwrap();
+            }
+        }
+        let mut reference = None;
+        for fuse in [false, true, true, false, true, false, false, true] {
+            FUSE_GLOW_OVERRIDE.set(Some(fuse));
+            let before = renderer.resource_stats().unwrap().work;
+            let mut submit_time = Duration::ZERO;
+            let mut completed_time = Duration::ZERO;
+            for phase in 0..6 {
+                let started = Instant::now();
+                draw(&mut renderer, phase, true, small, &mut handles);
+                submit_time += started.elapsed();
+                renderer.device().poll(wgpu::PollType::Wait {
+                    submission_index: None, timeout: Some(Duration::from_secs(10)),
+                }).unwrap();
+                completed_time += started.elapsed();
+            }
+            let after = renderer.resource_stats().unwrap().work;
+            let fused = after.fused_glow_passes - before.fused_glow_passes;
+            let count = if small { 240 * 6 } else { 78 * 6 };
+            assert_eq!(fused, if fuse { count } else { 0 });
+            assert_eq!(after.blur_passes - before.blur_passes + fused, count * 4);
+            let pixels = renderer.capture_frame().unwrap();
+            if let Some(expected) = &reference {
+                assert!(pixels.as_raw() == expected, "pixel differences in size benchmark");
+            } else {
+                reference = Some(pixels.into_raw());
+            }
+            println!("glow_timing small={small} fuse={fuse} frames=6 fused={fused} submit_ms={:.3} completed_ms={:.3}",
+                submit_time.as_secs_f64() * 1000.0, completed_time.as_secs_f64() * 1000.0);
+        }
+    }
+    FUSE_GLOW_OVERRIDE.set(None);
+}
+
+#[test]
 #[ignore = "explicit DX12 ABBA timing of 26 caches and 78 glow filters per frame"]
 fn filter_submission_workload_on_dx12() {
     for changing in [false,true] {
@@ -111,7 +163,7 @@ fn filter_submission_workload_on_dx12() {
                 native_after.iter().zip(native_before).map(|(a,b)| (a-b) as f64/1e6/12.0).collect::<Vec<_>>(),
                 counts_after.iter().zip(counts_before).map(|(a,b)| a-b).collect::<Vec<_>>());
             assert_eq!(a.filter_calls[2]-b.filter_calls[2],78*12);
-            assert_eq!(a.blur_passes-b.blur_passes,78*4*12);
+            assert_eq!(a.blur_passes-b.blur_passes + (a.fused_glow_passes-b.fused_glow_passes),78*4*12);
             assert_eq!(a.queue_submissions-b.queue_submissions,12);
             assert!(a.native_submit_ns[0]>b.native_submit_ns[0]);
             assert!(a.native_submit_ns[4]>b.native_submit_ns[4]);

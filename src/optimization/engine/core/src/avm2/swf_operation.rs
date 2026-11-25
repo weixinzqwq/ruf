@@ -1,4 +1,4 @@
-//! Observable method returns in the 2026111953323155 backpack and its same-version controls.
+//! Observable method returns in the verified backpack and battle ABCs.
 use std::sync::OnceLock;
 use swf::avm2::types::{AbcFile, Index, Multiname, Namespace, TraitKind};
 
@@ -11,11 +11,14 @@ pub(super) enum Operation {
     DisposePanel,
     ClickView,
     ChangeStyle,
+    ConstructFight,
+    DisposeFightManagers,
+    DisposeFight,
 }
 
 impl Operation {
     pub(super) fn for_method(abc: &AbcFile, index: u32) -> Self {
-        // Check the cheap method index first. Only six possible indices need further work.
+        // Check the cheap method index before inspecting the owner and binding.
         let (operation, instance, package, class, member) = match index {
             222 => (Self::ClassifyView, 28, "mmo.petpackage.controller.skin", "PackageSkinManager", "changeClassify"),
             224 => (Self::DisposeSkin, 28, "mmo.petpackage.controller.skin", "PackageSkinManager", "dispose"),
@@ -23,10 +26,17 @@ impl Operation {
             375 => (Self::DisposePanel, 41, "mmo.petpackage.panel", "PetPackagePanel", "disposeEvent"),
             1231 => (Self::ClickView, 128, "mmo.petpackage.panel", "SimpleViewController", "onClickMe"),
             1232 => (Self::ChangeStyle, 128, "mmo.petpackage.panel", "SimpleViewController", "changeStyle"),
+            4023 => (Self::ConstructFight, 720, "mmo.petfightnew.common", "FightPanel", ""),
+            4073 => (Self::DisposeFightManagers, 720, "mmo.petfightnew.common", "FightPanel", "disposeManagers"),
+            4167 => (Self::DisposeFight, 720, "mmo.petfightnew.common", "FightPanel", "dispose"),
             _ => return Self::Other,
         };
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        if !ENABLED.get_or_init(|| std::env::var_os("AOLA_SWF_OPERATIONS").is_some_and(|v| v == "1")) {
+        let sampling = *ENABLED.get_or_init(|| std::env::var_os("AOLA_SWF_OPERATIONS").is_some_and(|v| v == "1"));
+        let battle = matches!(operation, Self::ConstructFight | Self::DisposeFightManagers | Self::DisposeFight);
+        if !(sampling || (battle && (ruffle_render::backend::aola_long_run_maintenance()
+            || crate::goto_profile::goto_target_only_mode() == "battle"
+            || crate::orphan_manager::ordinary_orphan_mode() == "battle"))) {
             return Self::Other;
         }
         let Some(owner) = abc.instances.get(instance) else { return Self::Other };
@@ -40,7 +50,7 @@ impl Operation {
         if string(*uri) != Some(package.as_bytes()) || string(*name) != Some(class.as_bytes()) {
             return Self::Other;
         }
-        let bound = if operation == Self::ConstructPanel {
+        let bound = if matches!(operation, Self::ConstructPanel | Self::ConstructFight) {
             owner.init_method.0 == index
         } else {
             owner.traits.iter().any(|t| matches!(t.kind, TraitKind::Method { method, .. } if method.0 == index)
@@ -67,6 +77,7 @@ impl Operation {
 
 #[cfg(test)]
 mod tests {
+    use super::Operation;
     use super::Operation::*;
 
     #[test]
@@ -78,5 +89,53 @@ mod tests {
         assert_eq!(DisposeSkin.event(Other, Other), None);
         assert_eq!(DisposePanel.event(Other, Other), None);
         assert_eq!(ConstructPanel.event(Other, Other), Some("panel-created"));
+    }
+
+    #[test]
+    #[ignore = "Set AOLA_SWF_OPERATIONS=1 and AOLA_TEST_BATTLE_FILE to an actual petfightnew SWF"]
+    fn battle_operations_bind_to_real_abc() {
+        use swf::avm2::read::Reader;
+        use swf::avm2::types::{Index, Multiname, Op, TraitKind};
+        use swf::extensions::ReadSwfExt;
+
+        let path = std::env::var_os("AOLA_TEST_BATTLE_FILE").unwrap();
+        let data = std::fs::read(path).unwrap();
+        let buffer = swf::decompress_swf(data.as_slice()).unwrap();
+        let movie = swf::parse_swf(&buffer).unwrap();
+        let mut abc = movie.tags.iter().find_map(|tag| {
+            let swf::Tag::DoAbc2(tag) = tag else { return None };
+            let abc = Reader::new(tag.data).read().unwrap();
+            (Operation::for_method(&abc, 4023) == ConstructFight).then_some(abc)
+        }).expect("FightPanel constructor");
+        assert_eq!(Operation::for_method(&abc, 4073), DisposeFightManagers);
+        assert_eq!(Operation::for_method(&abc, 4167), DisposeFight);
+        assert_eq!(Operation::for_method(&abc, 4168), Other);
+
+        let body = &abc.method_bodies[abc.methods[4167].body.unwrap().0 as usize];
+        let mut code = Reader::new(&body.code);
+        let (mut manager_calls, mut early_return, mut completed_return) = (0, false, false);
+        while !code.as_slice().is_empty() {
+            match code.read_op().unwrap() {
+                Op::CallPropVoid { index, num_args: 0 } => {
+                    let name = match &abc.constant_pool.multinames[index.0 as usize - 1] {
+                        Multiname::QName { name, .. } | Multiname::Multiname { name, .. } => name,
+                        _ => continue,
+                    };
+                    if abc.constant_pool.strings[name.0 as usize - 1] == b"disposeManagers" {
+                        manager_calls += 1;
+                    }
+                }
+                Op::ReturnVoid if manager_calls == 0 => early_return = true,
+                Op::ReturnVoid => completed_return = true,
+                _ => {}
+            }
+        }
+        assert_eq!((manager_calls, early_return, completed_return), (1, true, true));
+        abc.instances[720].init_method = Index::new(0);
+        assert_eq!(Operation::for_method(&abc, 4023), Other);
+        abc.instances[720].traits.retain(|t| !matches!(t.kind, TraitKind::Method { method, .. } if method.0 == 4073));
+        assert_eq!(Operation::for_method(&abc, 4073), Other);
+        abc.instances[720].name = Index::new(0);
+        assert_eq!(Operation::for_method(&abc, 4167), Other);
     }
 }

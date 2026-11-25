@@ -12,13 +12,13 @@ use crate::surface::target::CommandTarget;
 use crate::{Descriptors, MaskState, Pipelines, PosUvVertex, Transforms, as_texture};
 use ruffle_render::backend::ShapeHandle;
 use ruffle_render::bitmap::{BitmapHandle, PixelRegion, PixelSnapping};
-use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
+use ruffle_render::commands::{Command, CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::lines::{emulate_line, emulate_line_rect};
 use ruffle_render::matrix::Matrix;
 use ruffle_render::pixel_bender::PixelBenderShaderHandle;
 use ruffle_render::quality::StageQuality;
 use ruffle_render::transform::Transform;
-use std::mem;
+use std::{mem, sync::LazyLock};
 use swf::{BlendMode, Color, ColorTransform, Twips};
 use wgpu::Backend;
 use wgpu_profiler::Scope;
@@ -756,32 +756,64 @@ impl WgpuCommandHandler<'_, '_> {
 
 }
 
+static DIRECT_BITMAP_GROUPS: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("AOLA_DIRECT_BITMAP_GROUPS").as_deref() != Ok("0"));
+
+fn can_draw_bitmaps_directly(commands: &[Command]) -> bool {
+    let mut covered: Option<PixelRegion> = None;
+    for command in commands {
+        let Command::RenderBitmap { transform, region, .. } = command else { return false };
+        let matrix = transform.matrix;
+        let x = matrix.tx.to_pixels();
+        let y = matrix.ty.to_pixels();
+        if matrix.a != 1.0 || matrix.d != 1.0 || matrix.b != 0.0 || matrix.c != 0.0
+            || x.fract() != 0.0 || y.fract() != 0.0 || transform.tz != 0.0
+            || transform.perspective_projection.is_some()
+            || transform.color_transform != ColorTransform::default()
+        {
+            return false;
+        }
+        if commands.len() == 1 { return true; }
+
+        // In a disjoint group each destination pixel sees at most one bitmap.
+        // Use the union of prior bounds to keep this check linear. A bitmap
+        // in a gap inside that union falls back to group isolation.
+        if x < 0.0 || y < 0.0 { return false; }
+        let bounds = PixelRegion::for_region(x as u32, y as u32, region.width(), region.height());
+        if let Some(previous) = &mut covered {
+            if previous.intersects(bounds) { return false; }
+            previous.union(bounds);
+        } else {
+            covered = Some(bounds);
+        }
+    }
+    covered.is_some()
+}
+
 impl CommandHandler for WgpuCommandHandler<'_, '_> {
     fn blend(&mut self, mut commands: CommandList, blend_mode: RenderBlendMode) {
-        // A single already-rendered bitmap needs no full-viewport intermediate
-        // for these fixed-function blends. Keep masks and grouped/complex
-        // blends on the existing isolation path.
+        let count = commands.commands.len();
+        let local_blend = blend_bounds::local_blend(&blend_mode);
+        let starts_layer = matches!(blend_mode, RenderBlendMode::Builtin(BlendMode::Layer));
+        let blend_type = BlendType::from(blend_mode);
         if self.num_masks == 0
-            && commands.commands.len() == 1
-            && matches!(&commands.commands[0], ruffle_render::commands::Command::RenderBitmap { transform, .. }
-                if transform.matrix.a == 1.0 && transform.matrix.d == 1.0
-                    && transform.matrix.b == 0.0 && transform.matrix.c == 0.0
-                    && transform.matrix.tx.to_pixels().fract() == 0.0
-                    && transform.matrix.ty.to_pixels().fract() == 0.0
-                    && transform.tz == 0.0 && transform.perspective_projection.is_none()
-                    && transform.color_transform == ColorTransform::default())
-            && let BlendType::Trivial(mode) = BlendType::from(blend_mode.clone())
+            && let BlendType::Trivial(mode) = blend_type
+            && (count == 1 || ((2..=64).contains(&count) && *DIRECT_BITMAP_GROUPS))
+            && can_draw_bitmaps_directly(&commands.commands)
         {
-            if let ruffle_render::commands::Command::RenderBitmap {
-                bitmap, transform, smoothing, pixel_snapping, region,
-            } = commands.commands.pop().unwrap() {
+            for command in commands.commands {
+                let Command::RenderBitmap { bitmap, transform, smoothing, pixel_snapping, region } = command
+                    else { unreachable!("validated bitmap group") };
                 self.render_bitmap_with_blend(bitmap, transform, smoothing, pixel_snapping, region, mode);
-                self.descriptors.resource_metrics.record_work(|s| s.direct_bitmap_blends += 1);
-                return;
             }
+            self.descriptors.resource_metrics.record_work(|stats| {
+                if count == 1 { stats.direct_bitmap_blends += 1; }
+                else { stats.direct_bitmap_groups += 1; }
+            });
+            return;
         }
         let full_region = BlendRegion::full(self.width, self.height);
-        let region = if blend_bounds::local_blend(&blend_mode) {
+        let region = if local_blend {
             blend_bounds::region(&commands, self.width, self.height).unwrap_or(full_region)
         } else { full_region };
         let exact_region = region;
@@ -803,12 +835,11 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             region.height,
             wgpu::TextureFormat::Rgba8Unorm,
         );
-        let target_layer = if let RenderBlendMode::Builtin(BlendMode::Layer) = &blend_mode {
+        let target_layer = if starts_layer {
             LayerRef::Current
         } else {
             self.nearest_layer
         };
-        let blend_type = BlendType::from(blend_mode);
         let clear_color = blend_type.default_color();
         let target = surface.draw_commands(
             RenderTargetMode::FreshWithColor(clear_color),

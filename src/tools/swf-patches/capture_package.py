@@ -35,7 +35,7 @@ def launcher(mode):
     elif operations:
         lines.append('echo Open the backpack, switch its view, close it promptly, reopen it, then exit normally.')
     lines.extend([
-        '"%~dp0aola-native-test.exe" --aola-host --frame-rate 50 --aola-data-dir "%run%"',
+        '"%~dp0aola-native-test.exe" --aola-host --aola-data-dir "%run%"',
         'set "game_status=%errorlevel%"',
     ])
     if mode != "official":

@@ -34,6 +34,68 @@ fn aola_step_finishes_cycle_with_root_writes_between_every_step() {
 }
 
 #[test]
+fn ephemerons_follow_promoted_keys_until_the_end_of_marking() {
+    use gc_arena::collect::Trace;
+
+    struct Edges<'gc> {
+        keys: [GcWeak<'gc, u32>; 3],
+        keep: Option<Gc<'gc, u32>>,
+    }
+
+    // All three headers are weakly visited. Register dependencies in reverse order so marking
+    // a value must wake the next dependency irrespective of the traversal order.
+    unsafe impl<'gc> Collect<'gc> for Edges<'gc> {
+        fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
+            for (a, b) in [(1, 2), (2, 0), (0, 1)] {
+                cc.trace_ephemeron(GcWeak::erase(self.keys[a]), GcWeak::erase(self.keys[b]));
+            }
+            cc.trace(&self.keep);
+        }
+    }
+    let mut arena = Arena::<Rootable![Edges<'_>]>::new(|mc| Edges {
+        keys: [0, 1, 2].map(|n| Gc::downgrade(Gc::new(mc, n))),
+        keep: None,
+    });
+    arena.finish_marking().unwrap().finalize(|fc, r| {
+        assert!(r.keys.iter().all(|k| k.is_dead(fc)));
+        assert!(r.keys[0].resurrect(fc).is_some());
+    });
+    arena.finish_marking().unwrap().finalize(|fc, r| {
+        assert!(r.keys.iter().all(|k| !k.is_dead(fc)));
+    });
+    arena.finish_cycle();
+    // A write to a previously fully marked root can also make a pending key reachable.
+    arena.finish_marking().unwrap();
+    arena.mutate_root(|mc, r| r.keep = r.keys[1].upgrade(mc));
+    for _ in 0..40 {
+        arena.collect_step();
+        if arena.collection_phase() == CollectionPhase::Sleeping { break; }
+    }
+    assert_eq!(arena.collection_phase(), CollectionPhase::Sleeping);
+    arena.mutate(|mc, r| assert!(r.keys.iter().all(|k| k.upgrade(mc).is_some())));
+    arena.mutate_root(|_, r| r.keep = None);
+    arena.finish_cycle();
+    arena.mutate(|_, r| assert!(r.keys.iter().all(|k| k.is_dropped())));
+}
+
+#[test]
+fn aola_drop_observer_counts_remaining_headers_only_at_teardown() {
+    use std::sync::Mutex;
+    static EDGES: Mutex<Vec<(bool, usize)>> = Mutex::new(Vec::new());
+
+    let mut arena = Arena::<Rootable![(Gc<'_, u32>, GcWeak<'_, u32>)]>::new(|mc| {
+        let _ = Gc::new(mc, 31);
+        (Gc::new(mc, 17), Gc::downgrade(Gc::new(mc, 23)))
+    });
+    arena.set_drop_observer(|starting, nodes| EDGES.lock().unwrap().push((starting, nodes)));
+    arena.finish_cycle();
+    assert_eq!(arena.metrics().total_gc_count(), 2);
+    assert!(EDGES.lock().unwrap().is_empty());
+    drop(arena);
+    assert_eq!(*EDGES.lock().unwrap(), [(true, 2), (false, 0)]);
+}
+
+#[test]
 fn aola_lifecycle_counts_distinguish_values_from_weak_headers() {
     let mut arena = Arena::<Rootable![Option<(Gc<'_, u32>, GcWeak<'_, u32>)>]>::new(|mc| {
         let _ = Gc::new(mc, 31);

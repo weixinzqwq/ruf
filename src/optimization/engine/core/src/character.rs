@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use web_time::Instant;
 
-use crate::backend::audio::SoundHandle;
+use crate::backend::audio::RegisteredSound;
 use crate::binary_data::BinaryData;
 use crate::display_object::{
     Avm1Button, Avm2Button, BitmapClass, EditText, Graphic, MorphShape, MovieClip, Text, Video,
@@ -27,7 +27,7 @@ pub enum Character<'gc> {
     Font(Font<'gc>),
     MorphShape(MorphShape<'gc>),
     Text(Text<'gc>),
-    Sound(#[collect(require_static)] SoundHandle),
+    Sound(RegisteredSound<'gc>),
     Video(Video<'gc>),
     BinaryData(Gc<'gc, BinaryData>),
 }

@@ -610,6 +610,46 @@ async fn prepare_movie_body(body: Vec<u8>) -> Result<(Vec<u8>, Option<crate::tag
     }).await.map_err(|error| Error::FetchError(error.into()))?.map_err(Error::from)
 }
 
+#[cfg(all(test, not(target_family = "wasm")))]
+#[test]
+#[ignore = "set AOLA_TEST_CWS_FILE to a local CWS of at least 16 KiB and run in isolation"]
+fn real_large_cws_movie_body() {
+    use crate::aoqi_work::{self, BACKGROUND_LARGE_CWS_JOBS};
+    use futures::executor::block_on;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    aoqi_work::initialize_aola_mode();
+    let path = std::env::var_os("AOLA_TEST_CWS_FILE").expect("AOLA_TEST_CWS_FILE");
+    let input = std::fs::read(path).unwrap();
+    assert!(input.starts_with(b"CWS") && input.len() >= 16 * 1024);
+    let background = aoqi_work::mode().background_for_large_cws();
+    let (thread, expected) = block_on(aoqi_work::decode_movie(input.clone(), |data| {
+        (std::thread::current(), swf::decompress_swf(data.as_slice()).unwrap())
+    })).unwrap();
+    assert_eq!(thread.id() != std::thread::current().id(), background);
+    let before = BACKGROUND_LARGE_CWS_JOBS.load(Relaxed);
+    let (mut body, prepared) = block_on(prepare_movie_body(input.clone())).unwrap();
+    let movie = SwfMovieData::from_prepared(prepared.unwrap(), "file:///large.swf".into(), None, None);
+    assert_eq!(body, input);
+    assert_eq!(movie.compressed_len(), input.len());
+    assert_eq!(movie.header().swf_header(), expected.header.swf_header());
+    assert_eq!(movie.data(), expected.data.as_slice());
+
+    // Corrupt the version in the same eligible envelope and compare the decoder error.
+    body[3] = 0;
+    let Err(expected_error) = swf::decompress_swf(body.as_slice()) else {
+        panic!("expected an invalid SWF version");
+    };
+    let Err(Error::InvalidSwf(error)) = block_on(prepare_movie_body(body)) else {
+        panic!("expected the same SWF error from the movie loader");
+    };
+    assert_eq!(error.to_string(), expected_error.to_string());
+    let completed = BACKGROUND_LARGE_CWS_JOBS.load(Relaxed) - before;
+    assert_eq!(completed, if background { 2 } else { 0 });
+    println!("compressed={} tag_bytes={} thread={:?} completed_large_cws={completed}",
+             input.len(), expected.data.len(), thread.name());
+}
+
 impl<'gc> MovieLoader<'gc> {
     fn replace_root_movie(&mut self, new_root: DisplayObject<'gc>) {
         self.target_clip = new_root;
@@ -932,7 +972,7 @@ impl<'gc> MovieLoader<'gc> {
         let id = 1;
         let generated_url = format!("{}/[[DYNAMIC]]/{}", loader_url, id);
 
-        if crate::aoqi_work::mode().background_for_movie(&bytes) {
+        if crate::aoqi_work::mode().background_for_load_bytes(&bytes) {
             let player = uc.player_handle();
             uc.navigator.spawn_future(Box::pin(async move {
                 match prepare_movie_body(bytes).await {
@@ -1473,7 +1513,8 @@ fn load_sound_avm1_data<'gc>(
         .map_err(|e| e.error)
         .and_then(|(body, _, _, _)| {
             let handle = activation.context.audio.register_mp3(&body)?;
-            sound.set_sound(&mut activation, sound_object, Some(handle));
+            let registered = crate::backend::audio::RegisteredSound::new(activation.context, handle);
+            sound.set_sound(&mut activation, sound_object, Some(registered));
             sound.set_duration(Some(0));
             sound.load_id3(&mut activation, sound_object, &body)?;
             let duration = activation
@@ -1531,7 +1572,8 @@ pub fn load_sound_avm2<'gc>(
             match response {
                 Ok((body, _, _, _)) => {
                     let handle = uc.audio.register_mp3(&body)?;
-                    sound.set_sound(uc, handle);
+                    let registered = crate::backend::audio::RegisteredSound::new(uc, handle);
+                    sound.set_sound(uc, registered);
 
                     let total_len = body.len();
 

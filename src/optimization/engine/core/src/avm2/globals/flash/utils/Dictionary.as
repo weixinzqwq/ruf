@@ -1,8 +1,7 @@
 package flash.utils {
-    import __ruffle__.stub_constructor;
-
     [Ruffle(InstanceAllocator)]
     public dynamic class Dictionary {
+        private native function enableWeakKeys():void;
         public native function aoqiUseDisplayOwners():Dictionary;
         prototype.toJSON = function(r:String):* {
             return "Dictionary";
@@ -11,7 +10,7 @@ package flash.utils {
 
         public function Dictionary(weakKeys:Boolean = false) {
             if (weakKeys) {
-                stub_constructor("flash.utils.Dictionary", "with weak keys");
+                enableWeakKeys();
             }
         }
     }

@@ -277,11 +277,16 @@ crate::impl_storage_item!(Queue);
 
 impl Drop for Queue {
     fn drop(&mut self) {
+        let _phase = hal::aola_close::Phase::begin("wgpu-queue-drop-body");
         resource_log!("Drop {}", self.error_ident());
 
         // On Vulkan, pending presents are not tracked by fences.
         // wait_for_idle covers both fence-tracked submissions and pending presents.
-        match unsafe { self.raw.wait_for_idle() } {
+        let idle_result = {
+            let _phase = hal::aola_close::Phase::begin("wgpu-queue-wait-idle");
+            unsafe { self.raw.wait_for_idle() }
+        };
+        match idle_result {
             Ok(()) => {}
             Err(hal::DeviceError::Lost) => {
                 self.device.handle_hal_error(hal::DeviceError::Lost);

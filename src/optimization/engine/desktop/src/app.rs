@@ -56,6 +56,22 @@ struct MainWindow {
 }
 
 impl MainWindow {
+    #[cfg(windows)]
+    fn drop_with_close_timings(self) {
+        // Match the declaration order. Release the GUI surface before the PlayerController.
+        drop(self.window_move);
+        drop(self.aoqi_host);
+        drop(self.preferences);
+        {
+            let _phase = crate::aola_close_phases::phase("gui-drop");
+            drop(self.gui);
+        }
+        {
+            let _phase = crate::aola_close_phases::phase("player-controller-drop");
+            drop(self.player);
+        }
+    }
+
     pub fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         if matches!(event, WindowEvent::RedrawRequested) {
             // Don't render when nobody can see the result: while minimized, the
@@ -498,7 +514,7 @@ impl App {
         #[cfg(windows)]
         crate::aola_host::set_proxy(event_loop_proxy.clone());
         #[cfg(windows)]
-        let aola_performance = if preferences.cli.aola_host {
+        let aola_performance = if preferences.cli.aola_host || crate::aola_close_phases::configured() {
             Some(crate::aola_diagnostics::PerformanceLog::new(
                 preferences.cli.aola_data_dir.as_ref().expect("Aola data directory initialized"))?)
         } else { None };
@@ -881,28 +897,46 @@ impl ApplicationHandler<RuffleEvent> for App {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         #[cfg(windows)]
-        let _=self.aola_browser.take();
+        {
+            crate::aola_close_phases::start();
+            if let Some(browser) = self.aola_browser.take() {
+                let _phase = crate::aola_close_phases::phase("webview-drop");
+                drop(browser);
+            }
+        }
         // `MainWindow` needs a tokio context to properly drop.
         {
             enter_runtime!(self);
             #[cfg(windows)]
             if let Some(window) = &mut self.main_window {
                 if let Some(host) = &mut window.aoqi_host { host.finish(window.gui.presentation_stats()); }
-                if let Some(log) = &mut self.aola_performance
-                    && let Some(player) = window.player.get()
-                    && log.sample(&player,window.gui.window(),window.gui.presentation_stats(),true).is_err() {
-                    crate::aola_host::record("host-error","performance-log-final-write");
+                if let Some(log) = &mut self.aola_performance && let Some(player) = window.player.get() {
+                    let _phase = crate::aola_close_phases::phase("final-performance-sample");
+                    if log.sample(&player,window.gui.window(),window.gui.presentation_stats(),true).is_err() {
+                        crate::aola_host::record("host-error","performance-log-final-write");
+                    }
                 }
             }
-            let _ = self.main_window.take();
+            if let Some(window) = self.main_window.take() {
+                #[cfg(windows)]
+                let _phase = crate::aola_close_phases::phase("main-window-drop");
+                #[cfg(windows)]
+                if crate::aola_close_phases::active() { window.drop_with_close_timings(); } else { drop(window); }
+                #[cfg(not(windows))]
+                drop(window);
+            }
         }
 
         // Manually stop the tokio runtime: this makes sure that any pending Player-bound futures
         // are properly cancelled and put back on the winit event loop before it closes, preventing
         // them from being dropped on the wrong thread and causing a panic.
         if let Some(runtime) = self.runtime.take() {
+            #[cfg(windows)]
+            let _phase = crate::aola_close_phases::phase("tokio-shutdown");
             runtime.shutdown_timeout(std::time::Duration::from_secs(1));
         }
+        #[cfg(windows)]
+        crate::aola_close_phases::record("event-loop-tail", "begin", None);
     }
 }
 

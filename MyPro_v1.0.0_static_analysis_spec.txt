@@ -1,0 +1,860 @@
+MyPro v1.0.0：面向奥拉星（aola）的 Ruffle 定制与优化分析
+分析日期：2026-11-23
+方法：静态 PE 结构、原生代码反汇编、嵌入 SWF 解压、ABC 指令分析、游戏模块对照、官方源码基线比对
+
+核心结论
+========
+
+这份程序的定制深入到了三层：桌面宿主、Ruffle 原生核心、奥拉游戏 SWF。
+确认度最高的优化包括：
+1. 将奥拉特定 AS3 热点替换成原生函数，包括 MD5、进度条、宠物数据访问和称号索引。
+2. 对 SWF 做后台预解压、内存数据去重、解压后磁盘缓存和文件映射复用。
+3. 缩小部分 blend 的离屏表面，增加简单 blend 的直接绘制路径，融合 blur/glow 渲染过程。
+4. 给空闲纹理池设预算，按闲置条件释放纹理/网格引用，并加入 SWF library 回收与内存治理。
+5. 修改战斗 SWF，删去若干切换、逃跑、变身、背景转场动画；用空 SWF 替换神兵升级动画。
+6. 用新的宿主回调控制技能、伤害、神兵及出场/死亡表现。
+
+“实现存在”“内置默认启用”“某次游戏会命中”“实测提升”是不同结论。
+本次没有执行 EXE、没有登录游戏，也没有做 FPS、内存、画面等价性测试。
+报告中的收益是依据实际控制流作出的工程判断，不是性能测试数据。
+本文所有“默认”均指程序内置读取器的回退值，用户配置、环境变量与 CLI 可以覆盖。
+
+证据编号 E01—E15 对应以下各节，可从原文件按地址复核。
+原生 VA 使用该 PE 的首选 ImageBase；SWF 内偏移均相对于解压后的文件，不能直接加到压缩文件的 EXE 偏移上。
+
+E01　样本身份与分析边界
+======================
+
+输入文件：
+/workspace/scratch/5072d5a995d8/upload/MyPro v1.0.0.exe
+
+文件长度：38,005,248 字节
+SHA-256：
+a4995824734bd4997c7df7aef2d4c00e84ede5f9782f741ddca8a7ce78cffbcf
+
+程序是从 EXE 偏移 0 开始的原生 Windows x64 PE。
+ImageBase：0x140000000
+入口 RVA：0x136ad54
+未发现 CLR 目录。
+本样本 .text 中：文件偏移 = VA - 0x140000000 - 0xc00；数据节不能套用此公式。
+
+内部标识包括 MyPro、Myaola，说明文字为 MyPro desktop client (Ruffle + egui + wry)。
+原始文件偏移 0x1417d68 存在 Ruffle/0.7.1 (https://ruffle.rs)。
+本报告据此使用官方 v0.7.1 作为参考基线，不把 UA 当成精确 upstream commit 证明。
+
+PE 存在 REPRO 标记；COFF 时间字段不能可靠地解释为实际构建日期。
+可见 PDB 名称 MyPro.pdb，但没有 PDB 文件可供符号恢复。
+内部另有“勇芳_鼠标精灵”PE，位于 0x1465c40、大小 606,720 字节，属于鼠标录制/回放组件，不是另一份 Ruffle 内核，不计为性能优化。
+
+旧奥拉Flux样本仅用于指定模块的对照，不是官方游戏原版基线：
+旧样本 SHA-256：
+4a7cd5526e6099880bb11dca1f09cff0d71079e88d4e6fcab52a0da86f951639
+
+因此：
+- 对官方 Ruffle 的差异以明确查到的官方源码为准。
+- 对游戏 SWF 的“移除某段流程”，以新旧这两份实际样本的同名方法对照为准。
+- 不据此推断作者、版本继承关系、远端当前游戏代码或实际启动时配置。
+
+E02　原生替换 AS3 热点：减少解释执行和重复工作
+==========================================
+
+2.1 MD5
+
+已确认绑定逻辑，而不只是看到 NATIVE_MD5 字符串：
+函数 0x1408060b0 中检查原生替换开关、方法名 decryptMD5 和参数数量。
+0x1408065e0 安装原生实现 0x14099f3e0。
+
+原生实现：
+- 检查传入 ByteArray。
+- 从底层字节存储读取输入。
+- 使用标准 MD5 状态常量与 64 字节分块处理（分块函数 0x14097cf20）。
+- 返回 32 字符摘要，并带有计时日志路径。
+
+价值：把原本要经过 AVM2 的逐字节运算、整数/位运算及循环搬到本机函数。
+当加载或校验流程确实频繁调用该方法时，可减少 CPU 解释执行开销。
+这不等于全局启用 JIT，也不意味着所有 AS3 方法都原生化。
+方法名里虽含 decrypt，实际识别到的是 MD5 摘要运算，不能称其“解密 MD5”。
+
+2.2 进度条去掉无效跳帧
+
+refreashPersentBar（样本原拼写）绑定到 0x1409a22e0。
+代码缓存 _persentBar、_curValue、_maxValue 的槽位访问，计算对应的 1—100 帧。
+在 0x1409a2766 比较当前帧与目标帧；相同则直接返回。
+
+价值除了原生化，还包括避免反复 gotoAndStop 同一帧。
+这减少了无变化时的时间轴调用及可能的显示状态处理。
+
+2.3 宠物数据和字符串函数
+
+函数 0x140806a60 中按类、命名空间、方法名与参数数量匹配原生替换，涉及：
+- com.adobe.utils::StringUtil$：trim、ltrim、rtrim、splitToIntArray。
+- mmo.interfaces.pet.pm.data.custom::PMContentReader$.getContent。
+- PMData.getPars、raceId、petSkinArr。
+- PMSkinMap.updateMap。
+- PMDataMap.updateRaceIds、getPMFromMap、isPmExist、getPM。
+- mmo.interfaces.title::TitleConfig$.getTitleById。
+
+确认的是这些替换的注册及对应原生函数；不把每一个都描述为已测得加速。
+对接频繁的游戏配置访问，是该客户端区别于通用播放器的定制点。
+
+2.4 称号查询建立索引
+
+getTitleById 原生函数：0x1409a7990。
+确认链条：
+- 0x1409a7baa 附近比较配置数组对象身份与长度。
+- 不可复用时遍历数组，读 titleId，构造 titleId 到数组下标的哈希索引。
+- 0x1409d5750 保存索引及数组身份/长度。
+- 可复用时经 0x1409d5830 查询索引，再以数组下标取结果。
+- 返回前有 titleId 校验及失败回退路径。
+
+价值：多次查询同一配置时复用索引，减少反复扫描整张表。
+这里既有执行语言改变，也有数据访问方式改变。
+同长度的原地配置修改是否被完整覆盖，未做运行验证；不能凭身份/长度检查宣称任意动态修改都无风险。
+
+相关总开关：--no-native-overrides。
+对应全局标记 0x1423b3e01；它影响多个补丁分支，包含部分资源维护分支。
+因此这个开关做 A/B 时测到的是一组改动的差异，不能单独归因给 MD5。
+
+E03　特定 DomainLoader 的 LoaderInfo.bytes 工作削减
+==================================================
+
+已确认在 LoaderInfo.bytes 相关原生路径 0x140a42cc0 中存在特例：
+- 原生替换开关允许时，检查最近 3 层 AVM 调用栈。
+- 0x140892520 的辅助逻辑在 0x1408925ea 一带匹配 12 字节类名 DomainLoader。
+- 命中后进入 NATIVE_BYTES_SKIPPED 分支，跳过后续 SWF 字节物化/复制相关工作。
+
+这是一项带调用上下文限制的优化，旨在减少游戏加载器获取整份 SWF 字节时的额外复制。
+不能概括成“所有 LoaderInfo.bytes 都不再分配”。
+命中后返回的是刚构造、尚未写入 SWF 内容的空 ByteArray，而不是 null。
+0x140a42ded 附近构造该对象，0x140a432f8 将保存的对象原样返回，绕过 0x140a43059 起的序列化/复制。
+这会改变该上下文中 bytes 的可见内容，依赖对游戏加载器用途的兼容性假设；未运行验证所有调用者都兼容。
+
+E04　后台预解压与内存去重
+========================
+
+4.1 HTTP body 的预处理
+
+已经追到异步状态机和实际任务调用：
+fetch 状态机 0x1400488a0
+→ response vtable 0x141418ed0 的 body 方法 0x1405b5a10
+→ body Future（vtable 0x141f46e48）
+→ poll 0x1405b39f0
+→ 对至少 16 KiB 且为 CWS/ZWS 的字节进行判定
+→ 0x140598800 调度 Tokio blocking 任务
+→ 0x1405c2950 调用 0x140e2dc20
+→ 0x140e2ea40 的去重/解压路径。
+
+prepared/static response 路径 0x1405b33d0 也有相同量级的阈值处理。
+
+这不是只有一个叫 prewarm 的选项；已确认真实任务链。
+其 body Future 会等待预处理任务完成后再返回 body，所以不能说下载后完全不等待。
+工程价值是把较重的压缩数据处理放进专门的 blocking 任务，并为后续加载准备可复用结果。
+这不消灭第一次解压的工作量，也不保证总加载时长在所有机器上更短。
+
+4.2 SWF 内容去重
+
+AOQI_SWF_DEDUP 的读取器 0x140e31ef0 默认开启，精确值 "0" 关闭。
+
+加载函数 0x140e2ea40：
+- 使用原始 SWF 长度、FNV64 和另一 64 位散列形成查找键。
+- 在 0x140e2ed0a 附近查询已有项。
+- 命中且引用仍可提升时，0x140e2ee30 一带获取共享引用，复用相同解压数据及头信息。
+- 命中直接返回，绕过解压函数 0x140e366f0。
+
+因此重复使用相同资源时，不必总是重新解压并持有另一份同内容缓冲。
+去重针对 SWF 数据，并不证明不同 Loader 的全部显示对象、ApplicationDomain、AS3 实例也合并。
+缓存命中还取决于缓存项有效性、引用存活与当前配置。
+内存查找键是长度加两个散列；没有观察到完整逐字节比较，不能称为绝对无碰撞。
+
+4.3 预热结果有短期强引用保留
+
+预热分支将结果交给 0x140e2df70；0x140e2e351 实际增加 Arc 强引用计数，
+随后把指针、key、header、时间写入全局保留队列。
+队列最多 48 项；插入前若已有至少 48 项，会先从队首移除，直到允许插入。
+0x140e2fc50 检查条目年龄，清理超过 180 秒的强引用；查询和插入时调用这一维护。
+
+因此后台预解压完成并释放任务本身临时 Arc 后，成果仍可由保留队列复用。
+这也解释了其内存取舍：用短期保留换后续加载延迟，48 是条目数而非字节预算。
+没有独立 180 秒定时器的证据，所以不能说每项过 180 秒就立即释放。
+factory 实际查找顺序包含弱引用去重表、预热保留队列、解压文件缓存，最后才重新解压。
+
+E05　解压后磁盘缓存、mmap 与缓存容量维护
+======================================
+
+5.1 解压数据缓存不同于普通 HTTP 缓存
+
+初始化在 main 的 0x1400651bb 一带建立 swf-data 子目录，调用 0x140e29a50。
+AOQI_SWF_FILES 默认开启，"0" 关闭。
+
+查找链：
+0x140e2f40b → 0x140e28530。
+
+写入链：
+解压后 0x140e2f595 → 0x140e287f0。
+
+文件格式包含：
+- 魔数 AQSWFC02。
+- 48 字节头。
+- 解压数据长度和 SWF 元信息。
+- .swfd 数据文件。
+
+写入路径对解压后的 body 大小设有 16 KiB 门槛；它与 E04 中按压缩输入长度判断的预热门槛不同。
+写完后，代码可释放原本堆 Vec，再使用文件映射作为数据存储。
+Windows 映射链：
+0x140e28530 → 0x140e4ffc0 → 0x140e50190
+→ CreateFileMappingW（0x140e50244）
+→ MapViewOfFile（0x140e5026c）。
+
+作用：
+- 有效的解压数据缓存命中可避免重复解压。
+- 文件映射为共享/可回收的文件页提供支撑，减少部分长期私有堆缓冲占用。
+- 不等于数据不占 RAM；访问映射页仍可能驻留内存，冷访问仍可能发生缺页和 I/O。
+- 缓存预算也不等于进程内存预算。
+
+5.2 swf-cache-trim 的实际政策
+
+0x140e29a50 启用缓存后创建名为 swf-cache-trim 的线程。
+线程回调链：
+0x140e34410 → 0x140e31bb0 → 0x140e29380。
+
+已经确认：
+- 扫描 .swfd 文件并累计大小。
+- 总量大于 2 GiB 时进入排序与删除流程。
+- 删除后成功减计数，直到累计量不大于 1 GiB。
+- 对超过 86,400 秒的 .tmp 文件有清理分支。
+
+静态链证明初始化调起的单次扫描；未证明这是固定周期运行的后台定时服务。
+也不能写成磁盘永远保持 1 GiB 或硬性不得超过 2 GiB。
+
+5.3 与旧样本的区别
+
+本样本确认的是 CWS/ZWS 后台任务、共享解压数据、swf-data 文件缓存和 mmap。
+未发现旧样本的 liblzma/xz2 标识与同一条原生 LZMA 路径。
+不能把旧报告中的解码器实现、预热政策或阈值直接套用到 MyPro。
+
+5.4 普通 HTTP body 缓存
+
+已确认实际读写分支，而非仅观察到 http-cache 目录名：
+- 缓存路径函数 0x1405ac320 只对 URL path 以 .swf 或 .fui 结尾的资源建路径（先转小写）。
+- 用完整 URL 的 FNV-1a 64 位散列和处理后的文件名生成文件名。
+- 文件保存 [u32 URL 字节长度][URL 字节][body]，读取时再次比较完整 URL，避免单凭文件名散列误命中。
+- 读取函数 0x1405ac790 根据最后修改时间使用约 3 天（259,200 秒）的有效窗口。
+- 写入函数 0x1405ac980 对单个 body 超过 64 MiB 的情况不缓存。
+- 写入临时文件后 rename；读写有实际 Tokio blocking 工作闭包。
+- fetch 状态机有 FETCH cached 的真实缓存命中分支。
+
+AOQI_NO_DISK_CACHE 的消费者已闭合：读取器 0x1405c3300，缓存路径在 0x1405ac34c 一带使用其值。
+未设置或精确值 "0" 时不禁用；其他有效字符串使其禁用，包括空字符串。
+默认允许使用 HTTP 磁盘缓存，还需目录配置可用。
+
+这一层命中减少重复网络传输；E05.1 的 swf-data 层命中减少解压。
+固定时间窗口和文件缓存不等于已经验证了完整 HTTP Cache-Control/条件请求语义。
+
+E06　GPU：缩小 blend 中间表面与直接绘制
+======================================
+
+6.1 Bounded blend：按对象范围缩小离屏表面
+
+官方参考基线：
+Ruffle v0.7.1 的 render/wgpu/src/surface/commands.rs::blend
+以 self.width、self.height 创建对应离屏 Surface。[S1]
+
+MyPro 确认的实现：
+AOQI_BOUNDED_BLEND 默认开启，"0" 关闭。
+渲染读取器 0x140578460；核心侧另有同名读取器 0x14097bc20。
+
+核心显示路径 0x140997960：
+- 计算对象范围。
+- 转为像素边界，向外取整。
+- 每条边扩张 6 像素。
+- 随渲染命令传递范围信息。
+
+渲染函数 0x1405562a0：
+- 要求适合的 blend 类型、范围信息和开关。
+- 0x140556329 附近将范围与当前表面求交。
+- 比较 cropped_area * 4 与 original_area * 3。
+- 裁后面积严格小于原面积的 75% 才采用较小尺寸。
+- 空交集有直接舍弃路径。
+- 最终选出的尺寸真正传入 Surface 创建函数 0x1405631c0。
+
+这能减少适用小范围效果的中间纹理大小、清除范围和读写带宽。
+例如原表面 960×560 为 537,600 像素，假设某次最终裁后为 212×212，则为 44,944 像素。
+这是说明面积变化的算例，不是样本运行数据，也不能等比换算为整局 FPS 提升。
+
+范围：
+- 这是特定 blend 的优化，不是所有滤镜和所有离屏操作都裁剪。
+- 普通 cacheAsBitmap 与按对象 bounds 分配滤镜缓存，在官方 Ruffle 已存在。[S4]
+
+6.2 Direct blend：符合条件时跳过额外离屏
+
+AOQI_DIRECT_BLEND、AOQI_DIRECT_BLEND_MULTI 均默认开启。
+读取器：0x140578590、0x140578620。
+
+同一 blend 函数中：
+- 检查命令类别、形状有效性等条件。
+- 多命令分支上限为 64 条。
+- 成功路径要求对应 mask 计数为零。
+- 0x140557413 附近暂时修改当前 handler 的 blend 状态。
+- 通过 0x140560400 在当前 handler 上执行命令。
+- 恢复状态并返回，跳过额外离屏表面路径。
+
+价值是对适用的简单、无 mask 情形减少一次中间绘制/合成的组织开销。
+不能写成所有混合模式都可以直接绘制；复杂模式仍有原路径。
+
+E07　GPU：融合 blur/glow，条件式离屏 MSAA
+=======================================
+
+7.1 Blur/glow 融合
+
+官方 v0.7.1 的 glow 路径先执行 blur_filter.apply，再建立独立 glow target 并绘制。[S2]
+
+本样本：
+- AOQI_FUSE_GLOW 默认开启。
+- 初始化读取器 0x140578280。
+- Glow 函数 0x14055bf80 在 0x14055c0ef 按开关分流。
+- 开启时给 blur 函数 0x140547a50 传入最后一轮延后/融合标志。
+- blur 函数在最后一轮检查此标志。
+
+实际嵌入且由 shader 构造函数 0x14057a990 引用的 WGSL：
+- 0x1f33829，长度 0x10e3：纵向 blur 与 glow 合成。
+- 0x1f3490c，长度 0xbdf：blur2d。
+- 0x1f354eb，长度 0x1482：融合 blur2d 与 glow。
+
+作用是在适用路径合并原本分开的工作，减少部分 pass 与中间纹理读写。
+着色器中有相应的 8 位中间量/舍入处理，显示其尝试保持原有计算语义。
+但没有执行图像逐像素验证，也没有证明每一种滤镜参数在所有 GPU 上均更快。
+
+AOQI_FUSE_GLOW_VERIFY 默认关闭。
+存在验证路径只说明可用于核对，不能说本次已运行验证。
+
+7.2 大离屏表面 MSAA 的条件控制
+
+AOQI_OFFSCREEN_MSAA 默认开启。
+blend 分支对大尺寸表面另作判断：
+- 边长超过 2048，或面积超过 1,048,576 像素时进入额外控制分支。
+- 关闭相应开关或全局条件字节 0x1423b3c58 非零时，可将质量枚举降为 0。
+- 构造函数确认该枚举对应单采样。
+
+这说明存在针对大中间表面的抗锯齿成本控制。
+不能解释成默认关闭全部 MSAA。
+根分析还确认 0x140541fd0 写入上述字节，调用者位于 0x140187310 与 0x1401888c0；
+但本次没有闭合其所有业务状态来源，所以不声称“内存治理器必然在某种战斗状态自动降 MSAA”。
+
+E08　空闲 GPU 资源的复用和回收
+=============================
+
+8.1 空闲纹理池预算
+
+官方 Ruffle 已有按尺寸、用途、格式、采样数复用的 TexturePool/BufferPool。[S3]
+本样本在其上增加可验证的预算维护：
+
+AOQI_IDLE_POOL_MB 默认值 0x1800000 = 24 MiB。
+读取器：0x140578830，另一个读取点在 0x140543190。
+纹理获取函数：0x140542390。
+- 计数器位于对象 +0x40。
+- 每 128 次纹理获取触发预算检查。
+- 不是每 128 帧，也不是每 128 秒。
+- 回收函数 0x140542b40 估算空闲项总大小。
+- 超预算时从候选项中弹出空闲纹理，减少估算值，并释放其持有的引用。
+
+预算只约束这组可回收空闲资源。
+它不是总显存上限，不覆盖所有活动纹理、驱动分配、其他缓存或整个进程。
+
+8.2 按闲置时间回收纹理和网格
+
+核心维护函数：0x1408832b0。
+已确认读取：
+- AOQI_TEXTURE_IDLE_SECS，默认 6.0 秒。
+- AOQI_MESH_IDLE_SECS，默认 8.0 秒。
+- AOQI_MESH_IDLE_MIN_KB，默认门槛常量对应 128 KiB。
+另有 all-idle 参数，但未把未闭合的组合政策写成确定结论。
+
+纹理：
+0x140a30c60 遍历弱引用登记表。
+判定函数 0x140ba35f0 升级引用、比较最近使用时间与闲置阈值。
+达到条件后清除对象 +0x50 持有的纹理引用（0x140ba3692 附近），并更新计数。
+
+网格：
+0x140911bc0 → 0x140b9e0f0 → 0x1408ef740，遍历登记的 shape 并调用回收逻辑。
+有 MESH_IDLE evicted 日志，记录形状和纹理量。
+
+这里确有清除资源引用的动作，不只是输出日志。
+6/8 秒是闲置判定阈值；维护扫描的调度、对象状态和其他条件仍影响实际发生时间。
+不能写成每个对象恰好在第 6/8 秒释放，也不能保证此时驱动已把全部 GPU 分配退还。
+再次使用时可能需要重建或上传资源，这体现了常驻占用与再次访问延迟之间的取舍，未实测其大小。
+
+E09　SWF library 回收、真实 GC 与内存治理
+=======================================
+
+9.1 collect-movies
+
+CLI 及实现均有 --no-collect-movies / AOQI_COLLECT_MOVIES 控制。
+player setup 0x1401830d0 中的 0x14018510b—518c：
+- 默认启用。
+- --no-collect-movies 或环境值 "0" 可关闭。
+- 调用 0x1408789f0，将状态存到 player +0x47f 并调整相关弱引用模式。
+
+核心收集函数 0x140874890 和周期维护 0x1408832b0 均实际检查该字段。
+路径涉及：
+- 已校验方法体缓存的维护。
+- 库表中对象与 SWF 的引用关系整理。
+- 0x1409f65b0 从强持有表转移/整理候选项。
+- 0x1409f9d20、0x1409f9f80 的后续状态与回收条件检查。
+
+可以确认程序实现了针对不再使用的 SWF library 的资源收集机制。
+不能把它描述成每局结束就无条件卸载全部 SWF，或每个无引用对象立即全部释放。
+与资源复用并存：活跃/仍需使用的对象可以保留，闲置且满足条件的对象进入回收路径。
+
+9.2 内存治理器
+
+函数 0x14013a0b0 包含 app/src/memory.rs 来源标记和实际治理流程：
+- 使用 GetProcessMemoryInfo 读取进程内存信息。
+- 结合内存、时间和业务状态选择维护动作。
+- 在 0x14013a9d5、0x14013aabf 调用核心收集 0x140874890。
+- 配合资源清理、统计与记录函数 0x1401393a0 / 0x140139750。
+- 存在手动面板回收、quiet collection 等路径。
+- CLI 提供 --no-governor、--warn-mb、--hard-limit-mb。
+
+本次没有完整重建全部阈值组合，所以不声称某一固定 RAM 数值会在所有配置下触发同样操作。
+
+9.3 确实有原生 GC 工作，不全是接口空壳
+
+常规垃圾收集和 gc-arena 本来就是 Ruffle 的组成部分；官方 player.rs 的执行流程会调用 collect_debt()。[S8]
+这里确认的是 MyPro 的相关治理入口能进入实际收集流程；其定制价值应归于收集调度、
+SWF library 引用管理和资源维护策略，不能说它首次给 Ruffle 实现 GC。
+旧样本的 System.gc 空实现也不代表旧内核没有自动 GC。
+
+核心函数可进入 0x140a4eb80 的收集状态机，包含实际阶段循环。
+新内置 playerglobal 中 System.gc 声明为 native，而非旧样本的空 ABC 方法。
+不过，本次未把 System.gc 的单个原生绑定完整对应到上述每一个宿主治理入口；
+“存在真实核心 GC”不应替代对所有 AS3 API 语义的逐项证明。
+
+System.pauseForGCIfCollectionImminent 仍是 stub：
+新 builtin SWF method 1938，解压 SWF 偏移 0x39d7a，16 字节；
+调用 stub_method 后返回，声明默认 threshold 为 0.75。
+因此不能把这个 API 调用本身当作已经执行提前回收的证据。
+
+9.4 EmptyWorkingSet 必须与对象释放区分
+
+确认 Windows IAT：
+0x1414155f8 GetCurrentProcess
+0x1414158a8 GetProcessMemoryInfo
+0x1414158a0 EmptyWorkingSet
+
+实际调用：
+0x14013952d，以及治理函数内 0x14013af3c。
+
+Windows 官方说明：EmptyWorkingSet 尝试从进程工作集移走页面。[S7]
+这是驻留页管理，不等于 AS3 堆、Rust 对象或 GPU 对象都已销毁。
+后续再次访问页面可能使工作集回升。
+
+判断“内存优化有效”至少应分开看：
+- 活着的 GC 对象、SWF 与库是否减少。
+- 私有内存是否减少。
+- bitmap/mesh/空闲池资源是否减少。
+- 只是 resident/工作集变小，还是前面几类也一起减少。
+不能单靠任务管理器的数字下降断言泄漏修复。
+
+9.5 调节接口与尚未闭合的部分
+
+CLI 存在 --gc-sleep-factor、--gc-work-scale、--gc-bytes-per-debt-unit。
+前两项存在参数解析到 GC metric 设置的实际链。
+GPU texture bytes 纳入 GC debt 的意图见参数说明，但本次未完整追出其每个字节计数消费者；
+因此不把所有 GC debt 细节都列为已证实生效的性能收益。
+
+E10　游戏 SWF：直接删减特定战斗表现
+==================================
+
+10.1 提取资源清单
+
+共验证 14 个有效 SWF，其中 8 个对应内置游戏覆盖路径。
+下列偏移均为 MyPro EXE 中压缩/原始 SWF 起点，长度为解压后的长度：
+
+路径                                      EXE 偏移     解压字节数
+/play/start                               0x171d938         9,218
+/play/material/materialservice            0x171eb5f       204,069
+/play/library/socketclient                0x1733138       267,599
+/play/pet/petfightnew                      0x174db33     6,353,786
+/play/common/battleeffmv                   0x1c38c16        12,306
+/play/petfightbackground/common            0x1c39c66        28,952
+/play/pet/petfightnew_startmv               0x1c4049a     1,183,375
+/play/gpet/shenbing/shenbingmovie           0x1d36004           472
+
+其余资源为一个极小空 SWF、另一个 CommonBack、两个宠物模板、两份 Ruffle builtin。
+资源存在和内容已经证实；用户可以通过配置更换覆盖文件，不能据此断言每次启动必然选中同一套资源。
+
+10.2 额外入场背景转场
+
+mmo.petfightnew.common.startmovie.StartMovie.enterFight：
+解压后的 petfightnew SWF 偏移 0x601142，方法长度 36。
+StartMovie3v3.enterFight：
+0x5bc811，长度 36。
+
+相较旧 Flux 同名方法，移除了对 GQcommonBackMv / XinghuicommonBackMv 的额外转场请求。
+新方法 dispose 后直接调用完成闭包，推进进入战斗。
+
+范围只是这一层额外背景转场。
+独立 petfightnew_startmv 仍有 1,183,375 字节，里面还有到指定帧停止的开场动画。
+不能写成“所有入场动画都被删了”。
+
+10.3 亚比切换和逃跑
+
+MCPetContainer.showSwitchEffect：
+SWF 0x5fdb5e，长度 81。
+- 设置必要状态。
+- 停止/移除当前动作。
+- 若有完成回调则调用。
+- 不再构造 McMySwitch / McVsSwitch 并挂接播放。
+
+MCPetContainer.showEscapeEffect：
+SWF 0x5fdad1，长度 132。
+- 保留缺失对象和部分特殊状态处理。
+- 停止/移除对象、清理光效、调用完成回调。
+- 删除旧的逃跑效果构造和播放路径。
+
+价值：减少临时显示对象、动画播放和等待完成的流程。
+这属于删减表现以减少工作；实际画面会变得简化，不应与保留所有表现的渲染优化混为一项。
+静态上保留推进回调，但未运行验证所有游戏状态下的回调成功性。
+
+10.4 特定变身/出场动画
+
+ChangePetView 下四个方法：
+showJuexingAppearMovie，0x5c755f。
+showJiuRiShenAppearMovie，0x5c775f。
+showDengShenChangJieAppearMovie，0x5c7965。
+showZhenLiFaDianAppearMovie，0x5c7b6e。
+
+新代码保留部分容器、位置、资源 ID 等计算；
+删除旧 ResScheduler.getRes(...) 的动画加载播放链；
+随后调用 afterPlayAppear()、callBack.invoke()。
+
+showYiRenMovie，0x5c8fae：
+删除旧首次/后续异人出场资源请求；
+通过 onPetChange(...) 和完成回调继续。
+
+上述方法没有依赖 Load.pb / pbeffect 的条件，是当前覆盖 SWF 的固定改动。
+
+10.5 星辉平台和神兵升级动画
+
+FightPanel.initLayers，SWF 0x5e4284：
+删除旧有分支中额外星辉平台 Sprite 的创建与挂接。
+背景 cacheAsBitmap 保留，但旧样本已存在此设置，不能算 MyPro 新加。
+
+shenbingmovie 覆盖资源：
+解压后仅 472 字节。
+只有 mmo.gqpet.shenbing.view.LevelUpMovie 空类及空 Sprite；
+构造器只调用 super，无形状、位图或实质动画。
+这是实际的轻量占位替换，不是仅凭体积推测。
+没有该模块当前官方原版数据，不能给出百分比加速。
+
+10.6 静态背景资源
+
+内置 /play/petfightbackground/common：
+一个 960×560 JPEG，JPEG 数据 28,100 字节；
+整体 28,952 字节，是单帧 CommonBack 包装。
+不过另有一个 1.32 MB 的 CommonBack 资源，实际选择由宿主决定。
+所以只能确认内置有轻量静态背景方案，不能说所有场景永远使用它。
+
+E11　新的屏蔽桥接：Load 状态与完成回调
+=====================================
+
+start.swf 的 mmo.checkversion.Load.init（SWF 0x1910）注册以下宿主回调：
+
+回调名     状态/行为                   已核实的使用方
+pingbi     Load.pb                    多种技能动画入口及 UseSkill 流程
+hurt       Load.pbhurt                伤害表现处理
+shenbing   Load.pbsb                  神兵攻击、受击效果
+pbeffect   Load.pbeffect              出场标记、死亡表现
+pbfight    Load.pbfight/fightMode     部分战斗图层切换
+highfps    stage.frameRate            60/25 FPS 及 ENTER_FRAME 纠正
+
+这些 Boolean 槽在 SWF 中初值为 false；宿主可以随后按用户配置修改。
+不能把 SWF 初值直接当成某位用户当前设置。
+
+11.1 pingbi
+
+GQWanyuZhichaoEffectHelper.playAttackMovie，0x5aefc2；
+GQMenghuanDiyueEffectHelper.playAttackMovie，0x5b1ccf：
+pb 为真时，完成回调后直接返回，避开动画构造/加载。
+
+UseItemMovieHelper.getRevertMovie，0x5b2489：
+先回调再返回，跳过对应动画池查询/加载。
+
+UseSkill.handleMovie，0x5ca8ea：
+合并原有跳过条件后，走 refreshInfos、handleSkillEnd、返回。
+handleSkillEnd，0x5ccf59：
+pb 为真时直接 afterSkillUseEnd()。
+
+关键在于跳过表现时仍显式推进后续处理。
+它不意味着服务器战斗运算或结算逻辑被取消。
+
+11.2 hurt
+
+FightPanel.refreshPetInfoOfPlayer，0x5e6e3d：
+pbhurt 为真时跳过 new SkillResultHandler(...).start()。
+后续宠物/状态 UI 刷新仍存在。
+因此应称伤害表现屏蔽，不能称不再处理 HP 或所有战斗状态。
+
+11.3 shenbing
+
+GQShenBingEffectHelper.attack，0x5b80ec；
+hurt，0x5b8176：
+pbsb 为真时提前返回，避开图标/动画创建、gotoAndPlay、帧回调设置。
+
+11.4 pbeffect
+
+MCPetContainer.startLoad，0x5fd583：
+开启后不再设置请求的出场动画标记。
+但仍执行 preloadResOfPet、prepareRes 和部分大招预加载。
+所以屏蔽出场不等于不加载亚比主体或不占模型内存。
+
+showDieEffect，0x5fd685：
+开启时转入停止/移除当前动作、移除光效和完成回调路径，绕过动画死亡分支。
+
+11.5 pbfight
+
+setter 将 fightMode 设为 3/0。
+PetFightService.enterFight，0x5f10e3：
+可跳过 LayerManager.switchLayer(FIGHTING_LAYER)，其他 setup 仍继续。
+不能凭此推导网络战斗和游戏状态处理完全停止。
+
+11.6 highfps
+
+HighFPS(true) 将 stage.frameRate 设为 60，并加 ENTER_FRAME 检查，游戏改动帧率时会恢复 60。
+false 移除监听并设回 25。
+
+这是帧率目标控制，不是降低每帧计算成本。
+若硬件有余量可能更流畅，但也可能增加 CPU/GPU 总工作量。
+依赖动画循环或帧回调的表现与计时，不能自动假定仍按同样现实秒数推进。
+新 CountMovie 恰为按动画循环倒数，见 E13。
+
+E12　其他配套改动及证据级别
+==========================
+
+12.1 WebView 面板
+
+原始 EXE 0x1678719 有内置 HTML，提取长度约 316 KB。
+其中全局 *, *::before, *::after 的 CSS 使用：
+backdrop-filter: none !important;
+-webkit-backdrop-filter: none !important;
+
+即使部分局部样式仍写 blur，前述全局 important 规则通常覆盖这些普通声明。
+这减少的是客户端面板背景模糊合成成本；不能把它当成 Flash 游戏的所有滤镜都被禁用。
+
+亚比列表：
+ABI_PAGE_SIZE = 150；
+appendAbiBatch 使用 DocumentFragment 分批追加；
+滚动时继续加载后续批次。
+这减少面板首次构造大量 DOM 的工作，不等同于游戏战斗逻辑优化。
+
+12.2 分辨率、FSR、倍率与帧率
+
+界面/CLI 提供渲染分辨率、max_render_pixels、FSR、目标 FPS、速度倍率等控制。
+渲染分辨率选项可见 960×560、1920×1120、2880×1680、3840×2240。
+这些参数允许在画质、负载和显示尺寸间调整；不是每个选项都意味着更快。
+本次未对每个 UI 值到最终 GPU 行为逐一闭合，因此只作为配套控制项，不把所有界面承诺当作已验证收益。
+
+特别是：
+- 设置 60 FPS 不等于测得 60 FPS。
+- 加快时间轴不等于相同画质/相同工作量下算得更快。
+- 分辨率提高会增加像素工作；FSR 的收益依赖输入/输出尺寸和实际实现。
+- H5/高清模型优先是内容与显示路径扩展，可能增加也可能减少开销。
+
+12.3 H5/Spine/mesh 扩展
+
+已发现：
+AOLA_SPINE_H5_V1 标记、ruffle/core/src/spine.rs、
+navigator/h5_pet_fight.rs、H5_PET/H5_PET_FIGHT 的加载/合成 SWF 日志。
+
+新 builtin 原生声明：
+Dictionary.aoqiUseDisplayOwners():Boolean，method 927。
+Graphics.aoqiDrawPetMesh(BitmapData,Vector<Number>,Vector<int>,Vector<Number>):Boolean，method 967。
+DisplayObject.aoqiPetModelInfo():Object，method 3033。
+ByteArray.aoqiAdaptSwf():ByteArray，method 3729。
+
+两个 pet2011 模板每个有 56 个 600×600 位图 tag；抽查第一帧像素全零。
+它们是资源模板，不能把极小压缩体积直接当成真实亚比的内存大小。
+
+这些证据支持“内核增加了 H5/Spine/mesh 相关集成”，
+但没有完整证实所有亚比的路由、缓存策略或实际性能差异，故不列入保证提速的项目。
+
+12.4 SWF 兼容适配
+
+ByteArray.aoqiAdaptSwf 对应原生链 0x14095d350 → 0x140b405f0，
+可处理 FWS/CWS/ZWS，有最大输入长度防护，解析 DoABC，
+并匹配 ExternalInterface、URLLoader、URLStream、Security、navigateToURL 等符号和 aoqi.my.compat 命名空间。
+
+这是兼容与适配机制。
+不能因为它是原生函数，就自动把它计作性能收益。
+
+E13　与前一份奥拉Flux的差别，以及不能沿用的结论
+===============================================
+
+13.1 公告屏蔽
+
+本样本未提取出 messagesendservice.swf 覆盖文件。
+解压后的游戏 ABC 中未发现旧 aolaHideNotice、aolaSessionGc、aolaSetBlock* 接口。
+新的屏蔽控制是 Load.pb/pbhurt/pbsb/pbeffect/pbfight 等。
+
+因此，前面针对旧 messagesendservice 的“提前返回、跳过图像创建、清消息队列”分析，
+不能直接作为这份 MyPro 已实现的优化。
+这只是本次内嵌资源扫描的边界，不证明程序永远不会下载公告模块，也不证明不存在其他屏蔽方式。
+
+13.2 会话回收和 System.gc
+
+新 fight 保留 FightData.resetDomainIfStale（0x5a5c47）以及 Movie/Tween 管理器清理。
+没有旧 aolaSessionGc 宿主调用包装。
+新 System.gc 为 native，旧样本空 ABC 的结论不能沿用；
+pauseForGCIfCollectionImminent 仍为 stub，见 E09。
+
+13.3 倒计时
+
+新 CountMovie：
+init，0x5f4aa5，使用 addFrameScript(totalFrames-1,onOneLoop)；
+onOneLoop，0x5f4b6f，每次动画循环减少 _leftSeconds；
+startCount 调用 play()。
+
+旧样本基于 getTimer + ENTER_FRAME 的真实时间倒数修正不在本方法里。
+因此不能说新样本保留了那项修正，尤其在提高帧率/速度倍率时应分别理解其行为。
+
+13.4 字体与素材体积
+
+对新旧 petfightnew 逐 tag 哈希：
+- 9 个 DefineFont3、9 个 FontAlignZones、4 个 FontName 全部相同。
+- 1,557 个 Sprite、237 个编辑文本、550 个 JPEG3，以及对应各类 shape 均相同。
+- 旧 456 个 DefineBitsLossless2 中有 455 个保持相同。
+- 被删除的主要位图是 BitmapRes513，1242×687，压缩 tag 220,670 字节。
+- 新 ABC 为 700,472 字节，旧为 679,644 字节，反而更大。
+
+所以文件小约 200 KB 不能归因于“重新压缩全部字体”“所有图片降采样”或“所有脚本更精简”。
+可证明的是具体位图删除、具体方法流程修改和不同覆盖资源。
+
+E14　原版 Ruffle 已有的能力与本次尚未证明的宣传式结论
+=====================================================
+
+官方 v0.7.1 已有：
+- wgpu GPU 渲染。
+- TexturePool/BufferPool。
+- cacheAsBitmap 与脏状态判定。
+- 按对象范围及滤镜扩张范围分配滤镜缓存。[S3、S4]
+- AVM2 方法验证、预解码后的 parsed_code、OnceLock 缓存。[S5]
+- 解释器循环读取已解析的 opcodes，而不是每次调用重新解析所有原始字节。
+
+因此：
+1. 不能把“启用 GPU”本身当作 MyPro 独有修改。
+2. 不能把“预解码/缓存 opcode”本身当作本样本新增。
+3. 原生替换某些游戏方法不等于完整 JIT。
+4. 不能仅凭 LAZY/FAST/WEAK 等参数名宣称全部相关优化已完成。
+
+对象休眠同样需要证据：
+样本唯一 dormant 文本与 GC 阶段统计并列，不能证明不可见/停止的 MovieClip 不再 tick。
+官方 orphan 管理会继续处理有效且 parent 为空的对象。[S6]
+本次没有追出 MyPro 全面改变这一行为的完整状态机，所以不声称已实现通用“不可见对象休眠”。
+
+这份程序存在多项具体优化，但还不能据静态代码给出：
+- 比官方快多少倍。
+- 所有亚比/技能都有同等收益。
+- 长时间运行绝不增长内存。
+- 所有兼容路径和融合滤镜都与官方逐像素/逐状态等价。
+- 新样本一定整体快于旧 Flux。
+
+E15　程序已经提供的测量能力，以及怎样读结果
+==========================================
+
+可见 --mem-log，其 CSV 字段包含：
+seconds,resident_mb,private_mb,movie_loaders,live_gc_objects,
+full_collections,last_pause_ms,reloads,movies,swf_mb,swf_unique_mb,
+dedup_hits,fps,render_ms,bitmap_textures,bitmap_mb,pool_idle_mb
+
+这些字段可以分别回答：
+- 去重是否命中：dedup_hits、swf_mb 与 swf_unique_mb。
+- 资源是否真正回收：movies、live_gc_objects、bitmap_textures、bitmap_mb、pool_idle_mb。
+- GC 是否带来停顿：full_collections、last_pause_ms。
+- 渲染是否更便宜：render_ms，结合相同场景下的 FPS。
+- 工作集是否只是被压小：resident_mb 与 private_mb、对象/资源计数共同观察。
+
+有 --no-native-overrides、--no-collect-movies、--no-governor，以及各渲染环境变量，
+也有自动战斗、重载压力测试等工具入口。
+这些是评估和定位机制，不是性能测试已经完成的证据。
+
+如果进行后续实测，应保持同一战斗场景、同一亚比、同一帧率/速度/分辨率，
+分别记录首次加载和缓存已热时的表现。
+否则删减动画、改变帧率、提高倍率、降低渲染分辨率会混到“引擎更快”的结论里。
+本次没有生成任何实测 CSV，没有执行自动战斗或压测。
+
+官方参考资料
+============
+
+[S1] Ruffle v0.7.1 blend
+https://github.com/ruffle-rs/ruffle/blob/v0.7.1/render/wgpu/src/surface/commands.rs
+Blob: 647a687d353bb7a6187ee56694b065abefc125f7
+
+[S2] Ruffle v0.7.1 glow
+https://github.com/ruffle-rs/ruffle/blob/v0.7.1/render/wgpu/src/filters/glow.rs
+Blob: 15a8d5253e0480e6d1db32d62f877b4f184f70aa
+
+[S3] Ruffle v0.7.1 texture pool
+https://github.com/ruffle-rs/ruffle/blob/v0.7.1/render/wgpu/src/buffer_pool.rs
+Blob: 7d36ac70cd2aebfc5095076ef370332c0f0306f6
+
+[S4] Ruffle v0.7.1 bitmap/filter cache
+https://github.com/ruffle-rs/ruffle/blob/v0.7.1/core/src/display_object.rs
+Blob: 64e3a3258f251ee7fe5b5806691b4db9e40718a6
+
+[S5] Ruffle v0.7.1 方法缓存与 AVM2 执行
+https://github.com/ruffle-rs/ruffle/blob/v0.7.1/core/src/avm2/method.rs
+Blob: 4363024d88d251c687670416e19e5dba5bd00333
+https://github.com/ruffle-rs/ruffle/blob/v0.7.1/core/src/avm2/verify.rs
+Blob: 008ae1dc72e1c5293a0080f46c09478f3908d665
+https://github.com/ruffle-rs/ruffle/blob/v0.7.1/core/src/avm2/activation.rs
+Blob: ac58f9f6a6101f457516a8b27d814194823e7f29
+
+[S6] Ruffle v0.7.1 orphan 管理
+https://github.com/ruffle-rs/ruffle/blob/v0.7.1/core/src/orphan_manager.rs
+Blob: a231dc08044438c44f174aeafa466afc9841f82e
+
+[S7] Microsoft EmptyWorkingSet
+https://learn.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-emptyworkingset
+
+[S8] Ruffle v0.7.1 player 与自动 GC
+https://github.com/ruffle-rs/ruffle/blob/v0.7.1/core/src/player.rs
+Blob: 675ef3a78e7a92652e8076b99921771d91818094
+
+官方 Ruffle 文件由 GitHub 连接器读取并保存；Microsoft 页面由网页读取工具获取。
+上述官方源码版本是比较基线，不是对 MyPro 精确构建提交的证明。
+
+证据工作文件索引
+================
+
+以下路径用于本次复核定位；正文已保留核心样本哈希、地址、条件与来源，不依赖这些临时文件才能理解结论。
+共同前缀：/workspace/scratch/5072d5a995d8/
+
+analysis_mypro_pe/
+verified_pe_metadata.json、pe_inventory.json
+native_install.asm.txt、native_install_more.asm.txt、native_md5.asm.txt
+native_loader.asm.txt、title_getbyid.asm.txt、native_overrides_all.asm.txt
+swf_dedup.asm.txt、swf_decode.asm.txt
+swf_disk_reuse_read.asm.txt、swf_disk_reuse_write.asm.txt、cache_mmap_win.asm.txt
+cache_setup.asm.txt、cache_trim.asm.txt、cache_trim_thread.asm.txt
+fetch_async.asm.txt、http_resource_prewarm.asm.txt、prewarm_future.asm.txt
+findings.txt
+
+analysis_mypro_baseline/
+render_control_disasm.txt、render_config_disasm.txt、glow_fusion_disasm.txt
+render_surface_pool_disasm.txt、pool_init_disasm.txt
+glow_shader_excerpt.wgsl、blur2d_shader_excerpt.wgsl、glow_fused2d_shader_excerpt.wgsl
+source_manifest.json、upstream_*.rs、findings.txt
+
+analysis_mypro_custom/
+swfs/manifest.json、start_disasm.txt、flags_disasm.txt
+skipped_effects_disasm.txt、fight_method_diffs.txt
+fight_gc_disasm.txt、builtin_gc_disasm.txt、builtin_custom_native.json
+fight_asset_comparison.json、background_jpeg_details.json、findings.txt
+
+analysis_mypro_root/
+pe_analysis.py、player_setup.asm、core_collect.asm、core_resource_reclaim.asm
+collect_library.asm、movie_deferred_collect.asm、movie_deferred_retain.asm
+native_gc_loop.asm、memory_governor.asm、governor_gc.asm、memory_stats.asm
+reclaim_textures.asm、reclaim_mesh.asm、texture_retain1.asm、mesh_retain.asm
+gc_metric_parse.asm、cli_builder.asm、embedded_html_1678719.html
+

@@ -27,6 +27,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("Sound definition is no longer registered")]
+    UnknownSound,
     #[cfg(feature = "mp3")]
     #[error("Couldn't decode MP3: {0}")]
     InvalidMp3(#[from] mp3::Error),

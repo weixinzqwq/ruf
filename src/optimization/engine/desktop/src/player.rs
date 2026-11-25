@@ -244,14 +244,19 @@ impl ActivePlayer {
             && std::env::var_os("AOLA_HIDE_NOTICE").as_deref() == Some(std::ffi::OsStr::new("1"));
         let block_skill = preferences.cli.aola_host
             && std::env::var_os("AOLA_BLOCK_SKILL").as_deref() == Some(std::ffi::OsStr::new("1"));
+        let hide_transform_portrait = preferences.cli.aola_host
+            && std::env::var_os("AOLA_HIDE_TRANSFORM_PORTRAIT").as_deref() == Some(std::ffi::OsStr::new("1"));
+        let skip_battle_backdrop = preferences.cli.aola_host
+            && std::env::var_os("AOLA_SKIP_BATTLE_BACKDROP").as_deref() == Some(std::ffi::OsStr::new("1"));
+        let patch_battle = block_skill || hide_transform_portrait || skip_battle_backdrop;
         let mut navigator = navigator;
-        if hide_notice || block_skill {
+        if hide_notice || patch_battle {
             let exe = std::env::current_exe().ok();
             let root = exe.as_deref().and_then(std::path::Path::parent);
             if hide_notice {
                 navigator = navigator.with_aola_notice(root.map(|r| r.join("swf-notice")).as_deref());
             }
-            if block_skill {
+            if patch_battle {
                 navigator = navigator.with_aola_battle(root.map(|r| r.join("swf-battle")).as_deref());
             }
         }
@@ -263,7 +268,11 @@ impl ActivePlayer {
                     if lifecycle == "official" {
                         tracing::info!(target: "aola_swf_lifecycle", mode="official", source="config", result="official");
                     }
-                    navigator
+                    if std::env::var("AOLA_OPTIMIZE_BACKPACK").as_deref() == Ok("1") {
+                        let bundle = std::env::current_exe().ok()
+                            .and_then(|exe| exe.parent().map(|root| root.join("swf-backpack")));
+                        navigator.with_aola_backpack(bundle.as_deref())
+                    } else { navigator }
                 }
                 AolaSwfMode::Legacy { optimized } => {
                     let root = std::env::current_exe().expect("Executable path").parent().expect("Executable directory").join("swf");
@@ -341,7 +350,9 @@ impl ActivePlayer {
 
         #[cfg(windows)]
         if crate::aola_host::enabled() {
-            builder=builder.with_external_interface(Box::new(crate::aola_host::AolaInterface::new(hide_notice, block_skill)));
+            builder = builder.with_external_interface(Box::new(crate::aola_host::AolaInterface::new(
+                hide_notice, block_skill, hide_transform_portrait, skip_battle_backdrop,
+            )));
         }
         if !opt.gamepad_button_mapping.is_empty() {
             builder = builder.with_gamepad_button_mapping(opt.gamepad_button_mapping.clone());

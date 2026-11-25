@@ -12,6 +12,8 @@ mod aola_host;
 #[cfg(windows)]
 mod aola_diagnostics;
 #[cfg(windows)]
+mod aola_close_phases;
+#[cfg(windows)]
 mod aoqi_host;
 #[cfg(windows)]
 mod aoqi_diagnostics;
@@ -199,7 +201,7 @@ fn main() -> Result<(), Error> {
         opt.graphics=Some(ruffle_render_wgpu::clap::GraphicsBackend::Dx12);
         opt.quality=Some(ruffle_render::quality::StageQuality::High);
         opt.width=Some(960.0);opt.height=Some(560.0);
-        // Default to the SWF's rate; preserve an explicitly requested --frame-rate.
+        opt.frame_rate.get_or_insert(60.0);
         opt.tcp_connections=Some(ruffle_core::backend::navigator::SocketMode::Allow);
         opt.referer=Some(Url::parse(aola_host::PAGE_URL)?);
         opt.movie_url=None;
@@ -248,14 +250,23 @@ fn main() -> Result<(), Error> {
 
     let preferences = GlobalPreferences::load(opt)?;
     #[cfg(windows)]
-    if aola_host::enabled() {
+    aola_close_phases::initialize(preferences.cli.aola_data_dir.as_deref())?;
+    #[cfg(windows)]
+    if aola_host::enabled() || aola_close_phases::configured() {
         use tracing_subscriber::Layer as _;
-        std::panic::set_hook(Box::new(aola_host::record_panic));
+        if aola_host::enabled() { std::panic::set_hook(Box::new(aola_host::record_panic)); }
         tracing_subscriber::registry().with(aola_host::DiagnosticLayer.with_filter(
             tracing_subscriber::filter::filter_fn(aola_host::diagnostic_enabled))).init();
         aola_host::record("host","starting");
         return App::new(preferences).and_then(|(mut app,event_loop)| {
-            event_loop.run_app(&mut app).context("Event loop failure")
+            let result = event_loop.run_app(&mut app).context("Event loop failure");
+            aola_close_phases::record("event-loop-tail", "end", None);
+            {
+                let _phase = aola_close_phases::phase("app-drop");
+                drop(app);
+            }
+            aola_close_phases::finish();
+            result
         });
     }
 

@@ -29,7 +29,7 @@ pub unsafe trait Collect<'gc> {
     /// *Must* call [`Trace::trace_gc`] (resp. [`Trace::trace_gc_weak`]) on all directly owned
     /// [`Gc`] (resp. [`GcWeak`]) pointers. If this type holds inner types that implement `Collect`,
     /// a valid implementation would simply call [`Trace::trace`] on all the held values to ensure
-    /// this.
+    /// this. [`Trace::trace_ephemeron`] also visits both weak pointers in its conditional edge.
     ///
     /// # Tracing pointers
     ///
@@ -60,6 +60,13 @@ pub trait Trace<'gc> {
 
     /// Trace a [`GcWeak`] pointer (of any real type).
     fn trace_gc_weak(&mut self, gc: GcWeak<'gc, ()>);
+
+    /// Trace both weak handles and keep the value alive if the key becomes strongly reachable
+    /// during this mark phase. Neither handle alone gives the caller a strong reference.
+    fn trace_ephemeron(&mut self, key: GcWeak<'gc, ()>, value: GcWeak<'gc, ()>) {
+        self.trace_gc_weak(key);
+        self.trace_gc_weak(value);
+    }
 
     /// This is a convenience method that calls [`Collect::trace`] but automatically adds a
     /// [`Collect::NEEDS_TRACE`] check around it.
@@ -143,6 +150,10 @@ unsafe impl<'gc, T: Collect<'gc>> DynCollect<'gc> for T {
 
             fn trace_gc_weak(&mut self, gc: GcWeak<'gc, ()>) {
                 self.0.trace_gc_weak(gc)
+            }
+
+            fn trace_ephemeron(&mut self, key: GcWeak<'gc, ()>, value: GcWeak<'gc, ()>) {
+                self.0.trace_ephemeron(key, value)
             }
         }
 

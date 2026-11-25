@@ -4,6 +4,8 @@ mod color_matrix;
 mod displacement_map;
 mod drop_shadow;
 mod glow;
+#[cfg(test)]
+pub(crate) use glow::FUSE_GLOW_OVERRIDE;
 mod shader;
 pub(crate) mod uniform_cache;
 

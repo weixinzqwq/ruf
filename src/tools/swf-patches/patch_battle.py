@@ -1,4 +1,4 @@
-"""Build the opt-in Wanyu attack animation patch for the archived petfightnew."""
+"""Build the Wanyu attack, transform portrait, and battle backdrop gates."""
 from display_patch import ROOT, build
 
 VERSION = "261112849126071"

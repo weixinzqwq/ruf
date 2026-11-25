@@ -58,6 +58,7 @@ use web_time::Instant;
 /// `Player` creates this when it begins a tick and passes it through the call stack to
 /// children and the VM.
 pub struct UpdateContext<'gc> {
+    pub(crate) battle_maintenance: &'gc mut crate::player::BattleMaintenance,
     pub(crate) frame_profile: &'gc mut crate::frame_profile::FrameProfiler,
     pub(crate) tick_profile: &'gc mut crate::tick_profile::TickProfiler,
     /// The mutation context to allocate and mutate `Gc` pointers.

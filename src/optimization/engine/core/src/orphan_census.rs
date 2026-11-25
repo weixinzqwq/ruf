@@ -1,7 +1,7 @@
 //! Metadata-only snapshot of the AVM2 weak orphan list after a profiled detail response.
 use crate::avm2::TObject;
 use crate::context::UpdateContext;
-use crate::display_object::{TDisplayObject, TDisplayObjectContainer};
+use crate::display_object::{DisplayObject, TDisplayObject, TDisplayObjectContainer};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use web_time::Instant;
@@ -33,7 +33,7 @@ pub struct Census {
     pub scan_us: u64,
 }
 
-// Only fixed labels leave the player. Never log an address or instance property.
+// Group resource URLs by a fixed label. Never log an address or instance property.
 fn movie_label(url: &str) -> &'static str {
     let Some(path) = url.strip_prefix("https://aola.100bt.com/play/")
         .or_else(|| url.strip_prefix("http://aola.100bt.com/play/")) else { return "unknown"; };
@@ -74,6 +74,106 @@ fn sampled_indices(slots: usize) -> impl Iterator<Item = usize> {
     let divisor = n.saturating_sub(1).max(1);
     let span = slots.saturating_sub(1);
     (0..n).map(move |i| i * (span / divisor) + i * (span % divisor) / divisor)
+}
+
+/// Root-local observations at the start of ordinary frame processing. The registry
+/// supplies an already upgraded object; sampling must not change its GC lifetime.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OrdinaryRootGroup {
+    pub class: String,
+    pub movie: &'static str,
+    pub symbol: Option<u16>,
+    pub playback: &'static str,
+    pub children: bool,
+    pub pending_script: bool,
+    pub script_on_current_frame: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct OrdinarySnapshot {
+    pub frame: u64,
+    pub in_battle: bool,
+    pub slots: usize,
+    pub sampled: usize,
+    pub invalid: usize,
+    pub omitted_roots: usize,
+    pub groups: Vec<(OrdinaryRootGroup, usize)>,
+    pub script_calls: usize,
+    pub script_receivers: BTreeMap<String, usize>,
+}
+
+// Read the declared ABC class metadata without invoking AS3 property access.
+fn declared_class(receiver: crate::avm2::StageObject<'_>) -> Option<String> {
+    let name = receiver.instance_class().name();
+    let ns = name.namespace().as_uri_opt()?;
+    let local = name.local_name();
+    if ns.len() > 96 || local.len() > 96 { return None; }
+    Some(if ns.is_empty() { local.to_string() } else { format!("{ns}::{local}") })
+}
+
+impl OrdinarySnapshot {
+    pub(crate) fn record_frame_script(&mut self, receiver: crate::avm2::StageObject<'_>) {
+        self.script_calls += 1;
+        if self.script_calls > SAMPLE_LIMIT { return; }
+        let class = declared_class(receiver).unwrap_or_else(|| "unknown".to_owned());
+        if let Some(count) = self.script_receivers.get_mut(&class) {
+            *count += 1;
+        } else if self.script_receivers.len() < GROUP_LIMIT {
+            self.script_receivers.insert(class, 1);
+        }
+    }
+}
+
+pub(crate) struct OrdinaryRootSample {
+    snapshot: OrdinarySnapshot,
+    indices: std::iter::Peekable<std::vec::IntoIter<usize>>,
+    groups: BTreeMap<OrdinaryRootGroup, usize>,
+}
+
+impl OrdinaryRootSample {
+    pub(crate) fn new(slots: usize, frame: u64, in_battle: bool) -> Self {
+        Self {
+            snapshot: OrdinarySnapshot { slots, frame, in_battle, ..Default::default() },
+            indices: sampled_indices(slots).collect::<Vec<_>>().into_iter().peekable(),
+            groups: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn observe(&mut self, index: usize, valid: Option<DisplayObject<'_>>) {
+        if self.indices.next_if_eq(&index).is_none() { return; }
+        self.snapshot.sampled += 1;
+        let Some(object) = valid else {
+            self.snapshot.invalid += 1;
+            return;
+        };
+        let class = object.object2().and_then(declared_class).unwrap_or_else(|| "unknown".to_owned());
+        let clip = object.as_movie_clip();
+        let playback = match clip {
+            Some(c) if !c.initialized() => "uninitialized",
+            Some(c) if !c.playing() => "stopped",
+            Some(c) if c.header_frames() > 1 => "playing-multiple-frames",
+            Some(_) => "playing-single-or-empty",
+            None => "non-timeline",
+        };
+        let id = object.id();
+        let group = OrdinaryRootGroup {
+            class, movie: movie_label(object.movie().url()),
+            symbol: (id != 0 && id != u16::MAX).then_some(id),
+            playback, children: object.as_container().is_some_and(|c| c.num_children() > 0),
+            pending_script: clip.is_some_and(|c| c.has_pending_script()),
+            script_on_current_frame: clip.is_some_and(|c| c.has_frame_script(c.current_frame())),
+        };
+        *self.groups.entry(group).or_default() += 1;
+    }
+
+    pub(crate) fn finish(mut self) -> OrdinarySnapshot {
+        let groups = &mut self.snapshot.groups;
+        groups.extend(self.groups);
+        groups.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        self.snapshot.omitted_roots = groups.iter().skip(GROUP_LIMIT).map(|(_, count)| count).sum();
+        groups.truncate(GROUP_LIMIT);
+        self.snapshot
+    }
 }
 
 impl Census {

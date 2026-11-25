@@ -19,7 +19,7 @@ def notice_libraries():
     return tags + b"".join(abc_tags(play.read_bytes(), scene_types.__contains__))
 
 
-def run_probe(args, label, class_name, access_java, tags, expected):
+def run_probe(args, label, class_name, access_java, tags, expected, access_args=(), frames=2):
     work = args.work.resolve()
     fixture = work / "tests/swfs" / label
     fixture.mkdir(parents=True)
@@ -29,7 +29,8 @@ def run_probe(args, label, class_name, access_java, tags, expected):
     source = class_name + ".as"
     shutil.copyfile(helpers / source, work / source)
     commands = [
-        [JAVA, "-cp", str(ROOT / "toolchain/ffdec/lib/*"), helpers / access_java, candidate, work / "probe.abc"],
+        [JAVA, "-cp", str(ROOT / "toolchain/ffdec/lib/*"), helpers / access_java, candidate,
+         work / "probe.abc", *access_args],
         [JAVA, "-classpath", ASC, "macromedia.asc.embedding.ScriptCompiler", "-optimize", "-builtin",
          "-apiversioning", "-outdir", work, "-out", "playerglobal", globals_dir / "Toplevel.as", globals_dir / "globals.as"],
         [JAVA, "-jar", ASC, "-AS3", "-import", work / "playerglobal.abc", "-swf", f"{class_name},100,100,30",
@@ -48,7 +49,7 @@ def run_probe(args, label, class_name, access_java, tags, expected):
     first = next(start for kind, start, _, _ in iter_tags(body) if kind in (72, 82))
     body = body[:first] + tags + body[first:]
     (fixture / "test.swf").write_bytes(b"FWS\x12" + struct.pack("<I", len(body) + 8) + body)
-    (fixture / "test.toml").write_text("num_frames = 2\n", encoding="utf-8")
+    (fixture / "test.toml").write_text(f"num_frames = {frames}\n", encoding="utf-8")
     (fixture / "output.txt").write_text(expected, encoding="utf-8")
     result = subprocess.run([args.runner.resolve(strict=True), label, "--exact"],
                             cwd=work, env={**os.environ, "RUFFLE_TEST_OPTS":"--compile-mode use-precompiled"},

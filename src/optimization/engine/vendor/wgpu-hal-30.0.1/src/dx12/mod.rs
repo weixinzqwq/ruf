@@ -1736,6 +1736,7 @@ impl crate::Surface for Surface {
                 // cleaning up, without error.
                 let _ = device.wait_for_present_queue_idle();
 
+                let _phase = crate::aola_close::Phase::begin("dx12-swapchain-release");
                 let _raw = sc.release_resources();
             }
         }
@@ -1880,6 +1881,7 @@ impl crate::Queue for Queue {
                 .SetEventOnCompletion(value, self.idle_event.0)
         }
         .into_device_result("SetEventOnCompletion")?;
+        let _phase = crate::aola_close::Phase::begin("dx12-render-fence-wait");
         unsafe { Threading::WaitForSingleObject(self.idle_event.0, Threading::INFINITE) };
         Ok(())
     }

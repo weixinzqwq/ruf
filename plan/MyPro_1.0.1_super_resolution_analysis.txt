@@ -1,0 +1,1190 @@
+MyPro v1.0.1 超分辨率实现分析
+============================
+
+分析对象与范围
+--------------
+上传样本：MyPro v1.0.1.exe，38,113,280 bytes。
+SHA256：c15066170707be57ff4e2b124435817f401d46ec446f773a4ae5a51fdc208a68。
+对照样本：MyPro v1.0.0.exe。
+本报告来自静态读取 PE、内嵌 HTML/WGSL、SWF 和原生指令；未执行样本或游戏，未进行 FPS、显存、画质实测。
+0x140... / 0x141... / 0x142... 是主 PE 首选基址0x140000000下的VA；raw是文件偏移。
+
+一、结论
+--------
+MyPro 的“超分”相关界面控制的是三个不同环节：
+
+1. 亚比模型图像超分：H5PetModel，设置编号19。门控资源替换器，取得H5/Spine素材，
+   适配成原游戏可以继续加载的兼容SWF；修改后的Ruffle内核识别其中自定义Spine数据。
+   此链路的画面改善来源是素材和模型呈现路径的替换。
+2. AMD FSR 超分锐化：AmdFsr，设置编号20。将Ruffle生成的整幅游戏纹理交给GPU上的
+   FSR1风格EASU放大和RCAS锐化，输出到窗口游戏区域。已发现完整代码与实际draw调用。
+3. 顶栏分辨率：原生egui菜单控制内部渲染像素预算，实际重设viewport与GPU纹理。
+   它决定FSR输入尺寸；不是四档FSR质量模式或四个AI模型。
+
+两种开关可以共同工作：H5模型先成为游戏画面的一部分，游戏画面之后才可能经过FSR。
+这些已确认路径不要求把低清旧贴图输入神经网络，也没有时域插帧的输入/输出结构。
+
+二、前端实际发送的内容
+----------------------
+内嵌HTML中：
+  h5-pet-model -> 亚比模型图像超分 -> map[id]=19
+  amd-fsr -> AMD FSR 超分锐化 -> map[id]=20
+
+勾选时实际执行：
+  ipc.emit("modifySettings", [19, true, ""])
+  ipc.emit("modifySettings", [20, true, ""])
+取消勾选则将true换成false。
+这是本机WebView到Rust宿主的设置IPC；H5素材请求发生在后续相应资源加载过程。
+
+原生dispatcher0x1401ed1a3进入0x1401f2c60，jump table0x141d5dfc8：
+  index19 ->0x1401f2ca1，保存config+0x17a，设置全局0x1423cdda0。
+  index20 ->0x1401f2dcc，保存config+0x17b，发送GUI action+0x1e。
+FSR动作消费0x14015bd8d写全局0x142325210，present0x140116e60读取。
+因此FSR开关改变的是实际呈现路径，原生侧存在真实消费者。
+
+三、亚比模型清晰化：资源与模型适配
+--------------------------------
+本样本含navigator/h5_pet.rs、navigator/h5_pet_fight.rs和core/spine.rs相关实现。
+已闭合的模型路径会加载Spine JSON、atlas和图集页图像；将petId、JSON、atlas和每页
+名称/图像字节组成自定义bundle，包入兼容SWF的BinaryData。
+
+普通模型bundle的magic为AOLA_SPINE_H5_V1；战斗路径另有AOLA_SPINE_F1。
+普通bundle构建函数0x1407d44c0；自定义bundle不仅被写出，SWF加载器0x14096b060也会
+识别这些magic并进入core Spine解析函数。具体匹配URL、素材种类和fallback见附录A。
+
+兼容SWF构造里出现1×1 bitmap占位、BinaryData、DoABC与SymbolClass；这些证据支持
+“保留SWF接口/类形状，承载新的模型数据”的适配方案，不能把这一结构描述成每一帧
+预先生成一张放大后的完整亚比位图。
+
+资源包装器会先尝试H5替换；替换成功返回HTTP200的内存响应，失败时继续原URL请求。
+因此它只替换能匹配且成功准备出替代内容的资源，不能宣称任意亚比、任意旧资源都能变成高清。
+
+H5开关实时更改后续资源路由。直接动作消费者0x14015befe..0x14015bf80更新flag、保存
+配置并请求重绘，未在此直接分支发现重建所有已加载模型。因此已有实例立刻切换与否，
+还取决于游戏是否重新加载资源，不应仅凭勾选状态作保证。
+
+Graphics.aoqiDrawPetMesh等native扩展确实存在，但本次没有完整闭合“所有H5 bundle
+实例都必经某一个AS3 native API”的全路径，附录会明确已确认与未确认的边界。
+
+四、整幅游戏画面FSR：实际的两个GPU阶段
+------------------------------------
+完整WGSL共11024字节，raw0x147ab00 / VA0x14147b900。
+源码头自述移植AMD ffx_fsr1.h，v1.20210629；算法本体也与EASU/RCAS结构一致。
+SHA256：d0b510f5a8b38d8a1c32c8f9eb5fb7225784be07d24a1f3268c1953a4fe86dc3。
+
+渲染器在0x140113c00构造阶段创建shader module与两个render pipeline。
+EASU的fragment入口是fs_easu。RCAS按窗口framebuffer格式选择
+fs_rcas_linear_framebuffer或fs_rcas_srgb_framebuffer。
+执行的是wgpu fragment render passes，每个阶段以6个顶点覆盖相应目标区域。
+
+EASU输入是Ruffle当前游戏画面纹理。它对每个输出像素映射输入坐标，取得12点邻域，
+估计边缘方向和强度，旋转/拉伸采样核，以Lanczos2近似加权，并用附近4点的min/max
+约束结果以降低振铃。这一步生成与窗口游戏区域同尺寸的Rgba8Unorm中间纹理。
+
+RCAS读取该中间纹理，对中心和上下左右共5点进行对比度自适应锐化；限制锐化权重，
+归一化并将最终RGB约束到0..1。原生填入的参数为2^-0.2，f32值0.8705505729。
+它是固定RCAS锐化衰减因子，不能把0.87055直译为“画质提升87%”。
+
+80字节uniform包含con0/con1/con2/con3/rcas五个vec4；详细公式见附录B。
+数学为f32；倒数/反平方根有除零保护。sRGB目标选择专门的颜色转换分支。
+这条链只需要当前纹理、采样器和尺寸/锐化参数，不需要运动矢量、深度或历史帧重建。
+缓存同一画面的放大结果，不会把该算法变成时域超分。
+
+EASU实际draw为0x14011787f，RCAS实际draw为0x140117bbd。
+宿主GUI绘制0x140117beb在其后；WebView面板本身不在这张Ruffle游戏纹理中。
+
+五、FSR什么时候运行
+--------------------
+概念化恢复逻辑（说明用伪代码，不是恢复的原始Rust源码）：
+
+  use_fsr = amd_fsr_enabled
+            && input_width > 0 && input_height > 0
+            && output_width > 0 && output_height > 0
+            && (output_width > input_width || output_height > input_height)
+
+  if use_fsr:
+      若尺寸/源纹理改变，重建中间纹理与绑定并更新参数
+      若游戏画面内容发生新的渲染提交，运行EASU更新中间纹理
+      运行RCAS，把中间纹理输出到窗口
+  else:
+      普通纹理采样呈现
+
+实际判定0x140116ec1..0x140116ec9是“任一输出维度更大”。因此1:1和纯缩小显示即便
+勾着开关也不跑FSR；这里没有1:1时单独开启RCAS的分支。
+默认开关开启，保存配置或--no-fsr可以改变它；打开开关本身不会自动降低内部渲染预算。
+
+FSR缓存键含输入宽高、输出宽高、源纹理身份和内容提交代数。
+尺寸/源纹理变化会更新资源，只有内容代数变化时复用纹理重跑EASU，完全相同则复用
+上一份EASU结果。有效FSR分支中的RCAS仍会随本次present执行。
+主渲染提交0x140033364→0x14010bcf0→0x14010bd06会递增同一个内容代数。
+
+六、分辨率菜单的真实含义与例子
+------------------------------
+菜单的像素预算为：
+  960×560    =   537600 pixels
+  1920×1120  =  2150400 pixels
+  2880×1680  =  4838400 pixels
+  3840×2240  =  8601600 pixels
+默认/无效值回退为1920×1120，保存配置或CLI --resolution可覆盖。
+
+函数0x14015fc60使用当前窗口游戏显示区W/H（需要预留顶栏时减去32×DPI的高度）：
+  P = min(菜单宽×菜单高, max_render_pixels)
+  s = sqrt(P / (W×H))
+  如果s >= 1，则s = floor(s)
+  renderW = max(1, trunc(W×s))
+  renderH = max(1, trunc(H×s))
+  viewportScale = windowDpiScale×s
+GPU设备最大纹理尺寸还会再约束最终宽高。
+max_render_pixels的默认值是u64::MAX，通常不另压低上述预算。
+
+纯算式示例：假设实际游戏显示区恰好1920×1120，未另限预算，GPU尺寸上限足够：
+  菜单960×560：内部960×560，FSR开关开启则放大到1920×1120。
+  菜单1920×1120：内部1920×1120，1:1呈现，FSR绕过。
+  菜单2880×1680：sqrt得1.5，被floor为1，内部仍1920×1120，FSR绕过。
+  菜单3840×2240：内部3840×2240，缩小到1920×1120，FSR绕过。
+这些是公式推导，不是运行测量。换窗口大小、DPI或顶栏状态会改变具体结果。
+
+因此“调高分辨率画面更清楚”和“低分辨率画面经过FSR放大”是两个不同来源。
+菜单实际更新viewport和WGPU纹理；它不是只把窗口外框放大。
+
+七、性能、画质与既往卡顿问题
+--------------------------
+在相同内部渲染尺寸和输出尺寸下，FSR相对普通采样增加后处理工作。
+其潜在性能价值来自：以更低内部像素量渲染，再以EASU/RCAS提升放大后的观感。
+只有节省的原始GPU工作超过后处理开销，且瓶颈在相关GPU工作时，才可能提高帧率。
+AS3逻辑、GC、同步资源加载、模型解析、服务器等待本身不会被FSR加速。
+
+一张Rgba8Unorm中间纹理的理论像素存储为outputW×outputH×4 bytes：
+  输出1920×1120：约8.20 MiB；
+  输出3840×2240：约32.81 MiB。
+仅计这张纹理的像素数据，不含行对齐、驱动分配、其他渲染目标或帧在途引用。
+缓存避免稳定尺寸下每帧重新分配，并可避免没有新游戏提交时重复EASU。
+
+H5模型路径需要素材获取、JSON/atlas/图像解析、打包和模型准备；真实成本取决于模型
+和缓存命中情况。它改善素材来源，不等于所有亚比切换或长期卡顿自动消失。
+本次没有时序采样，不能把先前2–3秒卡顿或半小时后的掉帧唯一归因于超分。
+
+八、版本关系
+------------
+同一份11024字节WGSL在1.0.0中已存在（raw0x1d3b309），与1.0.1逐字节相同。
+因此不能把这套着色器算法本体计为1.0.1才新增的优化。
+这次闭合的是1.0.1宿主接线与缓存行为；相同shader不等于所有宿主缓存策略也完全相同。
+
+九、如果用于自己的Ruffle宿主
+---------------------------
+FSR部分的复现边界相对清楚：内部游戏纹理与窗口输出分开；构造EASU/RCAS管线；
+维护输出尺寸中间纹理；按输入输出尺寸更新参数；在游戏呈现阶段执行两pass；
+保证颜色空间正确，并把宿主UI放在合适的后续层。无需从Winsock层处理这件事。
+
+H5模型部分涉及游戏资源路由、Spine素材、兼容SWF构造、自定义bundle与修改后的
+Ruffle内核识别。仅复制WebView的一个checkbox或FSR着色器不能复制这套资源适配功能。
+
+官方参考（只解释算法原理，不替代MyPro本地证据）
+--------------------------------------------
+AMD FSR1介绍：https://gpuopen.com/fidelityfx-superresolution/
+AMD参考头文件：https://github.com/GPUOpen-Effects/FidelityFX-FSR/blob/master/ffx-fsr/ffx_fsr1.h
+AMD集成文档：https://raw.githubusercontent.com/GPUOpen-Effects/FidelityFX-FSR/master/docs/FidelityFX-FSR-Overview-Integration.pdf
+
+后附完整原生证据、H5资源适配细节、分辨率恢复结果和277行内嵌WGSL原文。
+
+
+========================================================================
+附录 A：亚比 H5 资源替换原生证据
+========================================================================
+
+MyPro 1.0.1 — “亚比模型图像超分”静态实现核对
+===================================================
+对象：upload/MyPro v1.0.1.exe
+SHA256：c15066170707be57ff4e2b124435817f401d46ec446f773a4ae5a51fdc208a68
+范围：只读 PE / 内嵌 HTML / 既有 SWF 分析，未执行程序、HTML 或 SWF，未请求任何游戏资源。
+所有代码地址均为新 EXE VA，ImageBase=0x140000000。
+本文件是复核记录，不是源代码恢复；伪代码保留已证实语义，未完全恢复字段的地方明确说明。
+
+一、核心结论
+------------
+“亚比模型图像超分”开关有一条完整的实际实现链：
+HTML checkbox → modifySettings(19,bool,"") → 原生 settings.H5PetModel / 原子开关 → navigator 在请求原 Flash 亚比资源时尝试 H5 替代 → 从 aola.100bt.com 的 /h5/ 获取 Spine JSON、atlas、图集页或 PNG → 合成保留旧 AS3 类名/资源结构的 SWF → Ruffle core 识别该 SWF 内的 AOLA_SPINE 自定义 bundle。
+
+因此，这项功能的已证实主要机制是“替换资源来源，并为旧 Flash 客户端做原生兼容适配”。它不只是把现成低分辨率图像放大；在本链没有看到一个把低清像素输入神经网络、生成高清像素的推理步骤。不要把该开关写成 ESRGAN / AI 超分模型。它与另一个 AMD FSR 开关(index20)是不同功能。
+
+本实现也不能简单写成“把每一帧高清图片全部预先烘焙进 SWF”：通用合成器确实放入了 1×1 位图占位，同时把 Spine 数据打包进 BinaryData，内核有专门的 bundle 识别/解析。最后如何逐帧渲染、是否必经 Graphics.aoqiDrawPetMesh，本次未完整闭合，不能凭有这个 builtin 名字就把它写成唯一渲染入口。
+
+二、前端到原生开关（已闭合）
+----------------------------
+前端源：analysis_mypro101/host/panel_1.0.1_14ae5a1.html
+SHA256：f93d5c326fc858ba576091e5251b93237e14db33d31060c5ef7cb2fce98fed32
+
+HTML 2598：标签“亚比模型图像超分”，checkbox id=h5-pet-model。
+JS 3876：初始化读取 settings["H5PetModel"]。
+JS 4059–4061：settingsSynced 回调读取 data.h5PetModel 回填开关。
+JS 5333：map['h5-pet-model']=19。
+JS 5380 附近：实际发送 ipc.emit('modifySettings', [map[id], checked, ''])。
+因此实际消息为：ipc.emit('modifySettings', [19, true/false, ''])。
+
+原生链：
+- IPC dispatcher 0x1401e9f30 里，0x1401eb4ee..1eb537 取参数编号与bool；0x1401ed1a3 call0x1401f2c60。
+- setter 0x1401f2c60 的 jump table 位于0x141d5dfc8，index19→0x1401f2ca1（index20另一个分支，不混用）。
+- 0x1401f3388..1f3399 在共享设置结构写 [rsi+0x17a]=r8b，调用设置持久化函数0x1401cd420。
+- 0x1401f2cff..1f2d02 把bool传给0x1405a9830。
+- 0x1405a9830 的完整有效指令只有：mov byte ptr [0x1423cdda0],cl ; ret。
+  注意：此短叶函数没有独立 .pdata 边界；不能从不相干的0x1405a9810开始错位解码。
+- petmovie parser0x1405aa460 在0x1405aa488读取0x1423cdda0，false则0x1405aa4b3返回“不匹配”。
+- battle bitmap parser0x1405b9a60 在0x1405b9a88读取同一全局，false则0x1405b9ab3返回“不匹配”。
+- portrait分支在0x140087d1f call0x1405aaed0，后者直接返回同一开关；false跳过0x1405ad970路径解析。
+
+主代理额外复核 GUI action 消费分支：0x14015befe写app+0xe37；0x14015bf07调用同一leaf setter0x1405a9830；0x14015bf45保存shared+0x17a，0x14015bf53持久化；0x14015bf80仅request_redraw0x140168a80。该分支未见枚举已有模型或重载SWF。
+
+效果的时间边界：该 bool 会立即改变后续资源匹配/请求行为。此 setter 未见遍历已加载Movie/BitmapData、强制销毁模型、重新下载所有已显示亚比的动作；不能承诺已显示模型当场热替换。已有对象何时重载取决于游戏自己的资源加载流程。也未见该 setter 清空 H5 availability 表，不能承诺关开一次就清除失败缓存。
+
+三、实际匹配的旧资源范围
+----------------------
+匹配器先取得URL路径并做 ASCII 小写化，再定位下面的 Flash 资源路径片段，解析数字和后缀。
+以下是可读的标准形状，不把它当成完全恢复的正则表达式；代码还处理“~”版本尾缀。
+
+(1) 背包/展示的 petmovie
+旧路径形状：/play/peticon/movie/type{type}/petmovie{id}/petmovie{id}_{part}[~版本].swf
+parser：0x1405aa460
+证据：
+  0x1405aa69a 引用 /play/peticon/movie/type，长度24；
+  0x1405aa719 引用 /petmovie，长度9；
+  0x1405aaadf 格式化 petmovie{id}_ 并在0x1405aab12比较；
+  0x1405aab21检查结尾 .swf；0x1405aac1e在去扩展名后按~截取；
+  0x1405aaab4..aaabe：parsed id>>4>=0x113，即 id>=4400；
+  0x1405aac3f..aac43：part>>2==0，即 part=0..3。
+输出为 type/id/part，随后请求H5源。
+
+(2) 战斗 bitmap pet
+旧式形状：/play/fightassets/bitmap/pet{id}_{side}[~版本].swf
+新式分片形状：/play/fightassets/bitmap/pet{id}/pet{id}_{side}_{part}[~版本].swf
+parser：0x1405b9a60
+证据：
+  0x1405b9c9a引用 /play/fightassets/bitmap/pet；
+  0x1405ba193和0x1405ba53f检查.swf；
+  旧式支路0x1405ba345..ba34e：id>>4<=0x112，即 id<4400；
+  新式支路0x1405ba4cd..ba4d6：id>>4>=0x113，即 id>=4400；
+  0x1405ba367..ba36c和0x1405ba673..ba689限制 side=1或2；
+  0x1405ba680..ba684限制 split part<16。
+结构保留id、side、是否分片、part。不能据此声称所有亚比都实际有H5资源。
+
+(3) 亚比头像/半身图
+旧路径形状：/play/peticon/petfighticon/peticon{id}[~版本].swf
+parser：0x1405ad970（受其调用者的H5开关门控）
+证据：0x1405adb8a引用完整前缀；0x1405adc10附近排除多余目录分隔符；0x1405adc74检查.swf；0x1405adcb0附近按~去版本后缀，余下必须为数值ID。该解析器未见petmovie那种4400门槛。
+
+不包含的结论边界：本开关并非“把游戏所有图片都超分”，已闭合的入口是以上三类资源。场景地图、UI文字、普通道具图标是否走别的增强，不在本入口中。
+
+四、H5源及加载顺序（已闭合，不访问远端）
+------------------------------------
+A. petmovie
+  https://aola.100bt.com/h5/peticon/newbreath/petmovie{id}/petmovie{id}.json
+  https://aola.100bt.com/h5/peticon/newbreath/petmovie{id}/petmovie{id}.atlas
+  atlas中每个page文件也在同一个 /petmovie{id}/ 目录取回。
+URL helper0x1405a94a0，模板位于0x141f5e459；main0x1400869d0 在0x140087358 / 0x140087858生成json/atlas名，并在0x140087396 / 0x140087896调用URL helper。
+atlas文本经UTF8检查后在0x140087a20调用core page-name parser0x1407e00c0；0x14008a02d起遍历每页名，0x14008a08d用同一URL helper形成页URL。
+
+B. battle model
+  https://aola.100bt.com/h5/petfightassets/spine/pet{id}/pet{id}.json
+  https://aola.100bt.com/h5/petfightassets/spine/pet{id}/pet{id}.atlas
+  atlas的page文件在同一 /pet{id}/ 目录。
+URL helper0x1405b9860，模板0x141f5f5b0；main中的0x140088b8c / 0x140088d42生成json/atlas名称，0x140088bca / 0x140088d80调用URL helper；page循环有0x14008928c调用同helper。
+
+C. portrait
+依次尝试两条候选URL：
+  1. https://aola.100bt.com/h5/peticon/newlarge/type1/peticon{id}/peticon{id}_0.png
+  2. https://aola.100bt.com/h5/peticon/fight/peticon{id}.png
+0x140088243和0x14008826c构造并连续存成两条URL；0x14008ad46..8adbf循环访问候选；0x14008acfc..8ad0f检查长度>=8并检查标准PNG签名 89 50 4e 47 0d 0a 1a 0a，只有有效PNG才进入后续生成。
+因此有“newlarge优先、fight图兜底”的具体行为，不是随意任选一条。
+
+这些是程序内明确写死的 aola.100bt.com H5资源地址，支持“采用奥拉H5素材路径”的结论。由于未访问服务器，不能验证每个pet id是否存在、实时图片尺寸或与Flash原图相比清晰度提升多少。
+
+五、怎样让旧SWF客户端消费Spine素材
+--------------------------------
+5.1 打包格式，而不是只改URL
+petmovie适配器0x1405ae240在0x1405ae27d调用core0x1407d44c0。
+0x1407d44c0又调用0x1407d3980，后者0x1407d3a16调用JSON/atlas解析器0x1407bfd70；其真实字段引用包括bone/parent/scale/rotation/skins/vertices/triangles等，并有 invalid spine json / invalid atlas utf8 / missing atlas page 错误分支。
+
+0x1407d44c0的0x1407d4832开始把自定义bundle拼成字节数组：
+  magic AOLA_SPINE_H5_V1（源码常量含NUL，实际写17字节）
+  petId u32
+  JSON长度u32 + JSON字节
+  atlas长度u32 + atlas字节
+  page数量u32
+  对每页：名称长度u32 + 名称字节 + 图像长度u32 + 图像字节。
+写入/拷贝证据：0x1407d485f、0x1407d4887、0x1407d48ba、0x1407d48de、0x1407d4914、0x1407d494b，页循环0x1407d4a05..4a9f。
+
+战斗适配器0x1405ba730在0x1405ba782调用core0x1407e2620，内部同样调用0x1407bfd70；另有battle动画/帧指标与side数据，输出的bundle以 AOLA_SPINE_F1\0 标记。战斗bundle详细字段表未完整复原，不能与上面的展示bundle逐字节格式混写。
+
+5.2 保留老客户端期望的类名
+petmovie builder0x1405b0730创建：
+  package: mmo.peticon.movie.type{type}
+  PetMovie{id}_0
+  PetMovie{id}Config_MovieConfig
+  PetMovie{id}Config
+  配置文本形状0,{x},{y}；还传入24.0帧率数值（0x41c00000）。
+该适配器在0x1405b0965调用通用SWF生成器0x1405aaee0。
+
+battle builder0x1405ba730创建：
+  package: mmo.petfight.bitmap
+  Pet{id}Config_{side}_MovieConfig
+  Pet{id}Config_{side}
+  对应pet帧资源名称和动作/帧配置。
+
+通用builder0x1405aaee0原生构建ABC常量池/类继承关系，包括BitmapData、ByteArray、ByteArrayAsset、Sprite、MovieClip、MovieConfig；然后组成SWF标签并调用writer0x1405cb0e0。
+0x1405ad20c..5ad244写入位图占位：宽高均1，固定压缩字节常量为78 9c 63 60 00 00 00 04 00 01。它不是高清图集像素；用标准Python zlib校验这一10字节常量会报校验错误，因此本报告不把它描述成已验证可独立解码的透明ARGB图像。模型有独立bundle加载分支。
+随后0x1405ad30d..5ad36f把配置与bundle数据放进两个BinaryData类标签，再放DoABC、SymbolClass等兼容结构。
+这些占位说明不能把“合成SWF”解释为预先将所有骨骼动画帧渲染成独立高清位图。
+
+5.3 内核真正识别并使用bundle
+SWF加载/标签处理函数0x14096b060：
+- 0x14096d9d7..d9fe比对 AOLA_SPINE_H5_V1 与终止字节；
+- 命中后0x14096e93a调用0x1407d4cd0，该函数→0x1407d4290→0x1407d3980→0x1407bfd70解析；
+- 0x14096da04..da22比较AOLA_SPINE_F1\0；
+- 命中后0x14096da36调用0x1407ddb70→0x1407dcbb0（battle bundle解析）；
+- 错误日志分别为“SPINE failed to parse embedded bundle”及“SPINE failed to parse embedded battle bundle”。
+所以新材料确实有配套的 Ruffle core 原生支持，不依靠原版Flash自动认识Spine。
+
+已知但不越界的补充：本EXE的builtin ABC确实新增Graphics.aoqiDrawPetMesh(BitmapData,Vector<Number>,Vector<int>,Vector<Number>):Boolean（native method967）、DisplayObject.aoqiPetModelInfo等，见analysis_mypro_custom/builtin_custom_native.json；这组builtin在1.0.0/1.0.1的内嵌SWF对比中相同。本轮没有把该函数的注册表→最终draw调用完全连到上述bundle，因此不把“每帧必定调用aoqiDrawPetMesh”写成已证实事实。
+
+5.4 portrait使用真正PNG像素生成兼容SWF
+portrait builder0x1405ae870解码PNG（有decode png错误分支），核对图像尺寸，然后压缩/写SWF，创建：
+  mmo.pet::peticon{id}_Half
+  mmo.pet::peticon{id}_F
+有“unexpected portrait dimensions {w}x{h}”“zlib write”“zlib finish”失败分支。
+它与Spine模型bundle是不同的适配路径：portrait直接来自H5 PNG。原始Flash PNG没有在这条已闭合路径中被送入AI重建算法。
+
+六、缓存、并发、失败回退
+----------------------
+6.1 内存availability缓存/失败缓存：已闭合
+petmovie helper0x1405adee0使用global Mutex/HashMap（0x14232f1b8起），key为pet id，value为bool。
+- 没有记录：返回sentinel -2，表示仍需尝试H5源；
+- 记录false：0x1405ae062..ae065→0x1405ae1ec返回-1，跳过H5替换；
+- 记录true且part>0：生成空SWF，抑制原Flash多分片重复加载；
+- 记录true且part==0：继续主模型/缓存路径。
+
+失败写入有直接证据：main0x1400874b1..874c8如果json请求失败、body为空或首字符不是“{”，走0x1400876c0；0x140087706传pet id、0x14008770c传false给HashMap插入helper0x1400d2b40，随后返回不替换。
+成功H5识别的分片分支在0x140087526..8752f给同helper写true，然后空SWF日志/生成器0x1405a96d0。
+其他成功模型保存路径也使用共享缓存。对所有解析异常是否都写negative cache，未逐个分支枚举；不要写“任何失败都永远缓存”。
+
+battle与portrait也分别有availability map和按pet的同步锁，真实日志/错误路径出现h5 fight availability lock / h5 fighticon availability lock / h5 fight lock / h5 fighticon lock。main明确先查询map/获取按pet共享锁，再做网络资源请求，减少并发重复工作。
+
+未见本setter改变时清理这些表。未完整证明每种表的生存期、容量上限、TTL或是否跨进程保存，不能给出“缓存永不释放/每次关开必重试”等绝对结论。
+
+6.2 URL资源缓存辅助：可证到路径构造
+函数0x1405aacb0对完整URL字节做64位FNV-1a（offset basis0xcbf29ce484222325，prime0x100000001b3），配合资源basename构造h5前缀缓存路径。受0x14232ee20和0x14232ee08/10配置状态控制，资源fetch helper0x140085c10调用该路径辅助。
+本轮没有完整追踪配置目录、磁盘淘汰或磁盘缓存写入策略，不能据此承诺永久本地缓存。可靠主结论是已存在按URL派生的缓存命名及内存availability/模型复用。
+
+6.3 失败回原Flash请求：已闭合到调用者
+H5 replacement async函数0x1400869d0成功返回合成bytes；不适用或失败返回-1；异步等待返回-2。
+实际调用它的是资源包装器0x14008bba0（另有同型0x14008ec50）。
+- 0x14008bc60 call0x1400869d0；
+- 返回成功时0x14008bf0f..8bf31将合成bytes构成HTTP200内存响应；
+- 返回-1时0x14008be4d..8be51→0x14008bf59→0x14008c00e，复制原请求URL/参数，再0x14008c0ad call0x14007c290继续正常请求。
+因此失败不是把整个模型强制置空。正常主资源的失败路径会允许原Flash SWF继续加载；主动返回空SWF的分片路径用于已经选中H5替代时抑制多余旧分片，应与“失败回退”分开描述。
+
+画像候选都无有效PNG时0x14008ad46..8adc6耗尽候选，走0x14008b362的availability处理再返回不替换。程序没有保证所有id都升级成功。
+
+七、可以怎样解释用户看到的变化
+----------------------------
+本开关提高可见清晰度的原因是：同一个亚比的显示资源从旧Flash位图/动画资源换成H5版本的图集、骨骼数据或PNG；同时宿主制作兼容容器，使旧AS3继续按原来的类名加载。具体提高多少取决于该亚比实际存在的H5素材和显示尺寸，静态样本不能测量。
+
+它不等同于全画面FSR，不自动改变地图/文字所有像素，也不是一个保证解决2–3秒切宠卡顿的开关。首次需要获取多份JSON/atlas/图集、解析并合成；后续复用与缓存可减少重复成本，但本轮没有运行时计时，不能给出“加速多少/更省多少显存”的数值。
+
+对版本比较：此报告负责解释1.0.1现有实现，不把所有H5机制认定为1.0.1新增。之前已证明14个内嵌SWF与1.0.0完全相同，builtin自定义接口也已在旧版存在；本链逐函数native二进制差异尚未全量比较。
+
+八、复核文件
+------------
+本目录保存关键原生函数完整反汇编：
+1401f2c60.asm — 设置分发表
+1400869d0.asm — H5资源替换主流程
+14008bba0.asm / 14008ec50.asm — 对外资源响应与原请求回退
+1405aa460.asm / 1405b9a60.asm / 1405ad970.asm — 三类旧URL解析
+1405a94a0.asm / 1405b9860.asm — 两类H5 URL组装
+1405adee0.asm — availability缓存
+1405ae240.asm / 1405b0730.asm / 1405ba730.asm / 1405aaee0.asm — bundle/兼容SWF生成
+1405ae870.asm — portrait PNG生成
+1407d44c0.asm — 展示bundle序列化
+1407d3980.asm / 1407d4290.asm / 1407d4cd0.asm / 1407dcbb0.asm / 1407ddb70.asm — bundle解析链
+1407e2620.asm — battle适配
+14096b060.asm — SWF核心加载时识别bundle
+h5_refs.json — 字符串、格式模板、refs初始清单（只作为定位，不单独作为控制流证据）
+
+特别说明：pe_analysis.py的快速re.finditer xref只覆盖部分lea/mov，且对重叠字节序列会漏call；本轮关键漏项已用所有字节位移扫描+natively aligned反汇编补核。无caller结果不能当作死代码证据。
+
+
+========================================================================
+附录 B：FSR 着色器、GPU 接线与缓存证据
+========================================================================
+
+MyPro v1.0.1：AMD FSR 着色器与原生渲染实现
+==========================================
+
+范围和证据规则
+--------------
+仅静态读取 /workspace/scratch/5072d5a995d8/upload/MyPro v1.0.1.exe。
+没有运行 EXE、着色器、SWF 或前端页面，没有 GPU/FPS 实测。
+下列 VA 是主 PE 首选基址 0x140000000 下的地址；raw 是上传 EXE 文件偏移。
+A 表示已从字节、完整源码、引用和消费路径闭合；B 表示局部结构对应/工程解释。
+这里专查“AMD FSR 超分锐化”。“亚比模型图像超分”H5PetModel 是另一功能，另有报告。
+
+一、可下的核心结论【A】
+------------------------
+它确实在使用包含 EASU 放大和 RCAS 锐化两个阶段的 FSR 1 风格 WGSL 移植。
+这不是仅有 AMD FSR 界面文字，也不是只有 RCAS / 普通锐化。
+原始源码有 EASU 12-tap、方向估计、各向异性 Lanczos2 近似及 deringing，
+有 RCAS 五点邻域、抑制过冲的 lobe limiter 和 resolve；原生函数实际创建并选择这两个 pipeline。
+实现是空间算法：当前画面纹理和尺寸/锐化常量是本路径的输入，未读取前帧图像、运动矢量或深度。
+不能把这一条路径称为 FSR 2/3、时间超分、插帧、神经网络/AI 补画、替换游戏原始贴图。
+这里没有 AMD GPU/驱动专用 DLL 调用要求：是交给现有 wgpu 渲染设备的 WGSL fragment passes。
+能否在某台具体显卡/backend 正常运行仍需运行验证，本报告没有做兼容性实测。
+
+完整 shader 原始位置：
+  raw [0x147ab00,0x147d610)，VA [0x14147b900,0x14147e410)，长度 0x2b10 = 11024 bytes。
+  已按原字节保存 fsr_embedded.wgsl。
+源码注释自述：
+  // AMD FidelityFX Super Resolution 1.0: EASU (edge adaptive spatial upsampling) and RCAS (robust
+  // contrast adaptive sharpening), ported from AMD's reference header ffx_fsr1.h (v1.20210629,
+  // MIT license, Copyright (c) 2021 Advanced Micro Devices, Inc.).
+上述出处/版本文字是样本自身声明；算法判断依据不止注释，而包括下述完整代码和原生消费链。
+
+二、如何证明内嵌源码真正用到【A】
+----------------------------------
+创建函数 0x140113c00..0x140116602，来自 app/gui 构造流程：
+  0x140162cec -> 0x140113c00。
+  0x1401156fe 装载源码地址 0x14147b900。
+  0x14011570d 装载长度 0x2b10。
+  0x140115727 -> 0x140efaf70 创建 shader module。
+  0x1401159d9 装载入口字符串 VA0x14147e410，长度7，即 fs_easu。
+  0x140115a58 -> 0x140efb050 创建 EASU render pipeline。
+  0x140115a60/67 分别装载 fs_rcas_srgb_framebuffer / fs_rcas_linear_framebuffer，
+    0x140115a76 根据目标 framebuffer 的 sRGB 标志选取。
+  0x140115c58 -> 0x140efb050 创建 RCAS pipeline。
+  0x140115c74 指定 uniform buffer 大小 0x50 = 80 bytes。
+
+最终 Arc 内字段的关系可由 0x140115d46..0x140115e9a 的装配/复制核对：
+  +0x18：普通 blit pipeline；+0x20：共享 sampler；
+  +0x48：FSR bind group layout；+0x50：EASU pipeline；+0x58：RCAS pipeline；
+  +0x60：FSR uniform buffer；+0x80：EASU 全屏几何 buffer。
+普通画面/RCAS 共用另一个全屏几何 buffer，+0x28 起。
+
+实际显示函数 0x140116610..0x1401184cd，由主宿主帧流程 0x14017023a 调用。
+它不是只在构造时编译后永不使用；后文的 draw 直接使用 +0x50 / +0x58。
+
+三、输入、两次绘制和输出【A】
+------------------------------
+路径：Ruffle 游戏画面纹理 -> EASU 输出尺寸中间纹理 -> RCAS -> 窗口目标。
+宿主 GUI 图形绘制在这之后（0x140117beb -> 0x1401fe9c0）。
+因此这里处理的是 Ruffle 游戏画面，不能描述为对整台桌面或 WebView 截图做超分。
+
+EASU 输入：
+  0x140117324 从已识别的 Ruffle backend +0x3c0 取得游戏画面 texture 的 view。
+  0x140117333..0x1401173e2 构造三项 bind group：
+    binding0 = 游戏纹理 view；binding1 = sampler；binding2 = 80-byte Params buffer。
+  对应 shader 明确声明：
+    @group(0) @binding(0) var r_tex: texture_2d<f32>;
+    @group(0) @binding(1) var r_sampler: sampler;
+    @group(0) @binding(2) var<uniform> params: Params;
+
+中间目标：
+  0x1401170e6/0x1401170ed 写入输出宽、高；0x140117104 写 texture format enum 0x15。
+  0x14011714d -> 0x140efaeb0 创建输出尺寸的中间纹理。
+  enum 0x15 = Rgba8Unorm 已通过本样本的 TextureFormat formatter 独立确认：
+    formatter0x1401d36c0，jump table0x141b7e774，index0x15 ->0x1401d3be4，
+    输出 VA0x141b7d605 的10字节字符串 Rgba8Unorm。
+  0x1401171b6 创建其 texture view；0x1401173ef..0x14011749b 用该 view 构造 RCAS bind group。
+  这是一张8-bit/channel的中间RGBA纹理，不是时域多帧历史纹理。
+
+EASU 绘制：
+  0x140117759 label='fsr easu'。
+  0x1401177d8 开始以中间 texture view 为目标的 render pass。
+  0x1401177dd/0x1401177e4 选择 +0x50 EASU pipeline。
+  0x1401177e9..0x140117804 绑定游戏纹理对应的 bind group。
+  0x14011787f draw，vertex_count=6、instance_count=1。
+
+RCAS 绘制：
+  最终窗口 render pass 从 0x140117a8e 开始。
+  0x140117aa3 检查是否得到 FSR 中间纹理对应的 bind group。
+  非空时 0x140117aba/0x140117ac9 选择 +0x58 RCAS pipeline，
+    0x140117aea 绑定中间纹理，0x140117bbd 仍 draw6/instance1。
+  没有FSR结果时走 0x140117b00 分支，0x140117b14/0x140117b23 选择 +0x18 普通 blit。
+  普通 blit 源码 raw0x147d9d0、VA0x14147e7d0、长度0x57b，已保存 plain_blit_embedded.wgsl；
+    其 fragment 调用 textureSample(r_tex_color,r_tex_sampler,in.tex_coord)。
+
+四、EASU 具体算法与片段【A】
+-----------------------------
+fs_easu 定义 VA0x14147c7c4（raw0x147b9c4）。
+目标像素先映射回低分辨率输入坐标：
+    let ip = floor(in.position.xy);
+    var pp = ip * params.con0.xy + params.con0.zw;
+    let fp = floor(pp);
+    pp = pp - fp;
+之后 textureGather 取得12-tap所需的RGB样本，用近似亮度 0.5R + G + 0.5B 估计局部边缘。
+在四个中心邻域累加方向和边缘长度，再调整采样核方向与各向异性长度。
+
+关键权重函数 easu_tap，定义 VA0x14147c044（raw0x147b244）：
+    v.x = off.x * dir.x + off.y * dir.y;
+    v.y = off.x * (-dir.y) + off.y * dir.x;
+    v = v * len;
+    var d2 = v.x * v.x + v.y * v.y;
+    d2 = min(d2, clp);
+    var wB = (2.0 / 5.0) * d2 - 1.0;
+    var wA = lob * d2 - 1.0;
+    wB = wB * wB;
+    wA = wA * wA;
+    wB = (25.0 / 16.0) * wB - (25.0 / 16.0 - 1.0);
+    let w = wB * wA;
+    *aC = *aC + c * w;
+    *aW = *aW + w;
+
+源码实际调用12次 easu_tap，坐标为：
+  (0,-1),(1,-1),(-1,1),(0,1),(0,0),(-1,0),(1,1),(2,1),(2,0),(1,0),(1,2),(0,2)，
+  都先减去当前输入像素的亚像素偏移pp。
+最终归一化并把结果限制到四个最近像素的 min/max，降低振铃/过冲：
+  VA0x14147db5a（raw0x147cd5a）：
+    let color = min(max4, max(min4, aC * (1.0 / aW)));
+    return vec4<f32>(color, 1.0);
+这与简单双线性放大、仅锐化已有像素有不同的采样和权重结构。
+
+五、RCAS、固定强度与颜色处理【A】
+--------------------------------
+rcas 定义 VA0x14147dcd2（raw0x147ced2）。
+每个输出像素取中心e与上b/左d/右f/下h这5点；rcas_load使用textureLoad并clamp坐标到边界。
+先算上下左右的最小/最大值，再依据center+ring的范围求防止过冲的锐化权重。
+  VA0x14147e071（raw0x147d271）：
+    let limit = 0.25 - (1.0 / 16.0);
+    let lobe = max(-limit, min(max(max(lobeRGB.r, lobeRGB.g), lobeRGB.b), 0.0)) * params.rcas.x;
+    let rcpL = 1.0 / (4.0 * lobe + 1.0);
+    let color = (lobe * b + lobe * d + lobe * h + lobe * f + e) * rcpL;
+    return vec4<f32>(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+
+原生不是把sharpness留空或完全靠默认值：
+  0x140117207 movss 从 VA0x141443d70 读入 f32 0.8705505728721619，原字节67 dc 5e 3f。
+  0x14011720f/0x140117293/0x140117296 把它与输出宽高拼成 Params.rcas。
+  这个数等于 f32 精度的 2^-0.2，故可解释为0.2 stops的RCAS衰减强度。
+  0x1401172bc 把完整80字节uniform写入GPU buffer。
+  在这条构建路径中它是固定常量，不是界面传入的任意滑动条数值。
+
+80字节 Params（5个vec4<f32>），设输入W/H为iw/ih，输出为ow/oh：
+  con0 = [iw/ow, ih/oh, 0.5*iw/ow-0.5, 0.5*ih/oh-0.5]
+  con1 = [1/iw, 1/ih, 1/iw, -1/ih]
+  con2 = [-1/iw, 2/ih, 1/iw, 2/ih]
+  con3 = [0, 4/ih, 0, 0]
+  rcas = [0.8705505729, ow, oh, 0]
+对应计算区间 0x1401171bb..0x140117296。常量读取和具体uniform偏移见fsr_present.asm。
+
+颜色处理：
+  源码按游戏自身的gamma空间进行EASU/RCAS。
+  linear framebuffer入口直接返回RCAS结果；sRGB framebuffer入口先srgb_to_linear后写入，
+    避免sRGB输出转换导致错误的亮度。入口实际由0x140115a76条件选择。
+  变换公式含12.92、0.055、1.055、2.4与阈值0.04045，见VA0x14147e207。
+  该移植的所有向量和标量都是f32；精确1/x及inverseSqrt替代注释所说的参考近似倒数，
+    并以1e-20/1e-6作除零保护；未包含可选RCAS降噪代码。
+  两阶段输出alpha均固定1.0，适用于这里的最终游戏画面合成，不是保留透明alpha的通用离线图像增强器。
+
+六、何时启用，关闭后怎样处理【A】
+--------------------------------
+最终启用字节在 VA0x142325210（raw0x2323e10），PE初值1。
+  0x140116e60 读取；0x140116eaa/0x140116eac false时直接绕过FSR。
+  还检查源宽、源高、输出宽、输出高均非0。
+  输入宽高来自已识别的Ruffle backend +0x3d8。
+  输出宽高由窗口游戏区域计算（宿主工具栏占用会影响高度；完整分辨率政策另见同组报告）。
+  0x140116ec1..0x140116ec9：outW>inW 或 outH>inH 时进入FSR。
+  若输出没有任一维更大，即便开关为真也走普通blit；没有强制在1:1时只跑RCAS的分支。
+
+写开关的两条路径（root完整RIP扫描复核）：
+  0x14015bd8d，所属0x14015bb70：GUI actions+0x1e的Option<bool>消费，none=2，
+    更新全局、app+0xe35及持久化config+0x17b，调用save 0x1401cd420。
+  0x140164a60，所属构造0x140162b70：从config bool并结合CLI no_fsr确定初值。
+  前端checkbox id=amd-fsr，对应modifySettings设置编号20；完整IPC接线另由root/配置分工确认。
+  CLI帮助raw0x147fbec附近写明：NO_FSR/--no-fsr，默认打开、仅render低于window时有作用。
+关闭它改变显示路径，不会仅凭这个开关恢复更高内部渲染分辨率；内部尺寸政策独立。
+
+七、缓存不是每次创建纹理；EASU可跳过，RCAS仍运行【A】
+----------------------------------------------------
+FSR缓存带锁，字段在上述Arc对象中，初次未建标志位于+0xfc。
+判断逻辑：
+  0x140116f2d..0x140116f54 比较缓存的4个尺寸：输入宽高、输出宽高（+0x120..+0x12c）。
+  0x140116f5a 比较源纹理身份（缓存+0xa8 vs backend+0x3a0）。
+  0x140116f6c 比较画面内容提交代数（缓存+0xb0）。
+  尺寸或源纹理身份变化 -> 0x1401170bc，重新分配中间纹理/view/bindgroups并上传uniform；
+    更新缓存时在0x140117503..0x140117598释放旧资源引用。
+  只有内容代数变化 -> 0x1401176c4，重用纹理并重新运行EASU。
+  三者均相同 -> 0x140116f79..0x140116f91 克隆现有RCAS bindgroup引用，跳过EASU pass。
+这不是简单猜测“帧数缓存”：内容代数的更新已核对：
+  主游戏帧提交0x140033364把backend+0x3a0传入0x14010bcf0；
+  0x14010bd02取此结构+0x18，即backend+0x3b8中的Arc；
+  0x14010bd06对Arc data+0x10执行lock inc。
+  FSR present恰在0x140116ed2/0x140116ed9读取相同Arc/data位置。
+所以这里追踪的是游戏渲染提交更新；只刷新宿主窗口、游戏画面未重新提交时可以复用放大结果。
+
+但缓存命中不等于整个FSR完全不绘制：
+  命中路径 ->0x1401178ec ->0x140117912，随后仍进入最终window pass。
+  0x140117aa3发现FSR bindgroup非空，选择RCAS并在0x140117bbd绘制。
+  因此有效FSR分支每次present仍运行RCAS，能被跳过的是EASU计算和无需变化的资源构建。
+
+八、能解释的收益和不能证明的效果
+--------------------------------
+工程解释：内部画面用较少像素绘制，可减轻像素填充/部分滤镜与临时纹理工作；
+随后使用这两个空间pass放大、恢复局部边缘对比度。这能改善普通缩放的模糊感，
+同时也可能强调原画面中的锯齿/压缩边缘。实际观感取决于缩放比例、原图和文字/线条。
+FSR本身增加中间纹理和两个着色器pass，并不是无成本；缓存减少无新游戏画面时的EASU重复工作。
+它不会从低分辨率输入中恢复确实不存在的真实细节，也不能减少AS3逻辑/GC/网络等待本身。
+静态证据不足以承诺提升多少FPS、画质“等同真4K”、所有GPU都更快或长时间卡顿已被解决。
+
+证据文件
+--------
+fsr_embedded.wgsl：11024字节原始着色器。
+fsr_shader_meta.json / fsr_source_locations.json：边界及关键源码VA/raw位置。
+fsr_constructor.asm / fsr_present.asm：创建、尺寸判断、缓存、两次绘制完整反汇编。
+fsr_refs.txt / fsr_helpers.asm：直接引用及wgpu包装函数。
+fsr_texture_format.txt：0x15=Rgba8Unorm的本样本枚举格式化证据。
+plain_blit_embedded.wgsl：关闭/无需放大时的原始普通blit着色器。
+../render/render_submit_flush_new.asm / ../render/frame_limit_value_new.asm：游戏提交与内容代数更新。
+
+
+========================================================================
+附录 C：内部渲染分辨率恢复与验证
+========================================================================
+
+MyPro v1.0.1：分辨率菜单、像素预算、内部纹理与 FSR 尺寸链
+===========================================================
+
+范围
+----
+样本：upload/MyPro v1.0.1.exe。仅静态读取 PE、反汇编和已提取 HTML，未运行程序或游戏。
+VA 基址 0x140000000；本文地址为 VA。算法由二进制指令闭合；没有实际性能/画质测量。
+FSR shader 细节由 pe_structure 另文负责；此文只解释输入尺寸来源和 UI 生效路径。
+
+核心结论
+--------
+1. 顶栏的四档分辨率实际控制 Ruffle 内部渲染的像素预算，并会重设 viewport / GPU 纹理。
+   它并非仅把操作系统窗口变大，也不是四种 FSR 算法/AI 模型。
+2. 四档不是无条件精确的内部宽高：先与 --max-render-pixels 取较小像素预算，
+   按当前游戏显示区域的宽高比求缩放系数；当系数 >= 1 时取 floor 整数倍。
+3. FSR 输入来自该内部 WGPU 渲染目标；输出来自窗口内实际游戏显示区，必要时扣掉顶栏。
+   开关为真仍需输出任一维大于输入对应维，才进入 FSR 两 pass；相同尺寸或纯缩小路径会绕过。
+4. 默认配置/无效分辨率的回退字符串是 1920x1120（索引 1）。保存的用户设置和 CLI 可覆盖。
+   --max-render-pixels 的 CLI 默认为 u64::MAX，不额外把这四档压到更小的固定值。
+
+一、选项在哪里定义
+------------------
+CLI 构造函数 0x140122fa0：
+  0x140128149 -> VA 0x141480cce / raw 0x147fece，长度 7：960x560
+  0x14012815e -> VA 0x141480cd5 / raw 0x147fed5，长度 9：1920x1120
+  0x140128173 -> VA 0x141480cde / raw 0x147fede，长度 9：2880x1680
+  0x140128188 -> VA 0x141480ce7 / raw 0x147fee7，长度 9：3840x2240
+  上述四项进入 possible-values 列表；CLI --resolution 只接受这些枚举值。
+
+同一 CLI 0x1401281bf 引用帮助文字（VA 0x141480cf0）：
+  Render resolution: the movie is drawn with about this many pixels, whatever the window size,
+  and scaled to the window. Also chosen in the toolbar
+这是描述约像素量，与后续公式一致，不仅是字符串猜测。
+
+原生 egui 顶栏函数 0x14019c1d0：
+  0x14019c5d4 以 "resolution" 生成控件 ID。
+  0x14019c655 引用 VA 0x141b76360 / raw 0x1b75560 的 8 个 u32：
+    [(960,560),(1920,1120),(2880,1680),(3840,2240)]。
+  使用两个整数加 × 字符格式化当前项。
+  0x14019c763 使用 vtable 0x141b76420，闭包为 0x140199f60，绘制四个可选项。
+  业务尺寸函数使用相同内容的另一份表 VA 0x141b6dca0 / raw 0x1b6cea0。
+
+设置 HTML 并没有定义这四个分辨率菜单；其 HTML L2600 的控件是独立的
+“AMD FSR 超分锐化”，L3311 取得 amdfsr DOM 元素，L3877/L4063-L4065 同步状态。
+四档菜单属于 Rust/egui 原生顶栏。
+
+与此独立还有 --window-scale，帮助字符串 VA 0x1414805ec / raw 0x147f7ec：
+  Window size as a multiple of the game's 960x560 (0.5-2)
+不要把 window-scale 与 resolution 这两个配置混为一个东西。
+
+二、点击分辨率之后实际做什么
+--------------------------
+0x14019c79f 读取用户新选 index，与原值相比；变化时：
+  0x14019c7b2 写 GUI action Option tag=1；
+  0x14019c7b9 写新 index。
+
+宿主 GUI action 处理器 0x14015bb70：
+  0x14015c274 检查该 Option tag；
+  0x14015c27d 取 index；0x14015c281 写 self+0xdf0（当前分辨率档）；
+  0x14015c292..c29c 从四档表读取 width/height。
+  0x14015c3d1..c440 将其格式化为例如 1920x1120，存入持久配置 Resolution 字符串；
+  0x14015c44c 调用配置保存函数 0x1401cd420；
+  0x14015c476 调用重算 viewport 的 0x14015fc60；
+  0x14015c486 进入窗口绘制请求辅助函数 0x140168a80；
+  0x14015c4be 同步顶栏状态中的 index。
+
+这一分支的操作是更新内部渲染尺寸和请求重绘，没有以所选 width/height 发起外窗 resize。
+因此菜单改变在随后绘制中生效，不需要重建整个 player。
+窗口尺寸/缩放事件也会调用相同 viewport 重算函数，例如事件处理器 0x14016ebd0 中
+调用点 0x14016f05c、0x14016f292；全屏路径有 0x14015bcc9。
+
+三、实际内部尺寸公式：预算 + 保持显示区比例 + 整数倍率
+------------------------------------------------------
+已完整恢复函数：0x14015fc60..0x14015ff47，raw 0x15f060。
+
+输入/字段：
+  self+0x778 : 当前窗口宽 Wwindow（u32）
+  self+0x77c : 当前窗口高 Hwindow（u32）
+  self+0xdf0 : 四档分辨率 index（0..3）
+  self+0x2e0 : CLI max_render_pixels（u64）
+  self+0x708 : 窗口对象；0x140113520 返回窗口缩放因子（DPI scale）
+  self+0xdf8 : Ruffle player Mutex/Arc
+
+顶栏处理：
+  如果全局 0x1423c6830 开启，且窗口查询 0x14011b680 返回特定无值状态，
+  在 0x14015fcce 将窗口 scale_factor 乘以 32.0（常量 VA 0x141443c40），
+  对结果转换为 u32，并从窗口高度饱和减去。
+  即正常显示顶栏时游戏区域高度 H = Hwindow - trunc(32 * DPI)，否则 H = Hwindow。
+  W、H 至少按 1 处理，防止零面积。
+  此处应写“在需预留顶栏的分支”，不可声称任何模式都必减 32 物理像素。
+
+核心算式（忽略 u32/设备限值边界的概念化等价式）：
+  (presetW,presetH) = [(960,560),(1920,1120),(2880,1680),(3840,2240)][index]
+  budget = min(presetW*presetH, max_render_pixels)
+  s = sqrt(budget / (W * H))
+  if s >= 1:
+      s = floor(s)
+  renderW = max(1, trunc(W * s))
+  renderH = max(1, trunc(H * s))
+  renderScaleFactor = windowScaleFactor * s
+
+指令证据：
+  0x14015fd1a..fd29：读表并乘积；
+  0x14015fd2d..fd37：与 self+0x2e0 比较，取 min；
+  0x14015fd7d..fd84：budget / area，再 sqrt；
+  0x14015fd88：与 1.0 比较，小于 1 时跳过下一调用；
+  0x14015fd92：调用 0x141388130，为 floor。
+     SSE4 实现 0x141394f50 是 roundsd xmm0,xmm0,9，向负无穷舍入并抑制精度异常；
+     fallback 0x141388150..81ed 位操作同样为 floor。
+  0x14015fd97..fdf1：W*s/H*s 转整数、至少 1。
+  0x14015feb0..feb5：再次取 DPI 并乘 s。
+  0x14015feb9..fec2：构造 {scale_factor:f64,width:u32,height:u32}。
+  0x14015fed0：调用 0x1409e9e30，将以上 viewport 尺寸交给 Ruffle player。
+
+还有事件坐标换算函数复用相同 s：0x14015ff50、0x140160350、0x140161340。
+例如 0x140160117/11b 乘鼠标坐标；0x1401600b6 先减顶栏高度。
+这进一步支持是游戏内部 viewport 分离于窗口像素，输入坐标也必须配套转换。
+
+四、已经闭合到 GPU 内部纹理创建，不只是改一个 UI 数字
+---------------------------------------------------
+0x1409e9e30 是 player viewport 更新入口：
+  0x1409ea292 读 16 字节 viewport；
+  0x1409ea2c7 调用 renderer vtable + 0x28；
+  Wgpu renderer vtable VA 0x141b6df48，+0x28=0x140035880。
+
+0x140035880（backend viewport setter）：
+  0x1400358a4..58ca 读设备限值，宽高限制到 1..device_limit；
+  0x1400358cd self+0x3a0 为内部渲染目标；
+  0x1400358de -> 0x1401201e0，传实际内部宽/高；
+  0x140120210 -> 0x140111dd0，重新构造内部 target；
+  0x140111df9 / 1e01 将 width/height 写入 texture descriptor；
+  0x140111e5b 调 wgpu texture 创建路径 0x140efaeb0。
+  同时 0x140035922 重建相关渲染表面/中间资源；0x140035968 保存 viewport scale_factor。
+
+所以四档切换可真实改变栅格化像素量和 GPU 渲染目标。renderW/H 还会被设备允许的
+最大纹理维度限制，最终应以实际 backend 内部纹理的尺寸为准。
+
+五、FSR 输入和输出尺寸怎样接上这条链
+---------------------------------
+呈现函数 0x140116610：
+  0x140116da9 / 6daf 从 GUI+0x420 / +0x424 读窗口宽高。
+  GUI 在宿主 self+0x358，恰好对应上文 self+0x778 / +0x77c。
+  0x140116e15..6e52 走同一预留顶栏逻辑，输出高必要时减 trunc(32*DPI)。
+  0x140116e57 从 Wgpu backend+0x3d8 读输入 texture 的 width/height。
+     它位于上文内部 target self+0x3a0 内，不是 UI 文字标称宽高。
+  0x140116e60 读取 FSR enable 全局 0x142325210。
+  0x140116e7a..6ea4 排除零输入/输出尺寸；0x140116eaa 开关为 false 直接绕过。
+  0x140116ec1..6ec9：outW > inW OR outH > inH 才进入 FSR。
+  否则 0x140117912 走已有直接呈现路径。
+
+FSR 条件并不是“选了 1920/2880/3840 就自动超分”；是否执行由当帧真实输入/输出尺寸决定。
+最高档在较小窗口中可能是高分辨率渲染后缩小显示，FSR 会绕过。
+降低内部预算、放大窗口才更容易让输入小于输出，激活 FSR 放大。
+
+FSR 开关完整 UI/IPC 另由 root 闭合：
+  HTML AMD FSR -> modifySettings(20,bool) -> 原生 settings dispatcher
+  -> GUI action +0x1e -> 0x14015bd8d 写 0x142325210 -> 当帧/下帧呈现读取。
+  构造时 0x140164a51 检查 CLI no_fsr(+0x344)，非零强制关闭。
+  它控制后处理开关，没有重建整个播放器的要求。
+
+六、默认值和覆盖关系
+--------------------
+--max-render-pixels：
+  CLI 0x14012640b..6830 创建该参数；lazy default 位于 global 0x142325418。
+  默认 closure vtable 0x141b7ec58 -> 0x1401d9c00。
+  0x1401d9c2c 以 0xffffffffffffffff 传给整数格式化，即 18446744073709551615。
+  CLI 解析 0x14011e652..e68d 取得值，0x14011fff7 存到配置 +0x2e0。
+  后续尺寸函数直接读 self+0x2e0，和上文预算 min 闭合。
+  因此默认是 u64::MAX；它是可选人为上限，不是一个隐藏固定“低清输入尺寸”。
+
+Resolution：
+  默认配置构造 0x1401cf5f0 中 0x1401cf6ad..6ba 构造 "1920x1120"，
+  0x1401cf781..790 存配置 String +0x78；独立字符串默认构造也见 0x1401cf4d0。
+  配置规范化函数 0x1401cb340在
+  0x1401cc51a..58e 只认可四种字符串；无效值在 0x1401cc5b0..5e9 改成1920x1120。
+  宿主构造0x14016470b 检查 CLI resolution Option；提供CLI时以CLI字符串替代持久值。
+  0x1401647e3/489b/4956分别映射0/1/2，3840分支映射3；不匹配回退1。
+  所以可称程序默认/回退为1920x1120（索引1），但不代表用户每次启动必然用默认。
+
+七、方便解释用户现象的纯计算例子
+--------------------------------
+以下只是假设：实际游戏显示区（已经扣顶栏、使用物理像素）恰为1920×1120，
+max_render_pixels 不另限，设备纹理上限足够。
+
+  菜单960×560：s=0.5，内部960×560 -> 输出1920×1120，开关为真则进入FSR。
+  菜单1920×1120：s=1，内部1920×1120 -> 同尺寸输出，不进入FSR。
+  菜单2880×1680：sqrt预算比=1.5，但floor到1，内部仍1920×1120，不进入FSR。
+  菜单3840×2240：s=2，内部3840×2240 -> 缩小到1920×1120，不进入FSR。
+
+若窗口游戏区恰为960×560，上述四档则恰好为1/2/3/4倍内部栅格尺寸；
+这只是该窗口尺寸下的特例。窗口比例不同、DPI不同、顶栏状态、预算上限和设备上限
+均会影响最终内部尺寸。以上不是运行采样结果。
+
+八、证据文件
+------------
+resolution_evidence_excerpt.txt：尺寸算式、viewport和实际纹理创建的紧凑指令摘录。
+resolution_0x14015fc60.asm：完整尺寸计算及viewport调用。
+backend_set_viewport.asm / resize_internal_target.asm / internal_target_constructor.asm：GPU目标链。
+toolbar_resolution.asm / toolbar_choices.asm：顶栏当前值与四档菜单。
+resolution_0x14015bb70.asm：点击动作处理、保存和实时应用。
+cli_resolution.asm / cli_values_resolution.asm / max_pixels_default.asm：CLI参数及上限默认。
+default_config_resolution.asm / resolution_enum.asm：默认Resolution和合法值校验。
+player_setup_resolution.asm：CLI resolution优先和no_fsr初始开关。
+present_resolution.asm（与fsr_present.asm相同函数）：真实输入/输出及FSR选择条件。
+
+边界
+----
+不将四档菜单称为“AI超分四档”；不声称每个档位总是固定渲染其标称宽高。
+不以静态代码宣称帧率提升百分比、显存节省量或截图质量。
+具体EASU/RCAS着色器参数和是否按gamma空间工作请引用pe_structure另文。
+
+
+========================================================================
+附录 D：主审控制链与版本逐字节核对
+========================================================================
+
+MyPro v1.0.1 super-resolution — root verification notes
+
+Scope: uploaded PE only, static analysis. No binary/SWF execution; no game resource download.
+
+UI controls in host/panel_1.0.1_14ae5a1.html:
+2597-2600: h5-pet-model = 亚比模型图像超分; amd-fsr = AMD FSR 超分锐化.
+5333-5334: settings map 19 and 20. 5380-5381: ipc.emit("modifySettings", [map[id], checked, ""]).
+3876-3877: H5PetModel boolean and AmdFsr !== false UI initialization.
+4060 onwards: settingsSynced h5PetModel / amdFsr updates.
+
+FSR UI-to-native switch:
+0x1401e9f30 dispatcher compares "modifySettings" with two overlapping 8-byte integer constants at 0x1401ea027/34, branches 0x1401eb4ee.
+0x1401eb4fc parses args[0]; 0x1401eb532 reads args[1] boolean.
+0x1401ed1a3 calls 0x1401f2c60(index, bool, text).
+Jump table VA0x141d5dfc8 index19 -> 0x1401f2ca1, index20 -> 0x1401f2dcc.
+Index20: 0x1401f33da writes shared settings+0x17b; 0x1401f33e8 calls save helper0x1401cd420.
+0x1401f2e88 stores bool at stack0x5e, i.e. GUI action payload0x40 +0x1e; surrounding fields have Option<bool> none=2.
+0x1401f31c1 sends event via0x14011b4c0.
+Action consumer0x14015bb70 reads payload+0x1e at0x14015bc44; if value!=2, writes app+0xe35 at0x14015bd86 and global byte0x142325210 at0x14015bd8d.
+The same consumer saves settings+0x17b. Present function0x140116610 reads that global at0x140116e60.
+Only two .text RIP-relative writes to that global were recovered by scanning all 4-byte displacements and validating complete instructions:
+0x14015bd8d (runtime action consumer) and0x140164a60 (app construction).
+App constructor0x140162b70 at0x140164a51 checks CLI structure+0x344 (NO_FSR); nonzero forces global false.
+
+Shader verification:
+WGSL raw0x147ab00 / VA0x14147b900, length0x2b10=11024 bytes, source extracted to fsr_embedded.wgsl.
+SHA256 d0b510f5a8b38d8a1c32c8f9eb5fb7225784be07d24a1f3268c1953a4fe86dc3.
+Renderer construction0x140113c00 references source at0x1401156fe and exact length at0x14011570d; creates shader at0x140115727.
+0x1401159d9 references fs_easu entry. RCAS has linear_framebuffer / srgb_framebuffer variants.
+Code inspection confirms 12-tap EASU with edge direction, anisotropic Lanczos2 approximation, and min4/max4 deringing; RCAS loads center plus 4 cardinal neighbors, applies per-channel min/max limiters, bounded negative lobe and normalized sharpen resolve.
+All math here uses f32; helpers use exact reciprocal and inverseSqrt plus zero guards. RCAS clamps final RGB; final alpha=1.
+srgb framebuffer variant runs srgb_to_linear after rcas.
+Present0x140116610: enabled global read0x140116e60; reject disabled0x140116eaa; size checks0x140116ec1/6ec6 accept output width>input width OR output height>input height, after zero-dimension rejection.
+Fixed sharpness constant VA0x141443d70 = 0.8705505728721619; loaded0x140117207; approximately2^-0.2. Not a dynamic adaptive-resolution quality setting.
+Actual EASU/RCAS rendering and cache details owned by fsr_findings.txt.
+
+Version comparison:
+Full 11024-byte shader exists byte-for-byte in v1.0.0 at raw0x1d3b309, and v1.0.1 at raw0x147ab00. SHA above identical.
+This establishes identical embedded algorithm source; it does not establish all host-side cache/control behavior identical between versions.
+
+Official primary references used only for interpreting FSR algorithm, not as evidence of MyPro integration:
+https://gpuopen.com/fidelityfx-superresolution/ (FSR1 current-frame spatial EASU then RCAS; no motion vectors/history needed)
+https://github.com/GPUOpen-Effects/FidelityFX-FSR/blob/master/ffx-fsr/ffx_fsr1.h (12-tap EASU, RCAS limiter and sharpness=2^-stops)
+https://raw.githubusercontent.com/GPUOpen-Effects/FidelityFX-FSR/master/docs/FidelityFX-FSR-Overview-Integration.pdf (vendor-neutral/Intel support context, not a MyPro Iris Xe measurement)
+
+
+========================================================================
+附录 E：从上传 EXE 提取的完整 WGSL 原文（文本换行为 LF）
+========================================================================
+
+// AMD FidelityFX Super Resolution 1.0: EASU (edge adaptive spatial upsampling) and RCAS (robust
+// contrast adaptive sharpening), ported from AMD's reference header ffx_fsr1.h (v1.20210629,
+// MIT license, Copyright (c) 2021 Advanced Micro Devices, Inc.).
+//
+// The two passes of the movie are `fs_easu` (render resolution -> window resolution, into a texture
+// of the window's size) and `fs_rcas_*` (sharpening of that texture, into the window). The picture
+// is in the game's own (gamma) colour space, which is what FSR expects. The approximations of the
+// reference for reciprocals and reciprocal square roots are exact here.
+
+struct Params {
+    con0: vec4<f32>,
+    con1: vec4<f32>,
+    con2: vec4<f32>,
+    con3: vec4<f32>,
+    // x: sharpness as a factor (2^-stops), yz: size of the sharpened texture in pixels.
+    rcas: vec4<f32>,
+};
+
+struct VertexOutput {
+    @location(0) tex_coord: vec2<f32>,
+    @builtin(position) position: vec4<f32>,
+};
+
+@group(0) @binding(0) var r_tex: texture_2d<f32>;
+@group(0) @binding(1) var r_sampler: sampler;
+@group(0) @binding(2) var<uniform> params: Params;
+
+@vertex
+fn vs_main(
+    @location(0) a_pos: vec2<f32>,
+    @location(1) a_tex_coord: vec2<f32>,
+) -> VertexOutput {
+    var out: VertexOutput;
+    out.tex_coord = a_tex_coord;
+    out.position = vec4<f32>(a_pos, 0.0, 1.0);
+    return out;
+}
+
+// A reciprocal that never divides by zero (the reference's approximations give a large finite
+// value there).
+fn rcp_pos(x: f32) -> f32 {
+    return 1.0 / max(x, 1.0e-20);
+}
+
+// The same with the sign kept, for the limiters of RCAS.
+fn rcp_signed(x: f32) -> f32 {
+    let s = select(-1.0, 1.0, x >= 0.0);
+    return 1.0 / (s * max(abs(x), 1.0e-6));
+}
+
+// ---------------------------------------------------------------------------------------------
+// EASU
+
+fn easu_tap(
+    aC: ptr<function, vec3<f32>>,
+    aW: ptr<function, f32>,
+    off: vec2<f32>,
+    dir: vec2<f32>,
+    len: vec2<f32>,
+    lob: f32,
+    clp: f32,
+    c: vec3<f32>,
+) {
+    // Rotate the offset by the direction.
+    var v: vec2<f32>;
+    v.x = off.x * dir.x + off.y * dir.y;
+    v.y = off.x * (-dir.y) + off.y * dir.x;
+    // Anisotropy.
+    v = v * len;
+    // Distance squared, limited to the window.
+    var d2 = v.x * v.x + v.y * v.y;
+    d2 = min(d2, clp);
+    // Approximation of lanczos2 without sin(), rcp() or sqrt().
+    var wB = (2.0 / 5.0) * d2 - 1.0;
+    var wA = lob * d2 - 1.0;
+    wB = wB * wB;
+    wA = wA * wA;
+    wB = (25.0 / 16.0) * wB - (25.0 / 16.0 - 1.0);
+    let w = wB * wA;
+    *aC = *aC + c * w;
+    *aW = *aW + w;
+}
+
+// Accumulates the direction and the length.
+fn easu_set(
+    dir: ptr<function, vec2<f32>>,
+    len: ptr<function, f32>,
+    pp: vec2<f32>,
+    biS: bool, biT: bool, biU: bool, biV: bool,
+    lA: f32, lB: f32, lC: f32, lD: f32, lE: f32,
+) {
+    var w = 0.0;
+    if (biS) { w = (1.0 - pp.x) * (1.0 - pp.y); }
+    if (biT) { w = pp.x * (1.0 - pp.y); }
+    if (biU) { w = (1.0 - pp.x) * pp.y; }
+    if (biV) { w = pp.x * pp.y; }
+    // The direction is the '+' difference; the magnitude comes from both sides of 'c'.
+    let dc = lD - lC;
+    let cb = lC - lB;
+    var lenX = max(abs(dc), abs(cb));
+    lenX = rcp_pos(lenX);
+    let dirX = lD - lB;
+    (*dir).x = (*dir).x + dirX * w;
+    lenX = clamp(abs(dirX) * lenX, 0.0, 1.0);
+    lenX = lenX * lenX;
+    *len = *len + lenX * w;
+    // The same for the y axis.
+    let ec = lE - lC;
+    let ca = lC - lA;
+    var lenY = max(abs(ec), abs(ca));
+    lenY = rcp_pos(lenY);
+    let dirY = lE - lA;
+    (*dir).y = (*dir).y + dirY * w;
+    lenY = clamp(abs(dirY) * lenY, 0.0, 1.0);
+    lenY = lenY * lenY;
+    *len = *len + lenY * w;
+}
+
+@fragment
+fn fs_easu(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Integer position in the output.
+    let ip = floor(in.position.xy);
+    // The position of 'f'.
+    var pp = ip * params.con0.xy + params.con0.zw;
+    let fp = floor(pp);
+    pp = pp - fp;
+
+    // 12-tap kernel:    b c
+    //                 e f g h
+    //                 i j k l
+    //                   n o
+    // Gather order: x bottom-left, y bottom-right, z top-right, w top-left.
+    let p0 = fp * params.con1.xy + params.con1.zw;
+    let p1 = p0 + params.con2.xy;
+    let p2 = p0 + params.con2.zw;
+    let p3 = p0 + params.con3.xy;
+    let bczzR = textureGather(0, r_tex, r_sampler, p0);
+    let bczzG = textureGather(1, r_tex, r_sampler, p0);
+    let bczzB = textureGather(2, r_tex, r_sampler, p0);
+    let ijfeR = textureGather(0, r_tex, r_sampler, p1);
+    let ijfeG = textureGather(1, r_tex, r_sampler, p1);
+    let ijfeB = textureGather(2, r_tex, r_sampler, p1);
+    let klhgR = textureGather(0, r_tex, r_sampler, p2);
+    let klhgG = textureGather(1, r_tex, r_sampler, p2);
+    let klhgB = textureGather(2, r_tex, r_sampler, p2);
+    let zzonR = textureGather(0, r_tex, r_sampler, p3);
+    let zzonG = textureGather(1, r_tex, r_sampler, p3);
+    let zzonB = textureGather(2, r_tex, r_sampler, p3);
+
+    // Luma times 2.
+    let bczzL = bczzB * 0.5 + (bczzR * 0.5 + bczzG);
+    let ijfeL = ijfeB * 0.5 + (ijfeR * 0.5 + ijfeG);
+    let klhgL = klhgB * 0.5 + (klhgR * 0.5 + klhgG);
+    let zzonL = zzonB * 0.5 + (zzonR * 0.5 + zzonG);
+    let bL = bczzL.x;
+    let cL = bczzL.y;
+    let iL = ijfeL.x;
+    let jL = ijfeL.y;
+    let fL = ijfeL.z;
+    let eL = ijfeL.w;
+    let kL = klhgL.x;
+    let lL = klhgL.y;
+    let hL = klhgL.z;
+    let gL = klhgL.w;
+    let oL = zzonL.z;
+    let nL = zzonL.w;
+
+    // Accumulate for bilinear interpolation.
+    var dir = vec2<f32>(0.0);
+    var len = 0.0;
+    easu_set(&dir, &len, pp, true, false, false, false, bL, eL, fL, gL, jL);
+    easu_set(&dir, &len, pp, false, true, false, false, cL, fL, gL, hL, kL);
+    easu_set(&dir, &len, pp, false, false, true, false, fL, iL, jL, kL, nL);
+    easu_set(&dir, &len, pp, false, false, false, true, gL, jL, kL, lL, oL);
+
+    // Normalize, and clean up close to zero.
+    let dir2 = dir * dir;
+    var dirR = dir2.x + dir2.y;
+    let zro = dirR < (1.0 / 32768.0);
+    dirR = inverseSqrt(max(dirR, 1.0e-20));
+    dirR = select(dirR, 1.0, zro);
+    dir.x = select(dir.x, 1.0, zro);
+    dir = dir * dirR;
+    // From {0 to 2} to {0 to 1}, shaped with a square.
+    len = len * 0.5;
+    len = len * len;
+    // Stretch of the kernel: 1.0 vertical or horizontal, sqrt(2.0) diagonal.
+    let stretch = (dir.x * dir.x + dir.y * dir.y) * rcp_pos(max(abs(dir.x), abs(dir.y)));
+    // Anisotropic length after rotation.
+    let len2 = vec2<f32>(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);
+    // The window shifts with the amount of 'edge'.
+    let lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len;
+    // The clipping point of distance squared is the end of the adjustable window.
+    let clp = rcp_pos(lob);
+
+    // Min and max of the 4 nearest taps, for the deringing.
+    let fRGB = vec3<f32>(ijfeR.z, ijfeG.z, ijfeB.z);
+    let gRGB = vec3<f32>(klhgR.w, klhgG.w, klhgB.w);
+    let jRGB = vec3<f32>(ijfeR.y, ijfeG.y, ijfeB.y);
+    let kRGB = vec3<f32>(klhgR.x, klhgG.x, klhgB.x);
+    let min4 = min(min(min(fRGB, gRGB), jRGB), kRGB);
+    let max4 = max(max(max(fRGB, gRGB), jRGB), kRGB);
+
+    // Accumulation.
+    var aC = vec3<f32>(0.0);
+    var aW = 0.0;
+    easu_tap(&aC, &aW, vec2<f32>(0.0, -1.0) - pp, dir, len2, lob, clp, vec3<f32>(bczzR.x, bczzG.x, bczzB.x)); // b
+    easu_tap(&aC, &aW, vec2<f32>(1.0, -1.0) - pp, dir, len2, lob, clp, vec3<f32>(bczzR.y, bczzG.y, bczzB.y)); // c
+    easu_tap(&aC, &aW, vec2<f32>(-1.0, 1.0) - pp, dir, len2, lob, clp, vec3<f32>(ijfeR.x, ijfeG.x, ijfeB.x)); // i
+    easu_tap(&aC, &aW, vec2<f32>(0.0, 1.0) - pp, dir, len2, lob, clp, vec3<f32>(ijfeR.y, ijfeG.y, ijfeB.y)); // j
+    easu_tap(&aC, &aW, vec2<f32>(0.0, 0.0) - pp, dir, len2, lob, clp, vec3<f32>(ijfeR.z, ijfeG.z, ijfeB.z)); // f
+    easu_tap(&aC, &aW, vec2<f32>(-1.0, 0.0) - pp, dir, len2, lob, clp, vec3<f32>(ijfeR.w, ijfeG.w, ijfeB.w)); // e
+    easu_tap(&aC, &aW, vec2<f32>(1.0, 1.0) - pp, dir, len2, lob, clp, vec3<f32>(klhgR.x, klhgG.x, klhgB.x)); // k
+    easu_tap(&aC, &aW, vec2<f32>(2.0, 1.0) - pp, dir, len2, lob, clp, vec3<f32>(klhgR.y, klhgG.y, klhgB.y)); // l
+    easu_tap(&aC, &aW, vec2<f32>(2.0, 0.0) - pp, dir, len2, lob, clp, vec3<f32>(klhgR.z, klhgG.z, klhgB.z)); // h
+    easu_tap(&aC, &aW, vec2<f32>(1.0, 0.0) - pp, dir, len2, lob, clp, vec3<f32>(klhgR.w, klhgG.w, klhgB.w)); // g
+    easu_tap(&aC, &aW, vec2<f32>(1.0, 2.0) - pp, dir, len2, lob, clp, vec3<f32>(zzonR.z, zzonG.z, zzonB.z)); // o
+    easu_tap(&aC, &aW, vec2<f32>(0.0, 2.0) - pp, dir, len2, lob, clp, vec3<f32>(zzonR.w, zzonG.w, zzonB.w)); // n
+
+    // Normalize and dering.
+    let color = min(max4, max(min4, aC * (1.0 / aW)));
+    return vec4<f32>(color, 1.0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// RCAS
+
+fn rcas_load(p: vec2<i32>) -> vec3<f32> {
+    let size = vec2<i32>(params.rcas.yz);
+    return textureLoad(r_tex, clamp(p, vec2<i32>(0), size - vec2<i32>(1)), 0).rgb;
+}
+
+fn rcas(uv: vec2<f32>) -> vec4<f32> {
+    let sp = vec2<i32>(floor(uv * params.rcas.yz));
+    // 3x3 neighbourhood:   b
+    //                    d e f
+    //                      h
+    let b = rcas_load(sp + vec2<i32>(0, -1));
+    let d = rcas_load(sp + vec2<i32>(-1, 0));
+    let e = rcas_load(sp);
+    let f = rcas_load(sp + vec2<i32>(1, 0));
+    let h = rcas_load(sp + vec2<i32>(0, 1));
+    // Min and max of the ring.
+    let mn4 = min(min(min(b, d), f), h);
+    let mx4 = max(max(max(b, d), f), h);
+    // Limiters.
+    let peakY = -1.0 * 4.0;
+    let hitMin = min(mn4, e) * vec3<f32>(rcp_pos(4.0 * mx4.r), rcp_pos(4.0 * mx4.g), rcp_pos(4.0 * mx4.b));
+    let hitMax = (vec3<f32>(1.0) - max(mx4, e))
+        * vec3<f32>(rcp_signed(4.0 * mn4.r + peakY), rcp_signed(4.0 * mn4.g + peakY), rcp_signed(4.0 * mn4.b + peakY));
+    let lobeRGB = max(-hitMin, hitMax);
+    let limit = 0.25 - (1.0 / 16.0);
+    let lobe = max(-limit, min(max(max(lobeRGB.r, lobeRGB.g), lobeRGB.b), 0.0)) * params.rcas.x;
+    // Resolve.
+    let rcpL = 1.0 / (4.0 * lobe + 1.0);
+    let color = (lobe * b + lobe * d + lobe * h + lobe * f + e) * rcpL;
+    return vec4<f32>(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+
+/// Converts a colour from sRGB to linear colour space (as the plain blit does for an sRGB window).
+fn srgb_to_linear(srgb: vec3<f32>) -> vec3<f32> {
+    let a = srgb / 12.92;
+    let b = pow((srgb + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    let c = step(vec3<f32>(0.04045), srgb);
+    return mix(a, b, c);
+}
+
+@fragment
+fn fs_rcas_linear_framebuffer(in: VertexOutput) -> @location(0) vec4<f32> {
+    return rcas(in.tex_coord);
+}
+
+@fragment
+fn fs_rcas_srgb_framebuffer(in: VertexOutput) -> @location(0) vec4<f32> {
+    let c = rcas(in.tex_coord);
+    return vec4<f32>(srgb_to_linear(c.rgb), 1.0);
+}

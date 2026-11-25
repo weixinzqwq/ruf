@@ -110,6 +110,12 @@ use self::scope::Scope;
 const BROADCAST_WHITELIST: [&[u8]; 4] =
     [b"enterFrame", b"exitFrame", b"frameConstructed", b"render"];
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct WeakDictionaryStats {
+    pub inserted: u64,
+    pub pruned: u64,
+}
+
 /// The state of an AVM2 interpreter.
 #[derive(Collect)]
 #[collect(no_drop)]
@@ -172,6 +178,9 @@ pub struct Avm2<'gc> {
     /// currently present on the display list. This list keeps track of that.
     broadcast_list: FnvHashMap<AvmString<'gc>, Vec<WeakObject<'gc>>>,
 
+    #[collect(require_static)]
+    pub(crate) weak_dictionary_stats: std::rc::Rc<std::cell::Cell<WeakDictionaryStats>>,
+
     alias_to_class_map: FnvHashMap<AvmString<'gc>, ClassObject<'gc>>,
     class_to_alias_map: FnvHashMap<Class<'gc>, AvmString<'gc>>,
 
@@ -228,6 +237,7 @@ impl<'gc> Avm2<'gc> {
             native_custom_constructor_table: Default::default(),
             native_fast_call_list: Default::default(),
             broadcast_list: Default::default(),
+            weak_dictionary_stats: Default::default(),
 
             alias_to_class_map: Default::default(),
             class_to_alias_map: Default::default(),

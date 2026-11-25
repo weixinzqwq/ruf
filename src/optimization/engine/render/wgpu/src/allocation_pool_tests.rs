@@ -2,6 +2,56 @@ use crate::{backend::WgpuRenderBackend, buffer_pool::TexturePool, aoqi::TextureP
 use ruffle_render::backend::RenderBackend;
 
 #[test]
+#[ignore = "requires DX12; run twice with AOLA_LONG_RUN_MAINTENANCE=0 and 1"]
+fn dx12_long_run_texture_pool_rounds() {
+    let renderer = WgpuRenderBackend::for_offscreen((64, 64), wgpu::Backends::DX12,
+        wgpu::PowerPreference::HighPerformance).unwrap();
+    let long_run = ruffle_render::backend::aola_long_run_maintenance();
+    let mut main = TexturePool::new();
+    let mut offscreen = TexturePool::sharing_with(&main);
+    let take_four = |pool: &mut TexturePool, width| {
+        let size = wgpu::Extent3d { width, height: 32, depth_or_array_layers: 1 };
+        // All four identical allocations must coexist before they return to the pool.
+        let entries = [(); 4].map(|_| pool.get_texture(renderer.descriptors(), size,
+            wgpu::TextureUsages::RENDER_ATTACHMENT, wgpu::TextureFormat::Rgba8Unorm, 1));
+        drop(entries);
+    };
+    let start = renderer.resource_stats().unwrap();
+    let mut hot_rebuilds = 0;
+    for round in 0..6 {
+        let first_cold = 128 + 4 * round;
+        for frame in 0..40 {
+            let before = renderer.resource_stats().unwrap().temporary_texture.created_count;
+            take_four(&mut main, 64);
+            if round != 0 || frame != 0 {
+                hot_rebuilds += renderer.resource_stats().unwrap().temporary_texture.created_count - before;
+            }
+            if frame == 0 {
+                for width in first_cold..first_cold + 4 { take_four(&mut offscreen, width); }
+            }
+            if frame == 12 { take_four(&mut offscreen, first_cold); }
+            main.end_frame();
+        }
+        let stats = renderer.resource_stats().unwrap();
+        let (bytes, items, buckets) = main.idle_stats();
+        println!("long_run={long_run} round={} hits={} created={} hot_rebuilds={hot_rebuilds} idle_bytes={bytes} idle_items={items} buckets={buckets}",
+            round + 1, stats.temporary_pool_hits - start.temporary_pool_hits,
+            stats.temporary_texture.created_count - start.temporary_texture.created_count);
+    }
+    let stats = renderer.resource_stats().unwrap();
+    let (_, items, buckets) = main.idle_stats();
+    // The four-per-frame hot burst remains reusable in either mode. Each cold
+    // shape revisited after twelve frames needs three extra allocations in B.
+    assert_eq!(hot_rebuilds, 0);
+    assert_eq!(stats.temporary_texture.created_count - start.temporary_texture.created_count,
+               if long_run { 118 } else { 100 });
+    assert_eq!(stats.temporary_pool_hits - start.temporary_pool_hits, if long_run { 962 } else { 980 });
+    assert_eq!((items, buckets), if long_run { (5, 2) } else { (52, 13) });
+    for _ in 0..120 { main.end_frame(); }
+    assert_eq!(main.idle_stats(), (0, 0, 0));
+}
+
+#[test]
 #[ignore = "requires a DX12 device; verifies native charging and hot-set survival"]
 fn dx12_allocation_pool_pressure() {
     let renderer = WgpuRenderBackend::for_offscreen((64,64), wgpu::Backends::DX12, wgpu::PowerPreference::HighPerformance).unwrap();
@@ -233,6 +283,58 @@ fn dx12_pool_new_sizes_replace_cold_idle() {
     assert_eq!(after.temporary_pool_return_rejections,before.temporary_pool_return_rejections);
     assert!(pool.idle_stats().0<=256*1024*1024);
     println!("new_size_pool hot_misses=0 return_rejections=0 idle_bytes={}",pool.idle_stats().0);
+}
+
+#[test]
+#[ignore = "DX12: run with long-run maintenance on, with and without the battle texture pool"]
+fn dx12_battle_pool_filter_working_set() {
+    assert!(ruffle_render::backend::aola_long_run_maintenance());
+    let candidate = crate::buffer_pool::battle_texture_pool_enabled();
+    let renderer = WgpuRenderBackend::for_offscreen((64, 64), wgpu::Backends::DX12,
+        wgpu::PowerPreference::HighPerformance).unwrap();
+    let mut pool = TexturePool::new();
+    let mut limits = TexturePoolLimits { idle_bytes: 4 * 1024 * 1024, idle_frames: 120 };
+    pool.set_limits(limits);
+    let color = wgpu::TextureFormat::Rgba8Unorm;
+    let filter_usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+        | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING;
+    let take = |pool: &mut TexturePool, width, samples, usage| pool.get_texture(
+        renderer.descriptors(), wgpu::Extent3d { width, height: 16, depth_or_array_layers: 1 },
+        usage, color, samples,
+    );
+    // A 4 MiB MSAA request competes with 64 distinct 64 KiB filtered outputs.
+    for width in 16..80 { drop(take(&mut pool, width, 1, filter_usage)); }
+    for _ in 0..3 { pool.end_frame(); }
+    assert_eq!(pool.idle_stats().0, limits.idle_bytes);
+    let before = renderer.resource_stats().unwrap();
+    drop(take(&mut pool, 80, 4, wgpu::TextureUsages::RENDER_ATTACHMENT));
+    let first = renderer.resource_stats().unwrap();
+    let displaced = first.temporary_pool_pressure_evictions - before.temporary_pool_pressure_evictions;
+    assert_eq!(displaced, if candidate { 0 } else { 64 });
+    // A recurring MSAA key can still replace the cold single-sample working set.
+    drop(take(&mut pool, 80, 4, wgpu::TextureUsages::RENDER_ATTACHMENT));
+    let before_hit = renderer.resource_stats().unwrap().temporary_pool_hits;
+    drop(take(&mut pool, 80, 4, wgpu::TextureUsages::RENDER_ATTACHMENT));
+    assert_eq!(renderer.resource_stats().unwrap().temporary_pool_hits, before_hit + 1);
+    assert_eq!(pool.idle_stats().0, limits.idle_bytes);
+
+    pool.clear();
+    for usage in [filter_usage, wgpu::TextureUsages::RENDER_ATTACHMENT] {
+        let pair = [(); 2].map(|_| take(&mut pool, 32, 1, usage));
+        drop(pair);
+        for _ in 0..3 { pool.end_frame(); }
+        let before = renderer.resource_stats().unwrap().temporary_pool_misses;
+        drop([(); 2].map(|_| take(&mut pool, 32, 1, usage)));
+        let rebuilds = renderer.resource_stats().unwrap().temporary_pool_misses - before;
+        assert_eq!(rebuilds, u64::from(!(candidate && usage == filter_usage)));
+        println!("candidate={candidate} usage={usage:?} pair_rebuilds={rebuilds}");
+    }
+    limits.idle_bytes = 64 * 1024;
+    pool.set_limits(limits);
+    assert!(pool.idle_stats().0 <= limits.idle_bytes);
+    for _ in 0..120 { pool.end_frame(); }
+    assert_eq!(pool.idle_stats(), (0, 0, 0));
+    println!("candidate={candidate} first_msaa_displacements={displaced} all_expired=true");
 }
 
 #[test]

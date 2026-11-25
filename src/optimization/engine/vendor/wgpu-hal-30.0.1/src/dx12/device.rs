@@ -273,6 +273,7 @@ impl super::Device {
             .into_device_result("Signal")?;
         let hr = unsafe { self.idler.fence.SetEventOnCompletion(value, event.0) };
         hr.into_device_result("Set event")?;
+        let _phase = crate::aola_close::Phase::begin("dx12-present-fence-wait");
         unsafe { Threading::WaitForSingleObject(event.0, Threading::INFINITE) };
         Ok(())
     }
@@ -539,10 +540,12 @@ impl crate::Device for super::Device {
     }
 
     unsafe fn destroy_buffer(&self, buffer: super::Buffer) {
-        suballocation::DeviceAllocationContext::from(self)
-            .free_resource(buffer.resource, buffer.allocation);
+        crate::aola_close::destroy(crate::aola_close::Resource::Buffer, buffer, |buffer| {
+            suballocation::DeviceAllocationContext::from(self)
+                .free_resource(buffer.resource, buffer.allocation);
 
-        self.counters.buffers.sub(1);
+            self.counters.buffers.sub(1);
+        });
     }
 
     unsafe fn add_raw_buffer(&self, _buffer: &super::Buffer) {
@@ -619,10 +622,12 @@ impl crate::Device for super::Device {
     }
 
     unsafe fn destroy_texture(&self, texture: super::Texture) {
-        suballocation::DeviceAllocationContext::from(self)
-            .free_resource(texture.resource, texture.allocation);
+        crate::aola_close::destroy(crate::aola_close::Resource::Texture, texture, |texture| {
+            suballocation::DeviceAllocationContext::from(self)
+                .free_resource(texture.resource, texture.allocation);
 
-        self.counters.textures.sub(1);
+            self.counters.textures.sub(1);
+        });
     }
 
     unsafe fn add_raw_texture(&self, _texture: &super::Texture) {
@@ -730,29 +735,31 @@ impl crate::Device for super::Device {
     }
 
     unsafe fn destroy_texture_view(&self, view: super::TextureView) {
-        if view.handle_srv.is_some() || view.handle_uav.is_some() {
-            let mut pool = self.srv_uav_pool.lock();
-            if let Some(handle) = view.handle_srv {
-                pool.free_handle(handle);
+        crate::aola_close::destroy(crate::aola_close::Resource::TextureView, view, |view| {
+            if view.handle_srv.is_some() || view.handle_uav.is_some() {
+                let mut pool = self.srv_uav_pool.lock();
+                if let Some(handle) = view.handle_srv {
+                    pool.free_handle(handle);
+                }
+                if let Some(handle) = view.handle_uav {
+                    pool.free_handle(handle);
+                }
             }
-            if let Some(handle) = view.handle_uav {
-                pool.free_handle(handle);
+            if let Some(handle) = view.handle_rtv {
+                self.rtv_pool.lock().free_handle(handle);
             }
-        }
-        if let Some(handle) = view.handle_rtv {
-            self.rtv_pool.lock().free_handle(handle);
-        }
-        if view.handle_dsv_ro.is_some() || view.handle_dsv_rw.is_some() {
-            let mut pool = self.dsv_pool.lock();
-            if let Some(handle) = view.handle_dsv_ro {
-                pool.free_handle(handle);
+            if view.handle_dsv_ro.is_some() || view.handle_dsv_rw.is_some() {
+                let mut pool = self.dsv_pool.lock();
+                if let Some(handle) = view.handle_dsv_ro {
+                    pool.free_handle(handle);
+                }
+                if let Some(handle) = view.handle_dsv_rw {
+                    pool.free_handle(handle);
+                }
             }
-            if let Some(handle) = view.handle_dsv_rw {
-                pool.free_handle(handle);
-            }
-        }
 
-        self.counters.texture_views.sub(1);
+            self.counters.texture_views.sub(1);
+        });
     }
 
     unsafe fn create_sampler(
@@ -1882,13 +1889,15 @@ impl crate::Device for super::Device {
     }
 
     unsafe fn destroy_bind_group(&self, group: super::BindGroup) {
-        if let Some(dual) = group.handle_views {
-            self.shared.heap_views.free_slice(dual);
-        }
+        crate::aola_close::destroy(crate::aola_close::Resource::BindGroup, group, |group| {
+            if let Some(dual) = group.handle_views {
+                self.shared.heap_views.free_slice(dual);
+            }
 
-        drop(group.sampler_index_buffer);
+            drop(group.sampler_index_buffer);
 
-        self.counters.bind_groups.sub(1);
+            self.counters.bind_groups.sub(1);
+        });
     }
 
     unsafe fn create_shader_module(

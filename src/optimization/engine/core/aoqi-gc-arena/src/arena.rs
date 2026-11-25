@@ -242,6 +242,19 @@ where
         self.context.metrics()
     }
 
+    /// Observe the start and end of terminal object-list destruction, with the
+    /// number of GC allocations still present at each boundary. The observer
+    /// must not panic. Incremental collections do not call it.
+    pub fn set_drop_observer(&mut self, observer: fn(starting: bool, remaining: usize)) {
+        self.context.drop_observer = Some(observer);
+    }
+
+    /// Snapshot of objects awaiting tracing, objects awaiting retracing, ready
+    /// weak-key value groups, and whether the root still needs a marking visit.
+    pub fn mark_backlog(&self) -> (usize, usize, usize, bool) {
+        self.context.mark_backlog()
+    }
+
     #[inline]
     pub fn collection_phase(&self) -> CollectionPhase {
         match self.context.phase() {

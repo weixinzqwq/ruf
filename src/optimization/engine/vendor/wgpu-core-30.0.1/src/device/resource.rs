@@ -305,6 +305,7 @@ impl fmt::Debug for Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
+        let _phase = hal::aola_close::Phase::begin("wgpu-device-resource-destroy");
         resource_log!("Drop {}", self.error_ident());
 
         // SAFETY: We are in the Drop impl and we don't use self.zero_buffer anymore after this

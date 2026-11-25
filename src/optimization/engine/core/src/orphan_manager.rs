@@ -2,8 +2,25 @@
 
 use crate::context::UpdateContext;
 use crate::display_object::{DisplayObject, DisplayObjectWeak, TDisplayObject, TDisplayObjectContainer};
+use crate::frame_lifecycle::FramePhase;
+use crate::frame_profile::OrdinaryOrphanStats;
 use gc_arena::{Collect, Mutation};
 use std::rc::Rc;
+use std::sync::OnceLock;
+
+pub(crate) fn ordinary_orphan_mode() -> &'static str {
+    static MODE: OnceLock<&str> = OnceLock::new();
+    MODE.get_or_init(|| match std::env::var("AOLA_ORDINARY_ORPHANS").as_deref() {
+        Ok("battle") => "battle",
+        Ok("1") => "all",
+        _ => "off",
+    })
+}
+
+pub(crate) fn ordinary_branch_prune_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("AOLA_ORDINARY_BRANCH_PRUNE").as_deref() == Ok("1"))
+}
 
 /// The list of 'orphan' objects - these objects have no parent,
 /// so we need to manually run their frames in `run_all_phases_avm2` to match
@@ -46,7 +63,7 @@ impl<'gc> OrphanManager<'gc> {
         }
     }
 
-    pub fn each_orphan_obj(
+    pub fn each_orphan_obj<const INNER_GOTO: bool>(
         context: &mut UpdateContext<'gc>,
         mut f: impl FnMut(DisplayObject<'gc>, &mut UpdateContext<'gc>),
     ) {
@@ -58,23 +75,72 @@ impl<'gc> OrphanManager<'gc> {
         context.tick_profile.goto.count(crate::goto_profile::Counter::OrphanVisits, orphan_objs.len() as u64);
 
         let profiling = context.frame_profile.is_active();
+        let phase = *context.frame_phase;
+        let ordinary = !INNER_GOTO && match ordinary_orphan_mode() {
+            "battle" => context.battle_maintenance.is_active(),
+            "all" => true,
+            _ => false,
+        };
+        let ordinary_stats = if !INNER_GOTO && profiling {
+            OrdinaryOrphanStats::phase_index(phase)
+        } else {
+            None
+        };
+        let prune_branches = ordinary && ordinary_branch_prune_enabled();
+        let previous_scope = context.frame_profile.replace_ordinary_orphan_script_scope(
+            !INNER_GOTO && profiling && phase == FramePhase::FrameScripts,
+        );
+        let mut sample = (!INNER_GOTO && phase == FramePhase::Enter
+            && context.frame_profile.ordinary_sample_requested.replace(false)).then(|| {
+            crate::orphan_census::OrdinaryRootSample::new(
+                orphan_objs.len(), context.frame_profile.stats.started_frames, context.battle_maintenance.is_active(),
+            )
+        });
+        let goto_idle = INNER_GOTO && crate::goto_profile::goto_orphan_idle_enabled();
+        let reset_rejected = !INNER_GOTO && phase == FramePhase::Enter
+            && (ordinary || crate::goto_profile::goto_orphan_idle_enabled());
         if profiling { context.frame_profile.stats.orphan_visits += orphan_objs.len() as u64; }
-        for orphan in orphan_objs.iter() {
-            if let Some(dobj) = valid_orphan(*orphan, context.gc()) {
-                if crate::aoqi_work::mode().sleep && sleeping_subtree(dobj) {
+        for (index, orphan) in orphan_objs.iter().enumerate() {
+            let object = valid_orphan(*orphan, context.gc());
+            if let Some(sample) = &mut sample { sample.observe(index, object); }
+            if let Some(dobj) = object {
+                if reset_rejected { dobj.base().set_goto_orphan_rejected(false); }
+                if goto_idle && goto_idle_root(dobj) {
+                    context.tick_profile.goto.count(crate::goto_profile::Counter::OrphanGotoIdleSkipped, 1);
+                    if profiling { context.frame_profile.stats.orphan_goto_idle_skipped += 1; }
+                } else if crate::aoqi_work::mode().sleep && sleeping_subtree(dobj) {
                     context.tick_profile.goto.count(crate::goto_profile::Counter::OrphanSleepSkipped, 1);
+                    if let Some(i) = ordinary_stats { context.frame_profile.stats.ordinary_orphans[i].sleeping_roots += 1; }
                     if profiling { context.frame_profile.stats.orphan_sleep_skipped += 1; }
                     crate::aoqi_work::SLEEP_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else if ordinary && matches!(phase, FramePhase::Construct | FramePhase::FrameScripts)
+                    && goto_idle_root(dobj)
+                {
+                    // Enter already advanced the timelines and placed children. A fully
+                    // constructed, scriptless tree has no work in either of these phases.
+                    if let Some(i) = ordinary_stats { context.frame_profile.stats.ordinary_orphans[i].scriptless_roots += 1; }
                 } else {
                     context.tick_profile.goto.count(crate::goto_profile::Counter::OrphanExecuted, 1);
                     if profiling { context.frame_profile.stats.orphan_executed += 1; }
-                    f(dobj, context);
+                    if let Some(i) = ordinary_stats { context.frame_profile.stats.ordinary_orphans[i].dispatched_roots += 1; }
+                    if ordinary && phase == FramePhase::Enter && let DisplayObject::MovieClip(clip) = dobj {
+                        clip.enter_subtree::<true>(context);
+                    } else if prune_branches && phase == FramePhase::Construct {
+                        crate::display_object::MovieClip::walk_ordinary_orphan::<false>(dobj, None, context);
+                    } else if prune_branches && phase == FramePhase::FrameScripts {
+                        crate::display_object::MovieClip::walk_ordinary_orphan::<true>(dobj, None, context);
+                    } else {
+                        f(dobj, context);
+                    }
                 }
             } else {
+                if let Some(i) = ordinary_stats { context.frame_profile.stats.ordinary_orphans[i].invalid_roots += 1; }
                 context.tick_profile.goto.count(crate::goto_profile::Counter::OrphanInvalid, 1);
                 if profiling { context.frame_profile.stats.orphan_invalid += 1; }
             }
         }
+        context.frame_profile.replace_ordinary_orphan_script_scope(previous_scope);
+        if let Some(sample) = sample { context.frame_profile.ordinary_sample.replace(Some(sample.finish())); }
     }
 
     /// Called at the end of `run_all_phases_avm2` - removes any movies
@@ -136,12 +202,46 @@ pub(crate) fn sleeping_subtree(object: DisplayObject<'_>) -> bool {
     crate::aoqi_work::SLEEP_SCANNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let quiet = match object {
         DisplayObject::MovieClip(clip) => clip.timeline_can_sleep()
-            && clip.iter_render_list().all(sleeping_subtree),
+            && clip.iter_render_list().all(|child| is_child_of(child, object) && sleeping_subtree(child)),
         DisplayObject::Bitmap(_) | DisplayObject::Graphic(_) | DisplayObject::MorphShape(_) | DisplayObject::Text(_) => object.object2().is_some() && !object.base().should_skip_next_enter_frame(),
         _ => false,
     };
     if quiet { object.base().mark_timeline_quiet(); }
     quiet
+}
+
+pub(crate) fn is_child_of<'gc>(child: DisplayObject<'gc>, parent: DisplayObject<'gc>) -> bool {
+    child.parent().is_some_and(|actual| DisplayObject::ptr_eq(actual, parent))
+}
+
+fn goto_idle_root(object: DisplayObject<'_>) -> bool {
+    let base = object.base();
+    if base.goto_orphan_rejected() || base.timeline_quiet() { return false; }
+    if goto_idle_subtree::<true>(object) { return true; }
+    base.set_goto_orphan_rejected(true);
+    false
+}
+
+/// Construction and frame scripts can be idle even while a timeline plays.
+/// Require real parent links so mutations invalidate every cached ancestor.
+// Mixed ordinary roots are already being traversed. In that path only consult
+// immediate children's cached proofs to avoid a recursive second walk.
+pub(crate) fn goto_idle_subtree<const RECURSE: bool>(object: DisplayObject<'_>) -> bool {
+    let base = object.base();
+    if base.goto_orphan_idle() { return true; }
+    let idle = match object {
+        DisplayObject::MovieClip(clip) => clip.idle_during_inner_goto()
+            && clip.iter_render_list().all(|child| is_child_of(child, object) && if RECURSE {
+                goto_idle_subtree::<true>(child)
+            } else {
+                child.base().goto_orphan_idle()
+            }),
+        DisplayObject::Bitmap(_) | DisplayObject::Graphic(_) | DisplayObject::MorphShape(_)
+        | DisplayObject::Text(_) => object.object2().is_some(),
+        _ => false,
+    };
+    if idle { base.mark_goto_orphan_idle(); }
+    idle
 }
 
 #[cfg(test)]

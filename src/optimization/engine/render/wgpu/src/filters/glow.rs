@@ -9,7 +9,23 @@ use crate::filters::{
 use crate::surface::target::CommandTarget;
 use crate::utils::SampleCountMap;
 use bytemuck::{Pod, Zeroable};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
+
+static FUSE_GLOW: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("AOLA_FUSE_GLOW").as_deref() == Ok("1"));
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FUSE_GLOW_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+fn fuse_glow_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(override_value) = FUSE_GLOW_OVERRIDE.get() {
+        return override_value;
+    }
+    *FUSE_GLOW
+}
 use swf::GlowFilter as GlowFilterArgs;
 use wgpu::util::StagingBelt;
 
@@ -35,6 +51,7 @@ pub struct GlowFilter {
     #[cfg(test)]
     uniform_size: wgpu::BufferSize,
     pipeline: SampleCountMap<OnceLock<wgpu::RenderPipeline>>,
+    fused_pipeline: SampleCountMap<OnceLock<wgpu::RenderPipeline>>,
 }
 
 impl GlowFilter {
@@ -92,6 +109,7 @@ impl GlowFilter {
 
         Self {
             pipeline: Default::default(),
+            fused_pipeline: Default::default(),
             pipeline_layout,
             vertex_buffer,
             full_vertices,
@@ -105,17 +123,36 @@ impl GlowFilter {
         }
     }
 
-    fn pipeline(&self, descriptors: &Descriptors, msaa_sample_count: u32) -> &wgpu::RenderPipeline {
-        self.pipeline.get_or_init(msaa_sample_count, || {
+    fn pipeline(
+        &self,
+        descriptors: &Descriptors,
+        msaa_sample_count: u32,
+        blur: &BlurFilter,
+        fused: bool,
+    ) -> &wgpu::RenderPipeline {
+        let pipelines = if fused { &self.fused_pipeline } else { &self.pipeline };
+        pipelines.get_or_init(msaa_sample_count, || {
+            let fused_layout = fused.then(|| {
+                descriptors.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: create_debug_label!("Final blur and glow pipeline").as_deref(),
+                    bind_group_layouts: &[
+                        Some(&self.bind_group_layout),
+                        Some(&blur.bind_group_layout),
+                        Some(&self.uniform_cache.layout),
+                        Some(&blur.uniform_cache.layout),
+                    ],
+                    immediate_size: 0,
+                })
+            });
             let label = create_debug_label!("Glow Filter ({} msaa)", msaa_sample_count);
             descriptors
                 .device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: label.as_deref(),
-                    layout: Some(&self.pipeline_layout),
+                    layout: Some(fused_layout.as_ref().unwrap_or(&self.pipeline_layout)),
                     vertex: wgpu::VertexState {
                         module: &descriptors.shaders.glow_filter,
-                        entry_point: Some("main_vertex"),
+                        entry_point: Some(if fused { "fused_vertex" } else { "main_vertex" }),
                         buffers: &VERTEX_BUFFERS_DESCRIPTION_FILTERS_WITH_BLUR,
                         compilation_options: Default::default(),
                     },
@@ -136,7 +173,7 @@ impl GlowFilter {
                     },
                     fragment: Some(wgpu::FragmentState {
                         module: &descriptors.shaders.glow_filter,
-                        entry_point: Some("main_fragment"),
+                        entry_point: Some(if fused { "fused_fragment" } else { "main_fragment" }),
                         targets: &[Some(wgpu::TextureFormat::Rgba8Unorm.into())],
                         compilation_options: Default::default(),
                     }),
@@ -160,15 +197,30 @@ impl GlowFilter {
     ) -> CommandTarget {
         let sample_count = source.texture.sample_count();
         let format = source.texture.format();
-        let pipeline = self.pipeline(descriptors, sample_count);
-        let (blurred, scratch) = blur_filter.apply_with_scratch(
+        let whole_source = source.point == (0, 0)
+            && source.size == (source.texture.width(), source.texture.height());
+        // Only a full, pixel-aligned pass can replace the old nearest read of
+        // the resolved RGBA8 result with the rounded sample at this pixel.
+        let defer_vertical = fuse_glow_enabled()
+            && !streamed_reference()
+            && whole_source
+            && format == wgpu::TextureFormat::Rgba8Unorm
+            && sample_count == 1
+            && blur_offset == (0.0, 0.0)
+            && filter.blur_x.to_f32() > 1.0
+            && filter.blur_y.to_f32() > 1.0;
+        let (blurred, scratch, last_blur) = blur_filter.apply_with_scratch(
             descriptors,
             texture_pool,
             draw_encoder,
             staging_belt,
             source,
             &filter.inner_blur_filter(),
-        ).map_or((None, None), |(blurred, scratch)| (Some(blurred), Some(scratch)));
+            defer_vertical,
+        ).map_or((None, None, None), |targets| {
+            (Some(targets.output), Some(targets.scratch), targets.deferred_uniform)
+        });
+        let pipeline = self.pipeline(descriptors, sample_count, blur_filter, last_blur.is_some());
         if let Some(blurred) = &blurred {
             blurred.ensure_cleared(draw_encoder);
         }
@@ -244,7 +296,11 @@ impl GlowFilter {
         let source_group = if !streamed_reference() && let Some(bindings) = source.bindings {
             bindings.get(descriptors, 1, || create_group(&source_view))
         } else { create_group(&source_view) };
-        let blurred_group = if !streamed_reference() && let Some(blurred) = &blurred {
+        let blurred_group = if let (Some(_), Some(target)) = (&last_blur, &blurred) {
+            target.filter_bind_group(descriptors, 0, || {
+                blur_filter.texture_group(descriptors, blurred_view)
+            })
+        } else if !streamed_reference() && let Some(blurred) = &blurred {
             blurred.filter_bind_group(descriptors, 1, || create_group(blurred_view))
         } else if blurred.is_none() { source_group.clone() }
         else { create_group(blurred_view) };
@@ -260,6 +316,9 @@ impl GlowFilter {
         render_pass.set_bind_group(0, &source_group, &[]);
         render_pass.set_bind_group(1, &blurred_group, &[]);
         render_pass.set_bind_group(2, &uniform_group, &[]);
+        if let Some(group) = &last_blur {
+            render_pass.set_bind_group(3, group, &[]);
+        }
 
         render_pass.set_vertex_buffer(0, vertices.slice(..));
         render_pass.set_index_buffer(
@@ -269,6 +328,7 @@ impl GlowFilter {
         render_pass.draw_indexed(0..6, 0, 0..1);
         drop(render_pass);
         descriptors.resource_metrics.record_work(|s| {
+            s.fused_glow_passes += u64::from(last_blur.is_some());
             s.filter_bind_group_ns += bind_ns;
             s.filter_pass_encode_ns += encode_started.elapsed().as_nanos() as u64;
         });

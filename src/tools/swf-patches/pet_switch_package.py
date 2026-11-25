@@ -42,7 +42,7 @@ def launcher(mode):
         'echo 在相同地图和窗口大小下打开背包，等待 6 秒。',
         'echo 用相同顺序和节奏切换亚比 8 次，最后一次切换后等待 6 秒，再正常关闭游戏。',
         'echo 本轮记录保存至 "%run%"',
-        '"%~dp0aola-native-test.exe" --aola-host --frame-rate 50 --aola-data-dir "%run%"',
+        '"%~dp0aola-native-test.exe" --aola-host --aola-data-dir "%run%"',
         'set "game_status=%errorlevel%"',
         f'python -B "%~dp0pet_switch_result.py" run "%run%" {mode} --game-exit "%game_status%"',
         'set "result_status=%errorlevel%"',

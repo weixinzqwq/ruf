@@ -363,7 +363,7 @@ impl<'gc> MovieLibrary<'gc> {
 
     pub fn get_sound(&self, id: CharacterId) -> Option<SoundHandle> {
         if let Some(Character::Sound(sound)) = self.characters.get(&id) {
-            Some(*sound)
+            Some(sound.handle)
         } else {
             None
         }
@@ -634,6 +634,9 @@ impl<'gc> Library<'gc> {
     }
 
     pub fn movie_inventory(&self) -> MovieLibraryInventory { self.movie_libraries.inventory }
+
+    /// Count current registrations without upgrading the weak movie handles.
+    pub(crate) fn registered_movie_count(&self) -> usize { self.movie_libraries.entries.len() }
 
     /// Called immediately after a completed collection, before starting another
     /// mark pass. Inventory/cleanup must not resurrect weakly indexed movies.

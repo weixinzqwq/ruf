@@ -290,12 +290,37 @@ pub enum RenderMask<'gc> {
     Alpha(DisplayObject<'gc>),
 }
 
+#[derive(Default, Collect)]
+#[collect(require_static)]
+struct TimelineCache {
+    quiet: Cell<bool>,
+    goto_orphan_idle: Cell<bool>,
+    // A rejected root takes the normal path until its next ordinary Enter.
+    // Mutations only need to invalidate positive proofs.
+    goto_orphan_rejected: Cell<bool>,
+}
+
+impl Clone for TimelineCache {
+    fn clone(&self) -> Self {
+        // Instantiated objects have their own children and lifecycle.
+        Self::default()
+    }
+}
+
+impl TimelineCache {
+    fn clear(&self) -> bool {
+        let quiet = self.quiet.replace(false);
+        let goto_idle = self.goto_orphan_idle.replace(false);
+        quiet || goto_idle
+    }
+}
+
 #[derive(Clone, Collect)]
 #[collect(no_drop)]
 // Ensure this always has the same alignment as its subclasses (needed for `Gc` casts).
 #[repr(align(8))]
 pub struct DisplayObjectBase<'gc> {
-    timeline_quiet: Cell<usize>,
+    timeline_cache: TimelineCache,
     cell: RefCell<DisplayObjectBaseMut>,
     parent: Lock<Option<DisplayObject<'gc>>>,
     place_frame: Cell<u16>,
@@ -372,7 +397,7 @@ struct DisplayObjectBaseMut {
 impl Default for DisplayObjectBase<'_> {
     fn default() -> Self {
         Self {
-            timeline_quiet: Cell::new(0),
+            timeline_cache: TimelineCache::default(),
             cell: RefCell::new(DisplayObjectBaseMut {
                 filters: Default::default(),
                 blend_shader: None,
@@ -407,16 +432,20 @@ impl Default for DisplayObjectBase<'_> {
 }
 
 impl<'gc> DisplayObjectBase<'gc> {
-    // The address token makes cloned display objects revalidate their new subtree.
-    pub(crate) fn timeline_quiet(&self) -> bool { self.timeline_quiet.get() == self as *const Self as usize }
-    pub(crate) fn mark_timeline_quiet(&self) { self.timeline_quiet.set(self as *const Self as usize); }
+    pub(crate) fn timeline_quiet(&self) -> bool { self.timeline_cache.quiet.get() }
+    pub(crate) fn mark_timeline_quiet(&self) { self.timeline_cache.quiet.set(true); }
+    pub(crate) fn goto_orphan_idle(&self) -> bool { self.timeline_cache.goto_orphan_idle.get() }
+    pub(crate) fn mark_goto_orphan_idle(&self) { self.timeline_cache.goto_orphan_idle.set(true); }
+    pub(crate) fn goto_orphan_rejected(&self) -> bool { self.timeline_cache.goto_orphan_rejected.get() }
+    pub(crate) fn set_goto_orphan_rejected(&self, value: bool) { self.timeline_cache.goto_orphan_rejected.set(value); }
     pub(crate) fn wake_timeline(&self) {
-        if self.timeline_quiet.replace(0) == 0 { return; }
-        crate::aoqi_work::SLEEP_WAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let was_quiet = self.timeline_quiet();
+        if !self.timeline_cache.clear() { return; }
+        if was_quiet { crate::aoqi_work::SLEEP_WAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         let mut parent = self.parent.get();
         while let Some(object) = parent {
             let base = object.base();
-            if base.timeline_quiet.replace(0) == 0 { break; }
+            if !base.timeline_cache.clear() { break; }
             parent = base.parent.get();
         }
     }
@@ -3366,10 +3395,13 @@ mod stage3_quiet_tests {
     fn stage3_cloned_objects_revalidate_and_waking_clears_the_proof() {
         let base = Box::new(DisplayObjectBase::default());
         base.mark_timeline_quiet();
+        base.mark_goto_orphan_idle();
         assert!(base.timeline_quiet());
         let cloned = Box::new((*base).clone());
         assert!(!cloned.timeline_quiet());
+        assert!(!cloned.goto_orphan_idle());
         base.wake_timeline();
         assert!(!base.timeline_quiet());
+        assert!(!base.goto_orphan_idle());
     }
 }

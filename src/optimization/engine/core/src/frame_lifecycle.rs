@@ -80,20 +80,20 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
 
     *context.frame_phase = FramePhase::Enter;
     measure(context, FrameWork::OrphanEnter, |context| {
-        OrphanManager::each_orphan_obj(context, |orphan, context| orphan.enter_frame(context));
+        OrphanManager::each_orphan_obj::<false>(context, |orphan, context| orphan.enter_frame(context));
     });
     measure(context, FrameWork::TimelineEnter, |context| stage.enter_frame(context));
 
     *context.frame_phase = FramePhase::Construct;
     measure(context, FrameWork::OrphanConstruct, |context| {
-        OrphanManager::each_orphan_obj(context, |orphan, context| orphan.construct_frame(context));
+        OrphanManager::each_orphan_obj::<false>(context, |orphan, context| orphan.construct_frame(context));
     });
     measure(context, FrameWork::TimelineConstruct, |context| stage.construct_frame(context));
     broadcast_frame_constructed(context);
 
     *context.frame_phase = FramePhase::FrameScripts;
     measure(context, FrameWork::OrphanScripts, |context| {
-        OrphanManager::each_orphan_obj(context, |orphan, context| orphan.run_frame_scripts(context));
+        OrphanManager::each_orphan_obj::<false>(context, |orphan, context| orphan.run_frame_scripts(context));
     });
     measure(context, FrameWork::ScriptTraversal, |context| stage.run_frame_scripts(context));
     measure(context, FrameWork::ScriptCleanup, run_frame_script_cleanup);
@@ -118,10 +118,11 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
 /// by a goto. This is different enough to not be worth combining into a single
 /// method with extra parameters.
 ///
-/// During a goto, we run frame construction, framescripts, and frame exits for the *entire stage*.
+/// The Flash-compatible path runs construction, scripts, and exits for the *entire stage*.
 /// This even extends to orphans - for example, calling `gotoAndStop` on an orphan will
 /// cause frame construction to get run for the *current frame* of other objects on the timeline
 /// (even if the goto was called from an enterFrame event handler).
+/// The optional MyPro-style path scopes construction and scripts to the target timeline.
 pub fn run_inner_goto_frame<'gc>(
     context: &mut UpdateContext<'gc>,
     removed_frame_scripts: &[DisplayObject<'gc>],
@@ -140,6 +141,38 @@ pub fn run_inner_goto_frame<'gc>(
     let old_phase = *context.frame_phase;
     if context.frame_profile.is_active() { context.frame_profile.stats.nested_gotos += 1; }
 
+    let target_only = match crate::goto_profile::goto_target_only_mode() {
+        "battle" => context.battle_maintenance.is_active(),
+        "all" => true,
+        _ => false,
+    };
+    if target_only && initial_clip.movie().is_action_script_3() {
+        if context.frame_profile.is_active() {
+            context.frame_profile.stats.target_only_gotos += 1;
+        }
+        // This nested frame consumes work only in its own timeline. Preserve
+        // unrelated addFrameScript registrations for the ordinary cleanup pass.
+        context.frame_script_cleanup_queue.retain(|clip| {
+            let mut ancestor = Some(DisplayObject::from(*clip));
+            while let Some(object) = ancestor {
+                if DisplayObject::ptr_eq(object, initial_clip.into())
+                    || removed_frame_scripts.iter().any(|&removed| DisplayObject::ptr_eq(object, removed))
+                {
+                    return false;
+                }
+                ancestor = object.parent();
+            }
+            true
+        });
+        *context.frame_phase = FramePhase::Construct;
+        measure(context, FrameWork::TimelineConstruct, |context| initial_clip.construct_frame(context));
+        *context.frame_phase = FramePhase::FrameScripts;
+        measure(context, FrameWork::ScriptTraversal, |context| initial_clip.run_frame_scripts(context));
+        run_removed_frame_scripts(context, removed_frame_scripts);
+        *context.frame_phase = old_phase;
+        return;
+    }
+
     // When performing goto, frame scripts behave the same as when entering a new frame
     // so no separate cleanup is performed on ones registered during frame script phase
     context.frame_script_cleanup_queue.clear();
@@ -150,9 +183,9 @@ pub fn run_inner_goto_frame<'gc>(
     *context.frame_phase = FramePhase::Construct;
     measure(context, FrameWork::OrphanConstruct, |context| {
         if leaf_fast_path {
-            OrphanManager::each_orphan_obj(context, MovieClip::construct_goto_orphan);
+            OrphanManager::each_orphan_obj::<true>(context, MovieClip::construct_goto_orphan);
         } else {
-            OrphanManager::each_orphan_obj(context, |orphan, context| orphan.construct_frame(context));
+            OrphanManager::each_orphan_obj::<true>(context, |orphan, context| orphan.construct_frame(context));
         }
     });
     measure(context, FrameWork::TimelineConstruct, |context| stage.construct_frame(context));
@@ -162,17 +195,13 @@ pub fn run_inner_goto_frame<'gc>(
     measure(context, FrameWork::ScriptTraversal, |context| stage.run_frame_scripts(context));
     measure(context, FrameWork::OrphanScripts, |context| {
         if leaf_fast_path {
-            OrphanManager::each_orphan_obj(context, MovieClip::run_goto_orphan_scripts);
+            OrphanManager::each_orphan_obj::<true>(context, MovieClip::run_goto_orphan_scripts);
         } else {
-            OrphanManager::each_orphan_obj(context, |orphan, context| orphan.run_frame_scripts(context));
+            OrphanManager::each_orphan_obj::<true>(context, |orphan, context| orphan.run_frame_scripts(context));
         }
     });
 
-    let removed_previous = context.tick_profile.goto.enter(crate::goto_profile::REMOVED_SCRIPTS);
-    for child in removed_frame_scripts {
-        child.run_frame_scripts(context);
-    }
-    context.tick_profile.goto.leave(removed_previous);
+    run_removed_frame_scripts(context, removed_frame_scripts);
 
     *context.frame_phase = FramePhase::Exit;
     broadcast_frame_exited(context);
@@ -191,6 +220,16 @@ pub fn run_inner_goto_frame<'gc>(
     });
 
     *context.frame_phase = old_phase;
+}
+
+fn run_removed_frame_scripts<'gc>(context: &mut UpdateContext<'gc>, removed: &[DisplayObject<'gc>]) {
+    let previous = context.tick_profile.goto.enter(crate::goto_profile::REMOVED_SCRIPTS);
+    let ordinary_scope = context.frame_profile.replace_ordinary_orphan_script_scope(false);
+    for child in removed {
+        child.run_frame_scripts(context);
+    }
+    context.frame_profile.replace_ordinary_orphan_script_scope(ordinary_scope);
+    context.tick_profile.goto.leave(previous);
 }
 
 /// Broadcast a `enterFrame` event to all `DisplayObject`s.
@@ -218,7 +257,7 @@ pub fn broadcast_frame_exited<'gc>(context: &mut UpdateContext<'gc>) {
 
 /// Empty the `context.frame_script_cleanup_queue` by running frame scripts for
 /// each clip in the queue.
-fn run_frame_script_cleanup<'gc>(context: &mut UpdateContext<'gc>) {
+pub(crate) fn run_frame_script_cleanup<'gc>(context: &mut UpdateContext<'gc>) {
     while let Some(clip) = context.frame_script_cleanup_queue.pop_front() {
         clip.set_has_pending_script(true);
         clip.set_last_queued_script_frame(None);

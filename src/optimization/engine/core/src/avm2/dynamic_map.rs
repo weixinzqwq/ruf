@@ -146,6 +146,10 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
         }
     }
 
+    pub fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {
+        self.table.retain(|(key, entry)| keep(key, &entry.value));
+    }
+
     // NOTE: Per the docs on `HashTable::find_bucket_index`, bucket indices are
     // "only meaningful as long as the table is not resized and no entries are
     // added or removed". The current implementation uses tombstones and never

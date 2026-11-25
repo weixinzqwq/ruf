@@ -7,7 +7,7 @@ use crate::avm2::activation::Activation;
 use crate::avm2::globals::slots::flash_media_id3info as id3_slots;
 use crate::avm2::object::script_object::ScriptObjectData;
 use crate::avm2::object::{ClassObject, Object, TObject};
-use crate::backend::audio::{AudioManager, SoundHandle};
+use crate::backend::audio::{AudioManager, RegisteredSound, SoundHandle};
 use crate::context::UpdateContext;
 use crate::display_object::SoundTransform;
 use crate::string::AvmString;
@@ -99,8 +99,7 @@ pub enum SoundData<'gc> {
         queued_plays: Vec<QueuedPlay<'gc>>,
     },
     Loaded {
-        #[collect(require_static)]
-        sound: SoundHandle,
+        sound: RegisteredSound<'gc>,
     },
 }
 
@@ -127,7 +126,7 @@ impl<'gc> SoundObject<'gc> {
         let sound_data = self.0.sound_data.borrow();
         match &*sound_data {
             SoundData::NotLoaded { .. } => None,
-            SoundData::Loaded { sound } => Some(*sound),
+            SoundData::Loaded { sound } => Some(sound.handle),
         }
     }
 
@@ -160,18 +159,18 @@ impl<'gc> SoundObject<'gc> {
                 // We don't know the length yet, so return the `SoundChannel`
                 true
             }
-            SoundData::Loaded { sound } => play_queued(queued, *sound, activation.context),
+            SoundData::Loaded { sound } => play_queued(queued, sound.handle, activation.context),
         }
     }
 
-    pub fn set_sound(self, context: &mut UpdateContext<'gc>, sound: SoundHandle) {
+    pub fn set_sound(self, context: &mut UpdateContext<'gc>, sound: RegisteredSound<'gc>) {
         let mut sound_data =
             unlock!(Gc::write(context.gc(), self.0), SoundObjectData, sound_data).borrow_mut();
 
         match &mut *sound_data {
             SoundData::NotLoaded { queued_plays } => {
                 for queued in std::mem::take(queued_plays) {
-                    play_queued(queued, sound, context);
+                    play_queued(queued, sound.handle, context);
                 }
                 *sound_data = SoundData::Loaded { sound };
             }

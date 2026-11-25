@@ -15,7 +15,7 @@ use crate::avm1::error::Error;
 use crate::avm1::function::FunctionObject;
 use crate::avm1::property_decl::{DeclContext, PropertyOrder, StaticDeclarations, SystemClass};
 use crate::avm1::{ArrayBuilder, Attribute, ExecutionReason, NativeObject, Object, Value};
-use crate::backend::audio::{SoundHandle, SoundInstanceHandle};
+use crate::backend::audio::{RegisteredSound, SoundHandle, SoundInstanceHandle};
 use crate::backend::navigator::Request;
 use crate::character::Character;
 use crate::context::UpdateContext;
@@ -115,7 +115,7 @@ pub struct Sound<'gc>(Gc<'gc, SoundData<'gc>>);
 #[collect(no_drop)]
 struct SoundData<'gc> {
     /// The sound that is attached to this object.
-    sound: Cell<Option<SoundHandle>>,
+    sound: Lock<Option<RegisteredSound<'gc>>>,
 
     /// The instance of the last played sound on this object.
     sound_instance: Cell<Option<SoundInstanceHandle>>,
@@ -155,7 +155,7 @@ impl<'gc> Sound<'gc> {
         Sound(Gc::new(
             mc,
             SoundData {
-                sound: Cell::new(None),
+                sound: Lock::new(None),
                 sound_instance: Cell::new(None),
                 target,
                 position: Cell::new(0),
@@ -174,16 +174,16 @@ impl<'gc> Sound<'gc> {
     }
 
     pub fn sound(self) -> Option<SoundHandle> {
-        self.0.sound.get()
+        self.0.sound.get().map(|sound| sound.handle)
     }
 
     pub fn set_sound(
         self,
         activation: &mut Activation<'_, 'gc>,
         sound_object: Object<'gc>,
-        sound: Option<SoundHandle>,
+        sound: Option<RegisteredSound<'gc>>,
     ) {
-        self.0.sound.set(sound);
+        unlock!(Gc::write(activation.gc(), self.0), SoundData, sound).set(sound);
 
         // `position` and `duration` are only defined when a sound is loaded.
         if !sound_object.has_property(activation, istr!("position"))
@@ -469,7 +469,7 @@ fn attach_sound<'gc>(
                 activation
                     .context
                     .audio
-                    .get_sound_duration(sound_handle)
+                    .get_sound_duration(sound_handle.handle)
                     .map(|d| d.as_millis().round() as u32),
             );
             sound.set_position(0);
@@ -889,7 +889,7 @@ fn stop<'gc>(
                 // FIXME: This isn't entirely correct. We should only
                 // stop sounds with this name on this particular sound object;
                 // right now we're stopping *all* sound objects playing this sound.
-                activation.context.stop_sounds_with_handle(sound);
+                activation.context.stop_sounds_with_handle(sound.handle);
             } else {
                 avm_warn!(activation, "Sound.stop: Sound '{}' not found", name);
             }

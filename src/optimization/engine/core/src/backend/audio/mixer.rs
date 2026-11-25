@@ -1,7 +1,10 @@
 use super::decoders::{
     self, AdpcmDecoder, Decoder, G711ALawDecoder, G711MuLawDecoder, PcmDecoder, SeekableDecoder,
 };
-use super::{SoundHandle, SoundInstanceHandle, SoundStreamInfo, SoundTransform};
+use super::{
+    SoundDefinitionStats, SoundHandle, SoundInstanceHandle, SoundOwner, SoundStreamInfo,
+    SoundTransform,
+};
 use crate::backend::audio::{DecodeError, RegisterError};
 use crate::tag_utils::SwfSlice;
 use ruffle_common::buffer::Substream;
@@ -10,6 +13,9 @@ use slotmap::SlotMap;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex, RwLock};
 use swf::AudioCompression;
+
+#[cfg(test)]
+mod tests;
 
 /// Holds the last 2048 output audio frames. Frames can be written to it one by
 /// one, and the last completely filled 1024-wide window can be read from it.
@@ -58,6 +64,8 @@ impl CircBuf {
 pub struct AudioMixer {
     /// The currently registered sounds.
     sounds: SlotMap<SoundHandle, Sound>,
+    track_definitions: bool,
+    retired_definitions: u64,
 
     /// The list of actively playing sound instances.
     sound_instances: Arc<Mutex<SlotMap<SoundInstanceHandle, SoundInstance>>>,
@@ -144,6 +152,7 @@ impl<D: Decoder> dasp::signal::Signal for DecoderStream<D> {
 ///
 /// A sound is defined by the `DefineSound` SWF tags and contains the audio data for the sound.
 struct Sound {
+    tracked: bool,
     /// The format of the sound, including sample rate and compression format.
     format: swf::SoundFormat,
 
@@ -172,7 +181,6 @@ struct Sound {
 struct SoundInstance {
     /// The handle the sound definition inside `sounds`.
     /// `None` if this is a stream sound.
-    #[expect(dead_code)]
     handle: Option<SoundHandle>,
 
     /// The audio stream. Call `next()` to yield sample frames.
@@ -243,6 +251,8 @@ impl AudioMixer {
     pub fn new(num_output_channels: u8, output_sample_rate: u32) -> Self {
         Self {
             sounds: SlotMap::with_key(),
+            track_definitions: ruffle_render::backend::aola_long_run_maintenance(),
+            retired_definitions: 0,
             sound_instances: Arc::new(Mutex::new(SlotMap::with_key())),
             volume: Arc::new(RwLock::new(1.0)),
             num_output_channels,
@@ -523,6 +533,7 @@ impl AudioMixer {
         };
 
         let sound = Sound {
+            tracked: false,
             format: swf_sound.format.clone(),
             data: Arc::from(data),
             num_sample_frames: swf_sound.num_samples,
@@ -538,6 +549,7 @@ impl AudioMixer {
         // Validate that this is actually MP3 data, and calculate duration and sample rate.
         let metadata = decoders::mp3_metadata(&data)?;
         let sound = Sound {
+            tracked: false,
             format: swf::SoundFormat {
                 compression: AudioCompression::Mp3,
                 sample_rate: metadata.sample_rate,
@@ -554,6 +566,58 @@ impl AudioMixer {
     #[cfg(not(feature = "mp3"))]
     pub fn register_mp3(&mut self, _data: &[u8]) -> Result<SoundHandle, DecodeError> {
         Err(decoders::Error::UnhandledCompression(AudioCompression::Mp3))
+    }
+
+    pub fn track_sound_definition(&mut self, handle: SoundHandle) -> Option<SoundOwner> {
+        if !self.track_definitions {
+            return None;
+        }
+        let sound = self.sounds.get_mut(handle)?;
+        sound.tracked = true;
+        Some(SoundOwner {
+            _encoded: sound.data.clone(),
+        })
+    }
+
+    pub fn retain_sound_definition(&self, handle: SoundHandle) -> Option<SoundOwner> {
+        if !self.track_definitions {
+            return None;
+        }
+        let sound = self.sounds.get(handle)?;
+        sound.tracked.then(|| SoundOwner {
+            _encoded: sound.data.clone(),
+        })
+    }
+
+    pub fn maintain_sound_definitions(&mut self) {
+        if !self.track_definitions {
+            return;
+        }
+        // Snapshot only the playback handles; never scan or drop encoded buffers
+        // under the mutex shared with the audio device.
+        let playing: Vec<_> = self.sound_instances.lock().expect("Cannot be called reentrant")
+            .values()
+            .filter_map(|instance| instance.handle)
+            .collect();
+        let before = self.sounds.len();
+        self.sounds.retain(|handle, sound| {
+            !sound.tracked || Arc::strong_count(&sound.data) > 1 || playing.contains(&handle)
+        });
+        self.retired_definitions += (before - self.sounds.len()) as u64;
+    }
+
+    pub fn sound_definition_stats(&self) -> SoundDefinitionStats {
+        let active_instances = self.sound_instances.lock().expect("Cannot be called reentrant")
+            .values()
+            .filter(|instance| instance.handle.is_some())
+            .count();
+        SoundDefinitionStats {
+            registered: self.sounds.len(),
+            tracked: self.sounds.values().filter(|sound| sound.tracked).count(),
+            encoded_bytes: self.sounds.values().map(|sound| sound.data.len() as u64).sum(),
+            active_instances,
+            retired: self.retired_definitions,
+        }
     }
 
     /// Starts a timeline audio stream.
@@ -583,7 +647,7 @@ impl AudioMixer {
         sound_handle: SoundHandle,
         settings: &swf::SoundInfo,
     ) -> Result<SoundInstanceHandle, DecodeError> {
-        let sound = &self.sounds[sound_handle];
+        let sound = self.sounds.get(sound_handle).ok_or(DecodeError::UnknownSound)?;
         let data = Cursor::new(ArcAsRef(Arc::clone(&sound.data)));
         // Create a stream that decodes and resamples the sound.
         let stream = if sound.skip_sample_frames == 0
@@ -1077,6 +1141,22 @@ macro_rules! impl_audio_mixer_backend {
         #[inline]
         fn register_mp3(&mut self, data: &[u8]) -> Result<SoundHandle, DecodeError> {
             self.$mixer.register_mp3(data)
+        }
+
+        fn track_sound_definition(&mut self, handle: SoundHandle) -> Option<$crate::backend::audio::SoundOwner> {
+            self.$mixer.track_sound_definition(handle)
+        }
+
+        fn retain_sound_definition(&self, handle: SoundHandle) -> Option<$crate::backend::audio::SoundOwner> {
+            self.$mixer.retain_sound_definition(handle)
+        }
+
+        fn maintain_sound_definitions(&mut self) {
+            self.$mixer.maintain_sound_definitions();
+        }
+
+        fn sound_definition_stats(&self) -> Option<$crate::backend::audio::SoundDefinitionStats> {
+            Some(self.$mixer.sound_definition_stats())
         }
 
         #[inline]

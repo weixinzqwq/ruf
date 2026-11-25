@@ -1,10 +1,13 @@
 //! Apply display-only edits to complete responses for exact official resource versions.
-use super::{aola_battle_edits, aola_lifecycle::decode_movie, aola_notice_edits, fetch};
+use super::{aola_backpack_edits, aola_battle_edits, aola_lifecycle::decode_movie, aola_notice_edits, fetch};
 use ruffle_core::backend::navigator::{NavigationMethod, Request, SuccessResponse};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use url::Url;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Resource { Notice, Battle, SuppliedBackpack, ArchivedBackpack }
 
 pub(super) struct Recipe {
     path: &'static str,
@@ -12,7 +15,7 @@ pub(super) struct Recipe {
     original_size: usize,
     movie_size: usize,
     edits: &'static [(usize, &'static [u8], &'static [u8])],
-    battle: bool,
+    resource: Resource,
 }
 
 pub(super) static NOTICE: Recipe = Recipe {
@@ -21,7 +24,7 @@ pub(super) static NOTICE: Recipe = Recipe {
     original_size: 221_474,
     movie_size: 0x4a41f,
     edits: aola_notice_edits::EDITS,
-    battle: false,
+    resource: Resource::Notice,
 };
 
 pub(super) static BATTLE: Recipe = Recipe {
@@ -30,16 +33,50 @@ pub(super) static BATTLE: Recipe = Recipe {
     original_size: 5_377_898,
     movie_size: 6_573_705,
     edits: aola_battle_edits::EDITS,
-    battle: true,
+    resource: Resource::Battle,
+};
+
+pub(super) static SUPPLIED_BACKPACK: Recipe = Recipe {
+    path: "/play/pet/newpetpackage",
+    version: "",
+    original_size: 1_524_996,
+    movie_size: 2_197_510,
+    edits: aola_backpack_edits::SUPPLIED_EDITS,
+    resource: Resource::SuppliedBackpack,
+};
+
+pub(super) static ARCHIVED_BACKPACK: Recipe = Recipe {
+    path: "/play/pet/newpetpackage",
+    version: "2026111953323155",
+    original_size: 1_525_161,
+    movie_size: 2_197_545,
+    edits: aola_backpack_edits::ARCHIVED_EDITS,
+    resource: Resource::ArchivedBackpack,
 };
 
 impl Recipe {
     pub(super) fn audit(&self, source: &'static str, result: &'static str) {
-        let version = self.version;
-        if self.battle {
-            tracing::info!(target: "aola_battle", source, result, version);
+        self.audit_version(source, result, self.version);
+    }
+
+    fn audit_version(&self, source: &'static str, result: &'static str, version: &str) {
+        match self.resource {
+            Resource::Notice => tracing::info!(target: "aola_notice", source, result, version),
+            Resource::Battle => tracing::info!(target: "aola_battle", source, result, version),
+            Resource::SuppliedBackpack | Resource::ArchivedBackpack => {
+                let mode = if self.resource == Resource::SuppliedBackpack { "supplied" } else { "archived" };
+                tracing::info!(target: "aola_backpack", source, result, version, mode);
+            }
+        }
+    }
+
+    fn matches_version(&self, version: &str) -> bool {
+        if self.resource == Resource::SuppliedBackpack {
+            // This reference was supplied under the official unversioned URL.
+            // Other numeric versions must still match its complete packed body.
+            version != ARCHIVED_BACKPACK.version
         } else {
-            tracing::info!(target: "aola_notice", source, result, version);
+            self.version == version
         }
     }
 
@@ -57,8 +94,10 @@ impl Recipe {
 
     pub(super) fn accepts(&self, request: &Request, url: &Url) -> bool {
         let Some(version) = self.official_version(url) else { return false };
-        if version != self.version {
-            self.audit("request", "version-mismatch");
+        if !self.matches_version(version) {
+            if !matches!(self.resource, Resource::SuppliedBackpack | Resource::ArchivedBackpack) {
+                self.audit("request", "version-mismatch");
+            }
             return false;
         }
         if request.method() != NavigationMethod::Get || request.body().is_some()
@@ -110,7 +149,12 @@ impl DisplayPatch {
     fn original(&self) -> io::Result<&[u8]> {
         self.original.get_or_init(|| {
             let mut bytes = Vec::with_capacity(self.recipe.original_size);
-            std::fs::File::open(self.root.join("original.swf"))?
+            let name = match self.recipe.resource {
+                Resource::SuppliedBackpack => "supplied.swf",
+                Resource::ArchivedBackpack => "archived.swf",
+                _ => "original.swf",
+            };
+            std::fs::File::open(self.root.join(name))?
                 .take(self.recipe.original_size as u64 + 1).read_to_end(&mut bytes)?;
             if bytes.len() != self.recipe.original_size {
                 return Err(io::Error::other("unexpected display SWF size"));
@@ -124,20 +168,20 @@ impl DisplayPatch {
             .as_deref().map_err(|error| io::Error::new(error.kind(), error.to_string()))
     }
 
-    fn select(&self, source: &'static str, bytes: &[u8]) -> Option<Vec<u8>> {
+    fn select(&self, source: &'static str, version: &str, bytes: &[u8]) -> Option<Vec<u8>> {
         let Ok(original) = self.original() else {
-            self.recipe.audit(source, "invalid-reference");
+            self.recipe.audit_version(source, "invalid-reference", version);
             return None;
         };
         if original != bytes {
-            self.recipe.audit(source, "source-mismatch");
+            self.recipe.audit_version(source, "source-mismatch", version);
             return None;
         }
         let Ok(candidate) = self.candidate() else {
-            self.recipe.audit(source, "invalid-reference");
+            self.recipe.audit_version(source, "invalid-reference", version);
             return None;
         };
-        self.recipe.audit(source, "hit");
+        self.recipe.audit_version(source, "hit", version);
         Some(candidate.to_vec())
     }
 }
@@ -147,23 +191,25 @@ pub(super) fn wrap(
 ) -> Box<dyn SuccessResponse> {
     let Some(patch) = patch else { return response };
     let recipe = patch.recipe;
-    let same = Url::parse(&response.url()).ok().is_some_and(|url| recipe.official_version(&url) == Some(recipe.version));
-    if response.status() != 200 || response.redirected() || !same {
-        recipe.audit(source, "unexpected-response");
-        return response;
+    let url = Url::parse(&response.url()).ok();
+    let version = url.as_ref().and_then(|url| recipe.official_version(url)).filter(|v| recipe.matches_version(v));
+    if let Some(version) = version && response.status() == 200 && !response.redirected() {
+        return fetch::filter_movie(response, DisplaySelection { patch, source, version: version.to_owned() });
     }
-    fetch::filter_movie(response, DisplaySelection { patch, source })
+    recipe.audit(source, "unexpected-response");
+    response
 }
 
 struct DisplaySelection {
     patch: Arc<DisplayPatch>,
     source: &'static str,
+    version: String,
 }
 
 impl fetch::MovieBodyFilter for DisplaySelection {
     async fn complete(self, bytes: Vec<u8>) -> Vec<u8> {
-        if !self.patch.recipe.battle {
-            return self.patch.select(self.source, &bytes).unwrap_or(bytes);
+        if self.patch.recipe.resource == Resource::Notice {
+            return self.patch.select(self.source, &self.version, &bytes).unwrap_or(bytes);
         }
         if bytes.len() != self.patch.recipe.original_size {
             self.fallback("source-mismatch");
@@ -175,14 +221,14 @@ impl fetch::MovieBodyFilter for DisplaySelection {
         let input = official.clone();
         let recipe = self.patch.recipe;
         let source = self.source;
-        let result = tokio::task::spawn_blocking(move || self.patch.select(source, &input)).await;
+        let result = tokio::task::spawn_blocking(move || self.patch.select(source, &self.version, &input)).await;
         result.unwrap_or_else(|_| {
             recipe.audit(source, "worker-failed");
             None
         }).unwrap_or_else(|| Arc::unwrap_or_clone(official))
     }
 
-    fn fallback(&self, reason: &'static str) { self.patch.recipe.audit(self.source, reason); }
+    fn fallback(&self, reason: &'static str) { self.patch.recipe.audit_version(self.source, reason, &self.version); }
 }
 
 #[cfg(test)]
@@ -195,7 +241,7 @@ mod tests {
 
     #[test]
     fn aola_notice_accepts_only_the_versioned_official_get() {
-        for recipe in [&NOTICE, &BATTLE] {
+        for recipe in [&NOTICE, &BATTLE, &ARCHIVED_BACKPACK] {
             let official = format!("https://aola.100bt.com{}~{}.swf", recipe.path, recipe.version);
             let url = Url::parse(&official).unwrap();
             let get = Request::get(official.clone());
@@ -212,6 +258,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn supplied_backpack_accepts_only_the_bare_or_other_numeric_official_get() {
+        let bare = "https://aola.100bt.com/play/pet/newpetpackage.swf";
+        for (url, expected) in [
+            (bare.to_owned(), true),
+            (bare.replace(".swf", "~123.swf"), true),
+            (bare.replace(".swf", "~2026111953323155.swf"), false),
+            (bare.replace(".swf", "~abc.swf"), false),
+            (bare.replace(".swf", "~.swf"), false),
+            (bare.replace("100bt.com", "100bt.com.test"), false),
+        ] {
+            let parsed = Url::parse(&url).unwrap();
+            assert_eq!(SUPPLIED_BACKPACK.accepts(&Request::get(url), &parsed), expected);
+        }
+        let parsed = Url::parse(bare).unwrap();
+        assert!(!SUPPLIED_BACKPACK.accepts(&Request::post(bare.to_owned(), None), &parsed));
+        let mut range = Request::get(bare.to_owned());
+        range.set_headers([("Range".into(), "bytes=0-99".into())].into_iter().collect());
+        assert!(!SUPPLIED_BACKPACK.accepts(&range, &parsed));
+    }
+
     #[tokio::test]
     async fn aola_battle_builds_only_for_verified_bytes_and_shares_one_candidate() {
         // ZWS envelope containing the LZMA-compressed text "synthetic battle body".
@@ -220,7 +287,7 @@ mod tests {
             64, 237, 34, 58, 211, 81, 92, 200, 157, 149, 255, 242, 199, 48, 0];
         static EXAMPLE: Recipe = Recipe {
             path: "/test", version: "1", original_size: 48, movie_size: 29,
-            edits: &[(28, b"y", b"!")], battle: true,
+            edits: &[(28, b"y", b"!")], resource: Resource::Battle,
         };
         let expected = b"FWS\x12\x1d\0\0\0synthetic battle bod!";
         let temp = tempfile::tempdir().unwrap();
@@ -228,7 +295,7 @@ mod tests {
         let patch = Arc::new(DisplayPatch::new(&EXAMPLE, temp.path()));
         assert!(patch.original.get().is_none());
 
-        let selection = || DisplaySelection { patch: patch.clone(), source: "network" };
+        let selection = || DisplaySelection { patch: patch.clone(), source: "network", version: "1".into() };
         let mut changed = original.clone();
         *changed.last_mut().unwrap() ^= 1;
         use fetch::MovieBodyFilter;

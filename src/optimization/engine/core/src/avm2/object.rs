@@ -963,6 +963,16 @@ macro_rules! define_weak_enum {
                     $( Self::$variant(o) => $strong_enum::$variant($variant(o.0.upgrade(mc)?)).into(), )*
                 }
             }
+
+            $vis fn is_dropped(self) -> bool {
+                self.erase().is_dropped()
+            }
+
+            $vis fn erase(self) -> GcWeak<'gc, ()> {
+                match self {
+                    $( Self::$variant(o) => GcWeak::erase(o.0), )*
+                }
+            }
         }
 
         impl<'gc> $strong_enum<'gc> {
@@ -972,6 +982,20 @@ macro_rules! define_weak_enum {
                 }
             }
         }
+    }
+}
+
+impl PartialEq for WeakObject<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ptr() == other.as_ptr()
+    }
+}
+
+impl Eq for WeakObject<'_> {}
+
+impl Hash for WeakObject<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_ptr().hash(state);
     }
 }
 
