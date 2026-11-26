@@ -60,12 +60,24 @@ input[type=checkbox]{width:auto;margin:0;accent-color:var(--blue)}
 textarea{resize:vertical}
 .filters{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px 12px;margin:10px 0}
 details>summary{color:var(--blue);font-size:13px;font-weight:600}
-.record{display:block;width:100%;padding:8px 5px;text-align:left;color:var(--ink);background:none;border:0;border-bottom:1px solid #e3eaf2}
-.record:hover,.record[aria-pressed=true]{background:var(--wash)}
-.record span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.record .meta{font-size:11px;color:var(--sub)}
-.list{max-height:38vh;overflow:auto;scrollbar-gutter:stable}
-.packet-row{padding:7px 2px;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
-.packet-row p{margin:3px 0;font-size:13px}
+.table-scroll{max-height:40vh;overflow:auto;border:1px solid var(--line);border-radius:5px;scrollbar-gutter:stable}
+.data-table{width:100%;border-collapse:separate;border-spacing:0;text-align:left;font-size:13px}
+.data-table th,.data-table td{padding:7px 9px;border-bottom:1px solid #e7ecf3;overflow-wrap:anywhere;vertical-align:top}
+.data-table th{position:sticky;top:0;background:#f5f7fb;color:var(--sub);font-size:12px;font-weight:600}
+.data-table tr:last-child td{border-bottom:0}
+.data-table tr[data-selectable]{cursor:pointer}
+.data-table tr[data-selectable]:hover,.data-table tr[data-selected]{background:var(--wash)}
+.data-table tr:focus-visible{outline:2px solid var(--blue);outline-offset:-2px}
+.data-table .compact{width:1%;white-space:nowrap}
+.data-table .tabular{font-variant-numeric:tabular-nums}
+.data-table .code{font:12px/1.55 "IBM Plex Mono",Consolas,monospace;white-space:pre-wrap}
+.segmented{display:inline-flex;gap:3px;padding:3px;background:#e9eef6;border-radius:7px;justify-self:start}
+.segmented .btn{background:transparent;border-color:transparent;min-width:70px}
+.segmented .btn[aria-selected=true]{background:#fff;border-color:var(--line);color:var(--blue);font-weight:600;box-shadow:0 1px 2px #20304912}
+.btn.danger{background:#b12f3e;border-color:#b12f3e;color:#fff;font-weight:600}
+.btn.danger:not(:disabled):hover{background:#952635}
+.btn[aria-pressed=true]:not(.danger){background:var(--wash);border-color:var(--blue);color:var(--blue)}
+.messages-pane{display:grid;gap:14px}
 .enemy-pet{border-top:1px solid var(--line);padding:12px 0}
 .enemy-pet h3,.enemy-pet p{margin:4px 0}
 .enemy-pet img{width:38px;height:38px;object-fit:contain;flex:none}
@@ -74,16 +86,17 @@ details>summary{color:var(--blue);font-size:13px;font-weight:600}
 .note{position:sticky;top:8px;z-index:1;margin:0 0 10px;padding:8px 10px;background:#fff3df;color:#73431c;border:1px solid #edcca0;border-radius:5px;font-size:12px;overflow-wrap:anywhere}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:32vh;overflow:auto;padding:9px;background:#f2f5fa;border-radius:4px;font:12px/1.6 "IBM Plex Mono",Consolas,monospace}
 .spaced>*+*{margin-top:9px}
-.morph-targets{grid-template-columns:repeat(3,minmax(0,1fr))}
-.rule-options{padding-top:12px;border-top:1px solid #e7ecf3}
+#morph-search{max-width:300px}
+.morph-table{min-width:500px;table-layout:fixed}
+.morph-table th:first-child{width:24%}
+.morph-entry{display:grid;grid-template-columns:minmax(76px,1.2fr) repeat(4,minmax(76px,1fr)) auto;align-items:end;gap:8px;min-width:490px;padding:2px 0}
+.morph-entry-scroll{overflow-x:auto}
+.morph-entry .field{gap:3px}
 .rule-options label{display:inline-flex;align-items:center;gap:5px}
-.rule-actions{margin-top:12px}
-#morph-recent{white-space:pre-line}
-#morph-channels+details{margin-top:9px}
+.rule-options,.morph-entry-scroll{padding-top:8px}
+.morph-import-box{padding:10px 0;border-top:1px solid #e7ecf3}
 @media(min-width:1000px){
   #overview{grid-template-columns:minmax(0,1fr) minmax(0,1.1fr)}
-  #morph{grid-template-columns:minmax(0,1.55fr) minmax(235px,1fr)}
-  .morph-editor{grid-row:span 2}
 }
 @media(max-width:700px){
   .shell{grid-template-columns:112px minmax(0,1fr)}
@@ -95,7 +108,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:32vh;overflow:auto;pa
   .rail{padding:12px 5px}.rail h1{font-size:14px;letter-spacing:0;margin:3px 0 15px;text-align:center}
   nav button{text-align:center;padding:6px 4px;font-size:13px}
   .hide-window{justify-content:center;padding:4px 0}.hide-window kbd{display:none}
-  main{padding:10px 8px 16px}.card{padding:11px 10px}.morph-targets{grid-template-columns:repeat(2,minmax(0,1fr))}
+  main{padding:10px 8px 16px}.card{padding:11px 10px}
 }
 @media(max-width:390px){
   .filters{grid-template-columns:minmax(0,1fr)}
@@ -108,8 +121,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:32vh;overflow:auto;pa
 <aside class="rail">
 <h1>功能面板</h1>
 <nav aria-label="功能导航">
-<button data-tab="overview" aria-current="page">概览</button><button data-tab="morph">形态</button><button data-tab="capture">采集</button><button data-tab="packets">抓包日志</button><button data-tab="battle">战况</button><button data-tab="settings">表现</button>
-<button data-tab="workshop">工坊</button><button data-tab="lineups">阵容</button>
+<button data-tab="overview" aria-current="page">概览</button><button data-tab="morph">形态</button><button data-tab="capture">采集</button><button data-tab="messages">消息</button><button data-tab="battle">战况</button><button data-tab="settings">表现</button><button data-tab="lineups">阵容</button>
 </nav>
 <div class="rail-footer"><button id="hide" class="hide-window" type="button" title="隐藏窗口后，可在游戏中按 F8 打开" disabled>隐藏窗口<kbd aria-hidden="true">F8</kbd></button></div>
 </aside>
@@ -124,33 +136,18 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:32vh;overflow:auto;pa
   <article class="card"><div class="row between"><h2>功能状态</h2><button class="btn small" id="refresh">刷新</button></div><dl id="capabilities"></dl></article>
 </section>
 <section id="capture" hidden>
-  <article class="card">
-    <div class="row between"><h2>记录采集</h2><button class="btn primary" id="record" disabled>开始采集</button></div>
-    <p id="capture-state" class="hint" role="status"></p>
-    <div class="filters"><label class="field">记录来源<select id="source"><option value="live">当前会话</option><option value="import">已导入文件</option></select></label>
-    <label class="field">事件类别<select id="kind"><option value="">全部</option><option value="resource">资源请求</option><option value="battle">战斗</option><option value="backpack">背包</option><option value="panel">游戏面板</option></select></label></div>
-    <div class="row between"><span class="muted" id="range"></span><button class="btn small" id="follow" disabled>暂停显示</button></div>
-    <div id="rows" class="list" aria-label="采集记录"></div><p id="empty" class="hint"></p>
-    <div class="row controls"><button class="btn small" id="first" disabled>最早</button><button class="btn small" id="back" disabled>上一页</button><button class="btn small" id="next" disabled>下一页</button><button class="btn small" id="latest" disabled>最新</button></div>
-    <div id="detail" hidden><div class="row between"><h3>记录详情</h3><button class="btn small" id="close-detail">收起详情</button></div><pre id="record-data" tabindex="0"></pre></div>
-  </article>
-  <details class="card spaced"><summary>导出与导入</summary>
-    <p class="hint">导出当前会话的选定类别。文件保存在本包的 aola-data/mypro/recordings 目录。</p>
-    <div class="filters"><label class="field">起始序号<input id="from" type="number" min="1" step="1" placeholder="最早"></label><label class="field">结束序号<input id="to" type="number" min="1" step="1" placeholder="最新"></label></div>
-    <button class="btn" id="export" disabled>导出 JSONL</button>
-    <label class="field">导入文件名<input id="file" type="text" maxlength="90" placeholder="留空读取最近一次导出"></label>
-    <button class="btn" id="import" disabled>只读导入</button><p id="job" class="hint" role="status"></p>
-  </details>
-</section>
-<section id="packets" hidden>
   <article class="card spaced">
-    <h2>抓包日志</h2>
-    <div class="row"><label><input type="checkbox" id="packet-exportable"> 仅看可导出发送记录</label>
-      <label><input type="checkbox" id="packet-retain" disabled> 保留日志</label></div>
-    <p id="packet-status" class="hint" role="status"></p>
-    <div class="list" id="packet-rows" aria-label="收发记录"></div>
-    <div class="row"><button class="btn small" id="packet-newer" disabled>上一页</button><button class="btn small" id="packet-older" disabled>下一页</button><button class="btn small" id="packet-latest" disabled>最新</button></div>
-    <label class="field" id="packet-export-result" hidden>导出的发送文本<textarea id="packet-text" rows="3" readonly></textarea></label>
+    <h2>面板采集</h2>
+    <div class="row"><button class="btn primary" id="record" aria-pressed="false" disabled>开始采集</button>
+      <button class="btn" id="capture-clear" disabled>清空列表</button>
+      <button class="btn" id="capture-copy" disabled>复制选中</button>
+      <button class="btn" id="capture-fill" disabled>填入打开游戏面板</button></div>
+    <p id="capture-state" class="hint" role="status"></p>
+    <div class="table-scroll"><table class="data-table" aria-label="面板采集记录">
+      <thead><tr><th scope="col" class="compact">时间</th><th scope="col">资源路径 (url)</th><th scope="col">类名 (cls)</th></tr></thead>
+      <tbody id="capture-rows"></tbody>
+    </table></div>
+    <p id="capture-empty" class="hint">暂无面板记录</p>
   </article>
 </section>
 <section id="battle" hidden>
@@ -183,8 +180,29 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:32vh;overflow:auto;pa
     <p class="hint" id="auto-status" role="status"></p>
   </article>
 </section>
-<section id="workshop" hidden>
-  <article class="card"><h2>打开游戏面板</h2><div id="game-panels" class="row"></div><p class="hint" id="game-panel-status" role="status"></p></article>
+<section id="messages" hidden>
+  <div class="segmented" role="tablist" aria-label="消息">
+    <button class="btn" id="messages-tab-capture" role="tab" aria-controls="messages-capture" aria-selected="true" data-message="capture">抓包</button>
+    <button class="btn" id="messages-tab-send" role="tab" aria-controls="messages-send" aria-selected="false" data-message="send" tabindex="-1">发包</button>
+  </div>
+  <div id="messages-capture" class="messages-pane" role="tabpanel" aria-labelledby="messages-tab-capture">
+    <article class="card spaced">
+      <div class="row"><button id="packet-intercept" class="btn primary" aria-pressed="false" disabled>开始拦截</button>
+        <button id="packet-copy" class="btn" disabled>复制选中</button>
+        <button id="packet-clear" class="btn" disabled>清空列表</button>
+        <button id="packet-insert" class="btn" disabled>插入到发包文本</button>
+        <button id="packet-clear-text" class="btn" disabled>清空发包文本</button>
+        <button id="packet-retain" class="btn" aria-pressed="false" disabled>保留日志</button></div>
+      <div class="table-scroll"><table class="data-table" aria-label="发送消息">
+        <thead><tr><th scope="col" class="compact"><input id="packet-select-all" type="checkbox" aria-label="全选本页消息" disabled></th><th scope="col" class="compact">类型</th><th scope="col">数据内容</th></tr></thead>
+        <tbody id="packet-rows"></tbody>
+      </table></div>
+      <p id="packet-empty" class="hint">暂无发送消息</p>
+      <div class="row" id="packet-pages" hidden><button class="btn small" id="packet-newer" disabled>较新</button><button class="btn small" id="packet-older" disabled>较早</button><button class="btn small" id="packet-latest" disabled>最新</button></div>
+      <p id="packet-status" class="hint" role="status"></p>
+    </article>
+  </div>
+  <div id="messages-send" class="messages-pane" role="tabpanel" aria-labelledby="messages-tab-send" hidden>
   <article class="card"><h2>脚本本地演练</h2>
     <label class="field">文本序列<textarea id="workshop-text" rows="6" spellcheck="false" placeholder="#time = 0.5 | #wait"></textarea></label>
     <p class="hint">用 | 分隔指令。#send 显示命令摘要，#time 推进模拟时钟，#wait 等待模拟退场。</p>
@@ -193,6 +211,13 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:32vh;overflow:auto;pa
     <div id="own-bag-action" hidden><button class="btn" id="own-bag-read">在游戏中读取自己的背包</button>
     <p class="hint" id="own-bag-status" role="status"></p></div>
   </article>
+  <article class="card"><h2>打开游戏面板</h2><div id="game-panels" class="row"></div>
+    <div class="filters"><label class="field">资源路径 (url)<input id="game-panel-url" maxlength="768"></label>
+      <label class="field">类名 (cls)<input id="game-panel-cls" maxlength="192"></label></div>
+    <button id="game-panel-open" class="btn" disabled>打开面板</button>
+    <p class="hint" id="game-panel-status" role="status"></p>
+  </article>
+  </div>
 </section>
 <section id="lineups" hidden>
   <article class="card"><div class="row between"><h2>当前背包</h2><button id="lineup-read" class="btn">重新读取</button></div>
@@ -207,35 +232,36 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:32vh;overflow:auto;pa
   </article>
 </section>
 <section id="morph" hidden>
-  <article class="card spaced morph-editor">
+  <article class="card spaced">
     <h2>亚比形态</h2>
-    <label class="field">素材映射规则<select id="morph-choice"><option value="-1">新增规则</option></select></label>
-    <div class="filters">
-      <label class="field">原素材 ID<input id="m-originalId" inputmode="numeric" maxlength="12"></label>
-      <label class="field">备注<input id="m-remark" maxlength="128"></label>
+    <input id="morph-search" type="search" placeholder="搜索内容" aria-label="搜索形态规则">
+    <div class="table-scroll"><table class="data-table morph-table" aria-label="形态映射规则">
+      <thead><tr><th scope="col">备注</th><th scope="col">原型序号</th><th scope="col">目标序号（背包）</th><th scope="col">目标序号（战斗）</th><th scope="col">目标序号（海报）</th></tr></thead>
+      <tbody id="morph-rows"></tbody>
+    </table></div>
+    <p id="morph-empty" class="hint" hidden>暂无形态规则</p>
+    <div class="row rule-options"><label><input id="morph-enabled" type="checkbox" disabled>启用形态规则</label><label><input id="morph-enemy" type="checkbox" disabled>作用敌方主体</label></div>
+    <div class="row"><button id="morph-remove" class="btn" disabled>删除选中</button>
+      <button id="morph-save" class="btn primary" disabled>保存规则</button>
+      <button id="morph-import" class="btn" aria-controls="morph-import-box" aria-expanded="false" disabled>导入配置</button>
+      <button id="morph-restore" class="btn" disabled>恢复官方</button>
+      <button id="morph-discard" class="btn small" hidden>撤销编辑</button></div>
+    <div id="morph-import-box" class="morph-import-box spaced" hidden>
+      <label class="field">规则 JSON<textarea rows="4" maxlength="200000" id="morph-json" spellcheck="false"></textarea></label>
+      <div class="row"><label class="field">JSON 文件<input id="morph-file" type="file" accept=".json,application/json"></label>
+        <button id="morph-import-apply" class="btn">应用到列表</button></div>
+      <p class="hint">支持规则数组或含 skins 的旧版配置。应用后检查列表并保存。</p>
     </div>
-    <div class="filters morph-targets">
-      <label class="field">背包目标 ID<input id="m-backpackId" inputmode="numeric" maxlength="12"></label>
-      <label class="field">战斗目标 ID<input id="m-fightId" inputmode="numeric" maxlength="12"></label>
-      <label class="field">海报目标 ID<input id="m-spskiId" inputmode="numeric" maxlength="12"></label>
-    </div>
-    <p class="hint">按外观素材 ID 匹配。目标留空时沿用官方素材。</p>
-    <div class="row"><button id="morph-add" class="btn small" disabled>加入列表</button><button id="morph-remove" class="btn small" disabled>移除所选</button></div>
-    <div class="row rule-options"><label><input id="morph-enabled" type="checkbox">启用形态规则</label><label><input id="morph-enemy" type="checkbox">作用敌方主体</label></div>
-    <p class="hint">双方的战斗头像都使用战斗目标 ID。</p>
-    <div class="row rule-actions"><button id="morph-save" class="btn primary" disabled>保存规则</button><button id="morph-discard" class="btn" disabled>撤销编辑</button></div>
     <p class="hint" id="morph-draft" role="status"></p>
+    <div class="morph-entry-scroll"><div class="morph-entry">
+      <label class="field">备注<input id="m-remark" maxlength="128" placeholder="可选" disabled></label>
+      <label class="field">原型序号<input id="m-originalId" inputmode="numeric" maxlength="12" disabled></label>
+      <label class="field">目标序号（背包）<input id="m-backpackId" inputmode="numeric" maxlength="12" placeholder="/" disabled></label>
+      <label class="field">目标序号（战斗）<input id="m-fightId" inputmode="numeric" maxlength="12" placeholder="/" disabled></label>
+      <label class="field">目标序号（海报）<input id="m-spskiId" inputmode="numeric" maxlength="12" placeholder="/" disabled></label>
+      <button id="morph-add" class="btn" disabled>加入列表</button>
+    </div></div>
   </article>
-  <article class="card">
-    <div class="row between"><h2>应用状态</h2><button class="btn small" id="morph-restore" disabled>恢复官方</button></div>
-    <p class="hint" id="morph-status" role="status">正在读取规则…</p>
-    <dl id="morph-channels"></dl>
-    <details><summary>最近的素材 ID</summary><p class="hint" id="morph-recent"></p></details>
-  </article>
-  <details class="card spaced"><summary>导入 MyPro 规则</summary>
-    <label class="field">规则 JSON<textarea rows="5" maxlength="200000" id="morph-json" spellcheck="false" placeholder='[{"originalId":"…","fightId":"…"}]'></textarea></label>
-    <button id="morph-import" class="btn" disabled>替换编辑列表</button><p class="hint">支持规则数组或含 skins 数组的对象。核对列表后点击保存。</p>
-  </details>
 </section>
 </main>
 </div>
@@ -244,14 +270,15 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:32vh;overflow:auto;pa
 const $ = id => document.getElementById(id);
 const pending = new Map();
 let requestNo = 0, snapshot = null, activeTab = "overview", visible = true, epoch = 0;
-let page = null, after, previous = [], following = true, selected = null, captureQuery = 0, jobId = null;
-let packetAfter, packetNext, packetHistory=[], packetQuery=0, pendingRetention=null, sessionVersion=0, refreshAgain=false;
+let sessionVersion=0, refreshAgain=false, activeMessageTab="capture";
+let capturePage=null, captureSelected=null, captureQuery=0, captureWriting=false;
+let packetPage=null, packetAfter, packetHistory=[], packetQuery=0, packetWriting=false, pendingRetention=null;
+const packetSelected=new Set();
 const commandLabels = {
-  "session.pause":"暂停播放","session.resume":"继续播放","capture.page":"采集记录","capture.configure":"采集开关",
-  "capture.export":"记录导出","capture.import":"只读导入","packets.page":"抓包日志","battle.snapshot":"战斗记录","settings.patch":"游戏表现",
-  "workshop.validate":"工坊脚本","morph.rules.read":"形态规则","lineups.read":"阵容","assets.list":"本地资源"
+  "session.pause":"暂停播放","session.resume":"继续播放","panel_capture.list":"面板采集",
+  "packets.page":"消息抓包","battle.snapshot":"战斗记录","settings.patch":"游戏表现",
+  "workshop.validate":"发包演练","morph.rules.read":"形态规则","lineups.read":"阵容","assets.list":"本地资源"
 };
-const kinds = {resource:"资源请求",battle:"战斗",backpack:"背包",panel:"游戏面板"};
 const cap = cmd => snapshot?.capabilities?.[cmd]?.available === true;
 function notify(message) { $("notice").textContent = message; $("notice").hidden = !message; }
 function operation(action) {
@@ -280,8 +307,9 @@ window.myproReceive = msg => {
   if (!msg || msg.bridgeGeneration !== window.myproGeneration || (msg.protocolVersion!=null && msg.protocolVersion!==1)) return;
   if(msg.kind==="event") {
     if(msg.event==="session.changed") {
-      ++sessionVersion; ++epoch; resetPackets(); resetBattle(); resetAuto(); resetWorkshop(); resetGameTools();
-      if (busy) refreshAgain=true; else void refresh(true);
+      ++sessionVersion; ++epoch; ++morphRequest;
+      resetCapture(); resetPackets(); resetBattle(); resetAuto(); resetWorkshop(); resetGameTools();
+      if (busy) refreshAgain=true; else void refresh();
     }
     return;
   }
@@ -296,6 +324,37 @@ function setButton(id, enabled, reason) {
   const node = $(id); node.disabled = !enabled; node.title = enabled ? "" : reason || "";
 }
 function statusState(id,text,on) { $(id).textContent=text; $(id).dataset.on=String(Boolean(on)); }
+function tableCell(value, className="") {
+  const cell=document.createElement("td");
+  cell.textContent=value;
+  cell.className=className;
+  return cell;
+}
+function selectableRow(row, action) {
+  row.dataset.selectable="";
+  row.tabIndex=0;
+  row.onclick=action;
+  row.onkeydown=event=>{
+    if(event.key==="Enter" || event.key===" "){event.preventDefault(); action();}
+  };
+}
+async function copyText(text) {
+  if(navigator.clipboard?.writeText) {
+    try { await navigator.clipboard.writeText(text); return; } catch (_) {}
+  }
+  const input=document.createElement("textarea"), focus=document.activeElement;
+  input.value=text;
+  input.style.position="fixed";
+  input.style.opacity="0";
+  document.body.append(input);
+  try {
+    input.select();
+    if(!document.execCommand("copy")) throw new Error("未能写入剪贴板。");
+  } finally {
+    input.remove();
+    focus?.focus();
+  }
+}
 function showOverview() {
   if (!snapshot) return;
   const s=snapshot, playCommand=s.playing ? "session.pause" : "session.resume";
@@ -313,15 +372,13 @@ function showOverview() {
     line.append(dt,dd); facts.push(line);
   }
   $("capabilities").replaceChildren(...facts);
-  for (const [id,name] of [["export","capture.export"],["import","capture.import"]]) setButton(id,!jobId && cap(name),s.capabilities?.[name]?.reason);
 }
 async function updateSession() {
   const version=sessionVersion;
   const s=await command("app.snapshot");
   if(version!==sessionVersion) return false;
   if (snapshot && snapshot.sessionId !== s.sessionId) {
-    resetPackets(); resetBattle();
-    resetPage(); page=null; jobId=null; $("rows").replaceChildren(); $("job").textContent="";
+    resetCapture(); resetPackets(); resetBattle(); resetWorkshop(); resetGameTools();
     $("battle-state").textContent="等待读取"; ++epoch; ++morphRequest; ++settingsQuery;
   }
   snapshot=s; showOverview(); return true;
@@ -344,7 +401,7 @@ function showOwnBagRead(result) {
     result.stage==="ready" && result.current ? "已核对当前背包，共 "+result.current.pets.length+" 只亚比" :
     result.message || "请在战外打开自己的背包";
 }
-$("workshop-text").oninput=clearOwnBagAction;
+$("workshop-text").oninput=()=>{clearOwnBagAction(); updatePacketControls();};
 $("own-bag-read").onclick=operation(async()=>{
   const text=ownBagText,version=sessionVersion;
   if(!text || text!==$("workshop-text").value) return;
@@ -361,6 +418,8 @@ function resetGameTools() {
   clearOwnBagAction();
   $("workshop-steps").replaceChildren();
   $("game-panel-status").textContent=""; $("theme-status").textContent="";
+  $("game-panel-url").value=""; $("game-panel-cls").value="";
+  gamePanelEntries=[]; updateGamePanelOpen();
   $("lineup-name").value=""; showLineup(null);
 }
 function selectOptions(id, entries) {
@@ -416,6 +475,7 @@ function resetWorkshop(message="") {
   rehearsal=null; ++workshopVersion;
   $("workshop-status").textContent=message; $("workshop-next").hidden=true; $("workshop-stop").hidden=true;
   $("workshop-run").disabled=!cap("workshop.validate"); $("workshop-text").disabled=false;
+  updatePacketControls();
 }
 function advanceWorkshop() {
   while(rehearsal && rehearsal.at<rehearsal.steps.length) {
@@ -438,6 +498,7 @@ $("workshop-run").onclick=operation(async()=>{
   clearOwnBagAction();
   const id=++workshopVersion; $("workshop-steps").replaceChildren(); $("workshop-status").textContent="";
   $("workshop-run").disabled=true; $("workshop-text").disabled=true;
+  updatePacketControls();
   try {
     const result=await command("workshop.validate",{text:$("workshop-text").value});
     if(id!==workshopVersion) return;
@@ -450,6 +511,24 @@ $("workshop-run").onclick=operation(async()=>{
 });
 $("workshop-stop").onclick=()=>resetWorkshop("演练已停止");
 $("workshop-next").onclick=()=>{ if(rehearsal){$("workshop-next").hidden=true; advanceWorkshop();} };
+let gamePanelEntries=[];
+function enteredGamePanel() {
+  return {url:$("game-panel-url").value.trim(),cls:$("game-panel-cls").value.trim()};
+}
+function updateGamePanelOpen() {
+  const {url,cls}=enteredGamePanel();
+  const allowed=gamePanelEntries.some(panel=>panel.url===url && panel.cls===cls);
+  setButton("game-panel-open",cap("game.panel.open") && allowed,
+    url && cls && !allowed ? "这组资源路径与类名暂未收录为可打开面板" : "");
+}
+async function openGamePanel(payload) {
+  const version=sessionVersion;
+  const result=await command("game.panel.open",payload);
+  if(version===sessionVersion) $("game-panel-status").textContent=result.message ||
+    ({requested:"游戏已受理面板请求",blocked:"请在战斗结束后打开面板",failed:"游戏加载面板失败"}[result.status] || "等待游戏面板服务就绪");
+}
+$("game-panel-open").onclick=operation(()=>openGamePanel(enteredGamePanel()));
+for(const id of ["game-panel-url","game-panel-cls"]) $(id).oninput=updateGamePanelOpen;
 async function readGamePanels() {
   $("workshop-run").disabled=$("workshop-text").disabled || !cap("workshop.validate");
   const version=sessionVersion;
@@ -458,9 +537,13 @@ async function readGamePanels() {
     if(version===sessionVersion && text===ownBagText) showOwnBagRead(ownBagCapture && result.captureId!==ownBagCapture ?
       {stage:"unavailable",message:"本次背包读取已结束或切换"} : result);
   }
-  if(!cap("game.panels")){$("game-panels").replaceChildren();delete $("game-panels").dataset.items;return;}
+  if(!cap("game.panels")){
+    gamePanelEntries=[]; updateGamePanelOpen();
+    $("game-panels").replaceChildren(); delete $("game-panels").dataset.items; return;
+  }
   const {panels}=await command("game.panels");
   if(version!==sessionVersion) return;
+  gamePanelEntries=panels; updateGamePanelOpen();
   const container=$("game-panels");
   const signature=JSON.stringify([cap("game.panel.open"),panels]);
   if(signature===container.dataset.items) return;
@@ -468,11 +551,7 @@ async function readGamePanels() {
   container.replaceChildren(...panels.map(p=>{
     const button=document.createElement("button"); button.className="btn"; button.textContent=p.name;
     button.disabled=!cap("game.panel.open");
-    button.onclick=operation(async()=>{
-      const generation=sessionVersion; const result=await command("game.panel.open",{id:p.id});
-      if(generation===sessionVersion) $("game-panel-status").textContent=result.message ||
-        ({requested:"游戏已受理面板请求",blocked:"请在战斗结束后打开面板",failed:"游戏加载面板失败"}[result.status] || "等待游戏面板服务就绪");
-    });
+    button.onclick=operation(()=>openGamePanel({id:p.id}));
     return button;
   }));
 }
@@ -575,9 +654,9 @@ async function readSettings() {
   }
   showSettings();
 }
-const morphKeys=["originalId","remark","backpackId","fightId","spskiId"];
-const channelNames={body:"战斗主体",backpack:"背包模型",portrait:"海报"};
-let morph=null, draft=null, morphDirty=false, formDirty=false, writingMorph=false, afterSave=false, morphRequest=0;
+const morphKeys=["remark","originalId","backpackId","fightId","spskiId"];
+let morph=null, draft=null, morphSelected=-1, morphDirty=false, formDirty=false;
+let writingMorph=false, afterSave=false, morphRequest=0;
 function formRule(row) {
   const result={};
   for(const key of morphKeys) {
@@ -594,127 +673,310 @@ function formRule(row) {
   }
   return result;
 }
-function loadForm() {
-  const i=Number($("morph-choice").value), rule=draft?.rules[i];
+function fillMorphForm(index=-1) {
+  morphSelected=index;
+  const rule=draft?.rules[index];
   for(const key of morphKeys) $("m-"+key).value=rule?.[key]==="/" ? "" : rule?.[key] ?? "";
-  formDirty=false; updateMorphButtons();
+  formDirty=false;
+  for(const row of $("morph-rows").rows) row.toggleAttribute("data-selected",Number(row.dataset.index)===index);
+  updateMorphButtons();
 }
-function choices(selected=-1) {
-  const options=[new Option("新增规则","-1")];
-  draft.rules.forEach((r,i)=>options.push(new Option((r.remark ? r.remark+" · " : "")+r.originalId,String(i))));
-  $("morph-choice").replaceChildren(...options);
-  $("morph-choice").value=String(selected); loadForm();
+function includesMorphSearch(rule) {
+  const query=$("morph-search").value.trim().toLowerCase();
+  return morphKeys.some(key=>String(rule[key] ?? "").toLowerCase().includes(query));
+}
+function renderMorphRows() {
+  const rows=(draft?.rules || []).flatMap((rule,index)=>{
+    if(!includesMorphSearch(rule)) return [];
+    const row=document.createElement("tr");
+    row.dataset.index=String(index);
+    row.toggleAttribute("data-selected",index===morphSelected);
+    row.append(...morphKeys.map(key=>tableCell(rule[key] ?? (key==="remark" ? "" : "/"),
+      key==="remark" ? "" : "tabular")));
+    selectableRow(row,()=>{
+      if(!canEditMorph()) return;
+      if(formDirty){notify("请先将当前录入加入列表，或撤销编辑。");return;}
+      fillMorphForm(morphSelected===index ? -1 : index);
+    });
+    return [row];
+  });
+  $("morph-rows").replaceChildren(...rows);
+  $("morph-empty").hidden=rows.length>0 || !draft;
+  $("morph-empty").textContent=draft?.rules.length ? "没有匹配的规则" : "暂无形态规则";
+  updateMorphButtons();
 }
 function resetMorph() {
-  draft={revision:morph.revision,rules:morph.rules.map(r=>({...r}))};
-  morphDirty=false; formDirty=false;
-  $("morph-enabled").checked=Boolean(morph.enabled); $("morph-enemy").checked=Boolean(morph.enemy);
-  choices(); updateMorphButtons();
+  draft={revision:morph.revision,rules:morph.rules.map(rule=>({...rule}))};
+  morphDirty=false;
+  $("morph-enabled").checked=Boolean(morph.enabled);
+  $("morph-enemy").checked=Boolean(morph.enemy);
+  fillMorphForm();
+  renderMorphRows();
+}
+function canEditMorph() {
+  return Boolean(draft && morph && !writingMorph && !["loading","saving"].includes(morph.stage) &&
+      draft.revision===morph.revision && cap("morph.rules.replace"));
 }
 function updateMorphButtons() {
-  const modifiable=Boolean(draft && !writingMorph && morph.stage!=="saving" && morph.stage!=="loading" && cap("morph.rules.replace"));
-  const existing=Number($("morph-choice").value)>=0;
-  $("morph-add").textContent=existing ? "更新这一条" : "加入列表";
-  setButton("morph-remove",modifiable && existing);
-  setButton("morph-add",modifiable && formDirty);
-  setButton("morph-import",modifiable);
+  const editing=canEditMorph(), existing=draft?.rules[morphSelected], dirty=morphDirty || formDirty;
+  $("morph-add").textContent=existing ? "更新选中" : "加入列表";
+  setButton("morph-remove",editing && Boolean(existing) && includesMorphSearch(existing));
+  setButton("morph-add",editing && formDirty);
+  setButton("morph-import",editing);
+  setButton("morph-import-apply",editing);
   setButton("morph-restore",Boolean(morph && !writingMorph && morph.stage==="ready" && cap("morph.restore")));
-  setButton("morph-save",modifiable && (morphDirty || formDirty) && draft.revision===morph.revision);
-  setButton("morph-discard",!writingMorph && Boolean(morph) && (morphDirty || formDirty));
-  $("morph-enabled").disabled=$("morph-enemy").disabled=!modifiable;
-  for(const key of morphKeys) $("m-"+key).disabled=!modifiable;
-  $("morph-choice").disabled=!modifiable || formDirty;
-  $("morph-draft").textContent=draft ? (draft.revision!==morph.revision ? "规则版本已变化，请撤销编辑并重新核对。" :
-    draft.rules.length+" 条规则"+(morphDirty || formDirty ? " · 有未保存更改" : "")) : "";
-}
-function showMorph() {
-  if(!morph){$("morph-status").textContent=snapshot?.capabilities?.["morph.rules.read"]?.reason || "当前核心未提供形态规则。";$("morph-recent").textContent="尚未收到素材查询。";$("morph-channels").replaceChildren();updateMorphButtons();return;}
-  const status={loading:"正在读取规则…",saving:"正在保存规则…",failed:morph.error || "规则保存失败。"};
-  $("morph-status").textContent=status[morph.stage] || ("已保存版本 "+morph.revision+" · 战斗规则版本 "+morph.activeRevision+
-    (morph.battleBound && morph.revision!==morph.activeRevision ? " · 下场战斗应用新规则" : "")+" · 背包在下次展示时读取");
-  const nodes=[];
-  for(const [key,name] of Object.entries(channelNames)){
-    const ch=morph.capabilities?.[key];
-    const line=document.createElement("div"),term=document.createElement("dt"),value=document.createElement("dd");
-    term.textContent=name;
-    value.textContent=!ch?.available ? (ch?.reason || "未就绪") :
-      Number.isSafeInteger(morph.hits?.[key]) ? "替换分片 "+morph.hits[key]+" 次" : "可用";
-    line.append(term,value);nodes.push(line);
-  }
-  $("morph-channels").replaceChildren(...nodes);
-  const states={original:"沿用官方",unavailable:"目标素材失败，已回退",selected:"已交付替换素材"};
-  const recent=(morph.recent || []).slice(0,24).map(r=>{
-    const side=r.kind==="body" ? (r.face ? "敌方" : "己方") : "";
-    const mapped=r.target>0 && r.target!==r.source ? " → "+r.target : "";
-    return side+(channelNames[r.kind]||"素材")+" "+r.source+mapped+" · "+(states[r.state]||"状态未知");
-  });
-  $("morph-recent").textContent=recent.join("\n") || "尚未收到素材查询。";
-  if(Number(morph.hits?.waiting)>0)$("morph-status").textContent+=" · 回退 "+morph.hits.waiting+" 次";
-  updateMorphButtons();
+  setButton("morph-save",editing && dirty);
+  $("morph-discard").hidden=!dirty;
+  setButton("morph-discard",!writingMorph && Boolean(morph) && morph.stage!=="saving");
+  $("morph-enabled").disabled=$("morph-enemy").disabled=$("morph-file").disabled=!editing;
+  for(const key of morphKeys) $("m-"+key).disabled=!editing;
+  let status="";
+  if(!morph || morph.stage==="loading") status=cap("morph.rules.read") ? "正在读取规则…" :
+    snapshot?.capabilities?.["morph.rules.read"]?.reason || "当前核心未提供形态规则。";
+  else if(writingMorph || morph.stage==="saving") status="正在保存规则…";
+  else if(morph.stage==="failed") status=morph.error || "规则保存失败。";
+  else if(draft?.revision!==morph.revision) status="规则版本已变化，请撤销编辑并重新核对。";
+  else if(dirty) status=draft.rules.length+" 条规则 · 有未保存更改";
+  else if(morph.battleBound && morph.revision!==morph.activeRevision) status="已保存，下场战斗应用新规则";
+  else if(draft) status=draft.rules.length+" 条规则";
+  $("morph-draft").textContent=status;
 }
 async function readMorph() {
   if(!writingMorph && cap("morph.rules.read")) {
-    const q=++morphRequest, next=await command("morph.rules.read");if(q!==morphRequest)return;
+    const q=++morphRequest, next=await command("morph.rules.read");
+    if(q!==morphRequest) return;
     morph=next;
     if(afterSave && morph.stage==="failed") afterSave=false;
-    if(afterSave && morph.stage==="ready") {afterSave=false;resetMorph();}
-    else if(!draft || (draft.revision!==morph.revision && !morphDirty && !formDirty)) resetMorph();
+    if(morph.stage!=="loading" && (afterSave && morph.stage==="ready" || !draft ||
+        draft.revision!==morph.revision && !morphDirty && !formDirty)) {
+      afterSave=false;
+      resetMorph();
+    }
   }
-  showMorph();
+  updateMorphButtons();
 }
 function applyForm() {
-  const i=Number($("morph-choice").value),row=formRule(Object.fromEntries(morphKeys.map(k=>[k,$("m-"+k).value.trim()])));
-  if(draft.rules.some((r,n)=>n!==i && r.originalId===row.originalId)) throw new Error("列表中已有该原素材 ID。");
-  if(i<0 && draft.rules.length>=500) throw new Error("最多保存 500 条规则。");
-  if(i<0) draft.rules.push(row);else draft.rules[i]=row;
-  morphDirty=true;choices(i<0 ? draft.rules.length-1 : i);
+  const row=formRule(Object.fromEntries(morphKeys.map(key=>[key,$("m-"+key).value.trim()])));
+  if(draft.rules.some((rule,index)=>index!==morphSelected && rule.originalId===row.originalId))
+    throw new Error("列表中已有该原型序号。");
+  if(morphSelected<0) {
+    if(draft.rules.length>=500) throw new Error("最多保存 500 条规则。");
+    draft.rules.push(row);
+  } else draft.rules[morphSelected]=row;
+  if(!includesMorphSearch(row)) $("morph-search").value="";
+  morphDirty=true;
+  fillMorphForm(morphSelected);
+  renderMorphRows();
 }
 async function commitMorph(restore) {
-  if(writingMorph)return;
-  if(restore && (formDirty || morphDirty)) throw new Error("请先保存或撤销当前编辑，再恢复官方。");
+  if(writingMorph) return;
+  if(restore && (morphDirty || formDirty)) throw new Error("请先保存或撤销当前编辑，再恢复官方。");
   if(!restore && formDirty) applyForm();
-  writingMorph=true;++morphRequest;updateMorphButtons();
+  writingMorph=true; ++morphRequest; updateMorphButtons();
   try {
-    const payload=restore ? {expectedRevision:morph.revision} : {expectedRevision:draft.revision,rules:draft.rules,enabled:$("morph-enabled").checked,enemy:$("morph-enemy").checked};
+    const payload=restore ? {expectedRevision:morph.revision} :
+      {expectedRevision:draft.revision,rules:draft.rules,enabled:$("morph-enabled").checked,enemy:$("morph-enemy").checked};
     morph=await command(restore ? "morph.restore" : "morph.rules.replace",payload);
     if(morph.stage==="failed") throw new Error(morph.error || "保存失败。");
     if(morph.stage==="saving") afterSave=true; else resetMorph();
   } finally {writingMorph=false;await readMorph();}
 }
-$("morph-choice").onchange=loadForm;
+function toggleMorphImport(open) {
+  $("morph-import-box").hidden=!open;
+  $("morph-import").setAttribute("aria-expanded",String(open));
+  if(open) $("morph-json").focus();
+}
+function importMorph(text) {
+  let data;
+  try { data=JSON.parse(text); } catch (_) { throw new Error("规则 JSON 解析失败。"); }
+  const list=Array.isArray(data) ? data : data?.skins;
+  if(!Array.isArray(list) || list.length>500) throw new Error("请输入最多 500 条规则的数组，或含 skins 数组的对象。");
+  const imported=list.map((row,index)=>{
+    try { return formRule(row); } catch (_) { throw new Error("第 "+(index+1)+" 条规则的序号或备注无效。"); }
+  });
+  if(new Set(imported.map(row=>row.originalId)).size!==imported.length) throw new Error("导入列表含重复的原型序号。");
+  draft.rules=imported; morphDirty=true; $("morph-search").value="";
+  fillMorphForm(); renderMorphRows(); toggleMorphImport(false);
+}
+$("morph-search").oninput=renderMorphRows;
 for(const key of morphKeys) $("m-"+key).oninput=()=>{formDirty=true;updateMorphButtons();};
 for(const id of ["morph-enabled","morph-enemy"]) $(id).onchange=()=>{morphDirty=true;updateMorphButtons();};
-$("morph-add").onclick=operation(async()=>applyForm());
-$("morph-save").onclick=operation(()=>commitMorph(false));$("morph-restore").onclick=operation(()=>commitMorph(true));
-$("morph-discard").onclick=operation(async()=>resetMorph());
-$("morph-remove").onclick=operation(async()=>{const i=Number($("morph-choice").value);if(i>=0){draft.rules.splice(i,1);morphDirty=true;choices();}});
-$("morph-import").onclick=operation(async()=>{
-  let data; try{data=JSON.parse($("morph-json").value);}catch{throw new Error("规则 JSON 解析失败。");}
-  const list=Array.isArray(data) ? data : data?.skins;
-  if(!Array.isArray(list) || list.length>500)throw new Error("请输入最多 500 条规则的数组，或含 skins 数组的对象。");
-  const imported=list.map((r,i)=>{try{return formRule(r);}catch{throw new Error("第 "+(i+1)+" 条规则的 ID 或备注无效。");}});
-  if(new Set(imported.map(r=>r.originalId)).size!==imported.length)throw new Error("导入列表含重复的原素材 ID。");
-  draft.rules=imported;morphDirty=true;choices();$("morph-json").value="";
+$("morph-add").onclick=operation(()=>applyForm());
+$("morph-save").onclick=operation(()=>commitMorph(false));
+$("morph-restore").onclick=operation(()=>commitMorph(true));
+$("morph-discard").onclick=()=>resetMorph();
+$("morph-remove").onclick=()=>{
+  if(morphSelected<0) return;
+  draft.rules.splice(morphSelected,1); morphDirty=true;
+  fillMorphForm(); renderMorphRows();
+};
+$("morph-import").onclick=()=>toggleMorphImport($("morph-import-box").hidden);
+$("morph-import-apply").onclick=operation(()=>{
+  importMorph($("morph-json").value);
+  $("morph-json").value="";
 });
-function resetPackets() {
-  ++packetQuery; packetAfter=undefined; packetNext=null; packetHistory=[]; pendingRetention=null;
-  $("packet-rows").replaceChildren(); $("packet-status").textContent="";
-  $("packet-export-result").hidden=true; $("packet-text").value="";
-  $("packet-retain").checked=false;
-  for (const id of ["packet-retain","packet-newer","packet-older","packet-latest"]) setButton(id,false);
+$("morph-file").onchange=operation(async()=>{
+  const picker=$("morph-file"), file=picker.files[0];
+  if(!file) return;
+  picker.value="";
+  if(file.size>512*1024) throw new Error("规则文件超过 512 KiB。");
+  const targetDraft=draft, version=sessionVersion, text=await file.text();
+  if(targetDraft===draft && version===sessionVersion && canEditMorph()) importMorph(text);
+});
+
+function updateCaptureControls() {
+  const on=Boolean(capturePage?.enabled), selected=Boolean(captureSelected), ready=Boolean(capturePage);
+  $("record").textContent=on ? "暂停采集" : "开始采集";
+  $("record").setAttribute("aria-pressed",String(on));
+  setButton("record",ready && !captureWriting && cap("panel_capture.toggle"));
+  setButton("capture-clear",!captureWriting && Boolean(capturePage?.rows.length) && cap("panel_capture.clear"));
+  setButton("capture-copy",selected);
+  setButton("capture-fill",selected);
 }
-async function readPackets() {
-  if(!cap("packets.page")) { $("packet-status").textContent="当前播放器未提供抓包记录"; return; }
-  const request=++packetQuery, view=epoch;
-  const data=await command("packets.page",{after:packetAfter,limit:25,exportableOnly:$("packet-exportable").checked});
-  if(request!==packetQuery || view!==epoch || activeTab!=="packets") return;
-  packetNext=data.nextAfter;
-  setButton("packet-older",packetNext!=null); setButton("packet-newer",packetHistory.length>0);
+function resetCapture() {
+  ++captureQuery;
+  capturePage=null; captureSelected=null; captureWriting=false;
+  $("capture-rows").replaceChildren(); delete $("capture-rows").dataset.seqs;
+  $("capture-state").textContent="";
+  $("capture-empty").hidden=false; updateCaptureControls();
+}
+function renderCapture(data) {
+  const rows=data.rows || [];
+  capturePage={...data,rows};
+  const body=$("capture-rows"), signature=rows.map(row=>row.seq).join(",");
+  if(captureSelected && !rows.some(row=>row.seq===captureSelected.seq)) captureSelected=null;
+  if(signature!==body.dataset.seqs) {
+    const scroll=body.closest(".table-scroll"), following=scroll.scrollHeight-scroll.scrollTop-scroll.clientHeight<8;
+    body.dataset.seqs=signature;
+    body.replaceChildren(...rows.map(record=>{
+      const row=document.createElement("tr");
+      row.dataset.seq=String(record.seq);
+      row.toggleAttribute("data-selected",record.seq===captureSelected?.seq);
+      row.append(tableCell(timeLabel(record.timeMs),"compact"),tableCell(record.url,"code"),tableCell(record.cls,"code"));
+      selectableRow(row,()=>{
+        captureSelected=record;
+        for(const item of body.rows) item.toggleAttribute("data-selected",item===row);
+        updateCaptureControls();
+      });
+      return row;
+    }));
+    if(following) scroll.scrollTop=scroll.scrollHeight;
+  }
+  $("capture-empty").hidden=rows.length>0;
+  $("capture-state").textContent=(data.enabled ? "正在采集" : "采集已暂停")+" · "+rows.length+" 条"+
+    (data.dropped ? " · 已移出 "+data.dropped+" 条旧记录" : "");
+  updateCaptureControls();
+}
+async function readCapture() {
+  if(!cap("panel_capture.list")){
+    $("capture-state").textContent=snapshot?.capabilities?.["panel_capture.list"]?.reason || "当前核心未提供面板采集。";
+    return;
+  }
+  if(captureWriting) return;
+  const query=++captureQuery, version=sessionVersion, data=await command("panel_capture.list");
+  if(query===captureQuery && version===sessionVersion && activeTab==="capture") renderCapture(data);
+}
+async function changeCapture(name,payload={}) {
+  const version=sessionVersion;
+  if(captureWriting) return;
+  captureWriting=true; ++captureQuery; updateCaptureControls();
+  try {
+    const result=await command("panel_capture."+name,payload);
+    if(version===sessionVersion) {
+      if(name==="clear") renderCapture({enabled:result.enabled,rows:[],dropped:0});
+      else renderCapture({...capturePage,enabled:result.enabled});
+    }
+  } finally {
+    if(version===sessionVersion) {
+      captureWriting=false; updateCaptureControls();
+      if(activeTab==="capture") await readCapture();
+    }
+  }
+}
+$("record").onclick=operation(()=>changeCapture("toggle",{enabled:!capturePage?.enabled}));
+$("capture-clear").onclick=operation(()=>changeCapture("clear"));
+$("capture-copy").onclick=operation(async()=>{
+  await copyText(captureSelected.url+"\t"+captureSelected.cls);
+  notify("已复制资源路径和类名。");
+});
+$("capture-fill").onclick=()=>{
+  $("game-panel-url").value=captureSelected.url;
+  $("game-panel-cls").value=captureSelected.cls;
+  $("game-panel-status").textContent="";
+  setMessageTab("send",false); activate("messages");
+  updateGamePanelOpen();
+  $("game-panel-url").focus();
+};
+
+function visiblePackets() {
+  return packetPage?.rows || [];
+}
+function updatePacketControls() {
+  const rows=visiblePackets(), selectable=rows.filter(row=>row.data!=null);
+  const selected=selectable.filter(row=>packetSelected.has(row.seq));
+  const all=$("packet-select-all"), intercept=Boolean(packetPage?.interceptEnabled);
+  const retaining=pendingRetention ?? Boolean(packetPage?.retaining);
+  $("packet-intercept").textContent=intercept ? "停止拦截" : "开始拦截";
+  $("packet-intercept").classList.toggle("danger",intercept);
+  $("packet-intercept").setAttribute("aria-pressed",String(intercept));
+  $("packet-retain").textContent=retaining ? "停止保留日志" : "保留日志";
+  $("packet-retain").setAttribute("aria-pressed",String(retaining));
+  setButton("packet-retain",Boolean(packetPage) && cap("packets.retain.set") && !packetWriting &&
+    pendingRetention===null && !packetPage?.logPending);
+  setButton("packet-intercept",Boolean(packetPage) && cap("packets.intercept.set") && !packetWriting);
+  setButton("packet-clear",Boolean(packetPage?.newestSeq ?? rows.length) && cap("packets.clear") && !packetWriting);
+  setButton("packet-copy",selected.length>0 && !packetWriting);
+  setButton("packet-insert",selected.length>0 && selected.every(row=>row.exportable) &&
+    cap("packets.export") && !packetWriting && !$("workshop-text").disabled, "所选消息均须支持插入");
+  setButton("packet-clear-text",$("workshop-text").value.length>0);
+  all.disabled=!selectable.length || packetWriting;
+  all.checked=selectable.length>0 && selected.length===selectable.length;
+  all.indeterminate=selected.length>0 && !all.checked;
+  const checks=$("packet-rows").querySelectorAll("input[type=checkbox]");
+  for(const check of checks) {
+    check.checked=packetSelected.has(Number(check.dataset.seq));
+    check.disabled=packetWriting || !check.hasAttribute("data-selectable");
+  }
+  const next=packetPage?.nextAfter;
+  $("packet-pages").hidden=next==null && packetHistory.length===0;
+  setButton("packet-older",next!=null && !packetWriting);
+  setButton("packet-newer",packetHistory.length>0 && !packetWriting);
+  setButton("packet-latest",packetAfter!=null && !packetWriting);
+}
+function resetPackets() {
+  ++packetQuery; packetAfter=undefined; packetHistory=[]; packetPage=null;
+  pendingRetention=null; packetWriting=false; packetSelected.clear();
+  $("packet-rows").replaceChildren(); delete $("packet-rows").dataset.seqs;
+  $("packet-status").textContent=""; $("packet-empty").hidden=false;
+  updatePacketControls();
+}
+function renderPackets(data) {
+  const rows=(data.rows || []).filter(row=>row.direction==="send").reverse();
+  packetPage={...data,rows};
   if(pendingRetention===data.retaining || data.logError) pendingRetention=null;
-  const saving=pendingRetention!==null || data.logPending;
-  setButton("packet-latest",packetAfter!=null); setButton("packet-retain",cap("packets.retain.set") && !saving);
-  $("packet-retain").checked=pendingRetention ?? data.retaining;
-  const status=[saving ? "正在更新日志状态…" : data.retaining ? "正在保留日志" : "仅在内存中查看"];
+  for(const seq of packetSelected) if(!rows.some(row=>row.seq===seq)) packetSelected.delete(seq);
+  const body=$("packet-rows"), signature=rows.map(row=>row.seq).join(",");
+  if(signature!==body.dataset.seqs) {
+    const scroll=body.closest(".table-scroll"), following=scroll.scrollHeight-scroll.scrollTop-scroll.clientHeight<8;
+    body.dataset.seqs=signature;
+    body.replaceChildren(...rows.map(row=>{
+      const item=document.createElement("tr"), check=document.createElement("input"), cell=tableCell("","compact");
+      check.type="checkbox"; check.dataset.seq=String(row.seq);
+      check.toggleAttribute("data-selectable",row.data!=null);
+      check.setAttribute("aria-label","选择发送消息 "+row.seq);
+      check.onchange=()=>{
+        if(check.checked) packetSelected.add(row.seq); else packetSelected.delete(row.seq);
+        updatePacketControls();
+      };
+      cell.append(check);
+      item.append(cell,tableCell("send","compact"),tableCell(row.data==null ? "—" : JSON.stringify(row.data),"code"));
+      return item;
+    }));
+    if(following) scroll.scrollTop=scroll.scrollHeight;
+  }
+  $("packet-empty").hidden=rows.length>0;
+  const status=[pendingRetention!==null || data.logPending ? "正在更新日志状态…" :
+    data.retaining ? "正在保存发送和接收日志" : "日志保留已关闭"];
   if(data.logFile) status.push(data.logFile);
   if(data.droppedRows) status.push("已移出 "+data.droppedRows+" 条旧记录");
   if(data.droppedChunks) status.push("观察队列丢弃 "+data.droppedChunks+" 段");
@@ -723,75 +985,90 @@ async function readPackets() {
   if(data.droppedLogRows) status.push("未写入日志 "+data.droppedLogRows+" 条");
   if(data.logError) status.push(data.logError);
   $("packet-status").textContent=status.join(" · ");
-  const nodes=data.rows.map(row=>{
-    const item=document.createElement("div"); item.className="packet-row";
-    const head=document.createElement("strong"); head.textContent=(row.direction==="send" ? "发送" : "接收")+" · "+(row.cmd || "未识别");
-    const meta=document.createElement("div"); meta.className="hint";
-    meta.textContent=timeLabel(row.timeMs)+" · #"+row.seq+" · "+row.length+" 字节 · 连接 "+row.socket;
-    const summary=document.createElement("p"); summary.textContent=row.summary;
-    item.append(head,meta,summary);
-    if(row.exportable && cap("packets.export")) {
-      const button=document.createElement("button"); button.className="btn small"; button.textContent="导出文本";
-      button.onclick=operation(async()=>{
-        const version=sessionVersion, session=snapshot?.sessionId;
-        const out=await command("packets.export",{seq:row.seq});
-        if(version!==sessionVersion || session!==snapshot?.sessionId || view!==epoch) return;
-        $("packet-text").value=out.text; $("packet-export-result").hidden=false;
-      });
-      item.append(button);
-    }
-    return item;
-  });
-  $("packet-rows").replaceChildren(...nodes);
-  if(!nodes.length) $("packet-rows").textContent=$("packet-exportable").checked ? "没有可导出的发送记录" : "等待当前游戏连接的收发记录";
+  updatePacketControls();
 }
-$("packet-older").onclick=operation(async()=>{if(packetNext==null)return; setButton("packet-older",false);packetHistory.push(packetAfter);packetAfter=packetNext;await readPackets();});
-$("packet-newer").onclick=operation(async()=>{setButton("packet-newer",false);packetAfter=packetHistory.pop();await readPackets();});
-$("packet-latest").onclick=operation(async()=>{resetPackets();await readPackets();});
-$("packet-exportable").onchange=operation(async()=>{resetPackets();await readPackets();});
-$("packet-retain").onchange=operation(async()=>{
-  const requested=$("packet-retain").checked, version=sessionVersion;
-  setButton("packet-retain",false);
+async function readPackets() {
+  if(!cap("packets.page")){
+    $("packet-status").textContent="当前播放器未提供消息抓包";
+    return;
+  }
+  if(packetWriting) return;
+  const request=++packetQuery, view=epoch, version=sessionVersion;
+  const data=await command("packets.page",{after:packetAfter,limit:60});
+  if(request===packetQuery && view===epoch && version===sessionVersion && activeTab==="messages" && activeMessageTab==="capture")
+    renderPackets(data);
+}
+async function changePackets(name,payload={}) {
+  if(packetWriting) return;
+  const version=sessionVersion;
+  packetWriting=true; ++packetQuery; updatePacketControls();
   try {
-    await command("packets.retain.set",{enabled:requested});
-    if(version===sessionVersion) pendingRetention=requested;
-  } finally { if(activeTab==="packets") await readPackets(); }
+    const result=await command("packets."+name,payload);
+    if(version!==sessionVersion) return;
+    if(name==="retain.set") pendingRetention=payload.enabled;
+    if(name==="intercept.set") packetPage={...packetPage,interceptEnabled:result.enabled};
+    if(name==="clear"){
+      packetAfter=undefined; packetHistory=[]; packetSelected.clear();
+      renderPackets({...packetPage,rows:[],nextAfter:null,newestSeq:null,droppedRows:0,gap:false});
+    }
+  } finally {
+    if(version===sessionVersion) {
+      packetWriting=false; updatePacketControls();
+      if(activeTab==="messages" && activeMessageTab==="capture") await readPackets();
+    }
+  }
+}
+function writeWorkshopText(text) {
+  $("workshop-text").value=text;
+  clearOwnBagAction(); updatePacketControls();
+}
+$("packet-intercept").onclick=operation(()=>changePackets("intercept.set",{enabled:!packetPage?.interceptEnabled}));
+$("packet-retain").onclick=operation(()=>changePackets("retain.set",{enabled:!packetPage?.retaining}));
+$("packet-clear").onclick=operation(()=>changePackets("clear"));
+$("packet-select-all").onchange=()=>{
+  packetSelected.clear();
+  if($("packet-select-all").checked) for(const row of visiblePackets()) if(row.data!=null) packetSelected.add(row.seq);
+  updatePacketControls();
+};
+$("packet-copy").onclick=operation(async()=>{
+  await copyText(visiblePackets().filter(row=>packetSelected.has(row.seq)).map(row=>JSON.stringify(row.data)).join("\n"));
+  notify("已复制选中的消息。");
 });
-function resetPage() {
-  ++captureQuery; after=undefined; previous=[]; following=true; selected=null;
-  $("detail").hidden=true; $("record-data").textContent="";
-}
-function renderPage(data) {
-  page=data;
-  const live=$("source").value==="live", rows=data.rows || [];
-  $("record").textContent=data.enabled ? "停止采集" : "开始采集";
-  setButton("record",cap("capture.configure")); setButton("follow",live && after===undefined);
-  $("follow").textContent=following ? "暂停显示" : "恢复显示";
-  const info=[data.enabled ? "采集中" : "采集已停止"];
-  if (data.dropped) info.push("已移出 "+data.dropped+" 条");
-  if (data.gap) info.push("本页起点前有缺口");
-  $("capture-state").textContent=info.join(" · ");
-  $("range").textContent=rows.length ? "#"+rows[0].seq+"–"+rows.at(-1).seq+" · "+rows.length+" 条" : "";
-  $("empty").textContent=rows.length ? "" : live ? "当前范围内暂无记录。" : "当前范围内暂无导入记录。";
-  const list=rows.map(row => {
-    const button=document.createElement("button"),meta=document.createElement("span"),summary=document.createElement("span");
-    button.className="record"; meta.className="meta"; meta.textContent="#"+row.seq+" · "+timeLabel(row.timeMs)+" · "+(kinds[row.kind] || row.kind);
-    summary.textContent=row.summary || row.source || "查看详情"; button.setAttribute("aria-pressed",String(selected?.seq===row.seq));
-    button.append(meta,summary);
-    button.onclick=() => { selected=row; following=false; $("detail").hidden=false; $("record-data").textContent=JSON.stringify(row,null,2); renderPage(page); $("record-data").focus(); };
-    return button;
-  });
-  $("rows").replaceChildren(...list);
-  setButton("first",Boolean(data.newestSeq) && after!==0); setButton("back",previous.length>0);
-  setButton("next",after!==undefined && rows.length>0 && data.nextAfter!=null && data.nextAfter<data.newestSeq);
-  setButton("latest",after!==undefined || !following);
-}
-async function readCapture() {
-  if (!cap("capture.page")) { $("capture-state").textContent=snapshot?.capabilities?.["capture.page"]?.reason || "当前核心未提供采集记录。"; return; }
-  const key=++captureQuery, filter=$("kind").value;
-  const data=await command("capture.page",{source:$("source").value,after,limit:40,kind:filter || undefined});
-  if (key===captureQuery && activeTab==="capture") renderPage(data);
-}
+$("packet-insert").onclick=operation(async()=>{
+  if(packetWriting || $("workshop-text").disabled) return;
+  const version=sessionVersion, rows=visiblePackets().filter(row=>packetSelected.has(row.seq));
+  if(!rows.length || rows.some(row=>!row.exportable || row.data==null)) return;
+  packetWriting=true; updatePacketControls();
+  try {
+    const lines=[];
+    for(const row of rows){
+      const result=await command("packets.export",{seq:row.seq});
+      if(version!==sessionVersion) return;
+      lines.push(result.text);
+    }
+    const prior=$("workshop-text").value.trimEnd();
+    const separator=prior ? (prior.endsWith("|") ? "\n" : "\n|\n") : "";
+    writeWorkshopText(prior+separator+lines.join("\n"));
+    notify("已插入 "+lines.length+" 条发送消息。");
+  } finally {
+    if(version===sessionVersion){packetWriting=false; updatePacketControls();}
+  }
+});
+$("packet-clear-text").onclick=()=>{
+  if($("workshop-text").disabled) resetWorkshop();
+  writeWorkshopText("");
+};
+$("packet-older").onclick=operation(async()=>{
+  const next=packetPage?.nextAfter;
+  if(next==null) return;
+  packetHistory.push(packetAfter); packetAfter=next; packetSelected.clear(); await readPackets();
+});
+$("packet-newer").onclick=operation(async()=>{
+  packetAfter=packetHistory.pop(); packetSelected.clear(); await readPackets();
+});
+$("packet-latest").onclick=operation(async()=>{
+  packetHistory=[]; packetAfter=undefined; packetSelected.clear(); await readPackets();
+});
 let battleView="attributes", enemyDetails=null, enemyRevision="", itemNames=null, namesRequest=null;
 const loadoutNames={"equipment":"装备","soul-card":"魂卡","soul-artifact":"魂器","crystal-key":"晶钥"};
 const groupStates={empty:"空",notProvided:"尚未收到",invalid:"无法解析"};
@@ -881,80 +1158,64 @@ async function readBattle() {
   $("battle-id").textContent=details?.battleUniqueId ?? battle.battleId ?? "—"; $("switches").textContent=battle.switches ?? "—";
   $("battle-time").textContent=timeLabel(battle.updatedMs); $("battle-source").textContent=details?.lastCommand ? "接收 "+details.lastCommand : battle.source || "—";
 }
-async function pollJob() {
-  if (!jobId) return;
-  const id=jobId, state=await command("capture.job",{jobId:id});
-  if (jobId!==id) return;
-  if (state.state==="completed" || state.state==="failed") {
-    jobId=null; showOverview();
-    if (state.state==="failed") { $("job").textContent=state.error || "文件操作失败。"; return; }
-    $("job").textContent="已完成 · "+(state.rows ?? 0)+" 条"+(state.file ? " · "+state.file : "");
-    if (state.file) $("file").value=state.file;
-    if (jobKind==="import") { $("source").value="import"; resetPage(); await readCapture(); }
-  }
-}
-let jobKind="";
-async function startFileJob(mode) {
-  if (jobId) return;
-  let payload={};
-  if (mode==="export") {
-    if ($("kind").value) payload.kind=$("kind").value;
-    for (const [id,key] of [["from","fromSeq"],["to","toSeq"]]) if ($(id).value) {
-      const value=Number($(id).value);
-      if (!Number.isSafeInteger(value) || value<1) throw new Error("序号须为正整数。");
-      payload[key]=value;
-    }
-    if (payload.fromSeq>payload.toSeq) throw new Error("起始序号须小于或等于结束序号。");
-  } else if ($("file").value.trim()) payload.file=$("file").value.trim();
-  setButton("export",false); setButton("import",false);
-  try {
-    const result=await command("capture."+mode,payload);
-    jobId=result.jobId; jobKind=mode; $("job").textContent=mode==="export" ? "正在导出…" : "正在导入…";
-    await pollJob();
-  } finally { showOverview(); }
-}
 let busy=false;
-async function refresh(manual=false) {
+async function refresh() {
   if (busy || !visible || document.hidden || !window.myproGeneration) return;
   busy=true;
   try {
-    if(!await updateSession()) return; const at=epoch;
-    if (activeTab==="capture") { if (following || !page || manual) await readCapture(); if (at===epoch) await pollJob(); }
-    else if (activeTab==="packets") await readPackets();
-    else if (activeTab==="battle") await readBattle();
-    else if (activeTab==="settings") await Promise.all([readSettings(),readTheme()]);
-    else if (activeTab==="workshop") await readGamePanels();
-    else if (activeTab==="lineups") await readLineup();
-    else if (activeTab==="morph") await readMorph();
-  } catch(e) { if (visible) notify(e.message); }
-  finally { busy=false; if(refreshAgain) { refreshAgain=false; void refresh(true); } }
+    if(!await updateSession()) return;
+    if(activeTab==="capture") await readCapture();
+    else if(activeTab==="messages") {
+      if(activeMessageTab==="capture") await readPackets();
+      else await readGamePanels();
+    }
+    else if(activeTab==="battle") await readBattle();
+    else if(activeTab==="settings") await Promise.all([readSettings(),readTheme()]);
+    else if(activeTab==="lineups") await readLineup();
+    else if(activeTab==="morph") await readMorph();
+  } catch(e) { if(visible) notify(e.message); }
+  finally { busy=false; if(refreshAgain){refreshAgain=false; void refresh();} }
+}
+function requestRefresh() {
+  if(busy) refreshAgain=true; else void refresh();
+}
+function setMessageTab(tab, refreshView=true) {
+  if(activeMessageTab===tab) return;
+  activeMessageTab=tab;
+  document.querySelectorAll("[data-message]").forEach(button=>{
+    const selected=button.dataset.message===tab;
+    button.setAttribute("aria-selected",String(selected));
+    button.tabIndex=selected ? 0 : -1;
+    $(button.getAttribute("aria-controls")).hidden=!selected;
+  });
+  if(refreshView && activeTab==="messages"){++epoch; requestRefresh();}
+}
+for(const button of document.querySelectorAll("[data-message]")){
+  button.onclick=()=>setMessageTab(button.dataset.message);
+  button.onkeydown=event=>{
+    const tab=({Home:"capture",End:"send",ArrowLeft:button.dataset.message==="send" ? "capture" : "send",
+      ArrowRight:button.dataset.message==="capture" ? "send" : "capture"})[event.key];
+    if(!tab) return;
+    event.preventDefault(); setMessageTab(tab); $("messages-tab-"+tab).focus();
+  };
 }
 function activate(id) {
-  if(activeTab!==id)window.scrollTo(0,0);
+  if(activeTab!==id) window.scrollTo(0,0);
   activeTab=id; ++epoch;
   document.querySelectorAll("main>section").forEach(s=>s.hidden=s.id!==id);
   document.querySelectorAll("[data-tab]").forEach(b=>{if(b.dataset.tab===id)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current");});
-  if(busy) refreshAgain=true; else void refresh(true);
+  requestRefresh();
 }
 document.querySelectorAll("[data-tab]").forEach(b=>b.onclick=()=>activate(b.dataset.tab));
 $("hide").onclick=operation(()=>command("panel.hide"));
-$("refresh").onclick=operation(()=>refresh(true));
+$("refresh").onclick=operation(()=>refresh());
 $("play").onclick=operation(async()=>{setButton("play",false);try{await command(snapshot.playing ? "session.pause" : "session.resume");await updateSession();}finally{showOverview();}});
-$("record").onclick=operation(async()=>{setButton("record",false);try{await command("capture.configure",{enabled:!page?.enabled});await readCapture();}finally{setButton("record",cap("capture.configure"));}});
-for (const id of ["source","kind"]) $(id).onchange=operation(async()=>{resetPage();await readCapture();});
-$("follow").onclick=operation(async()=>{following=!following;if(following)await readCapture();else renderPage(page);});
-$("first").onclick=operation(async()=>{previous=[];after=0;following=false;await readCapture();});
-$("next").onclick=operation(async()=>{previous.push(after);after=page.nextAfter;following=false;await readCapture();});
-$("back").onclick=operation(async()=>{after=previous.pop();following=false;await readCapture();});
-$("latest").onclick=operation(async()=>{resetPage();await readCapture();});
-$("close-detail").onclick=()=>{selected=null;$("detail").hidden=true;renderPage(page);};
-$("export").onclick=operation(()=>startFileJob("export"));$("import").onclick=operation(()=>startFileJob("import"));
-window.myproVisible=value=>{visible=Boolean(value);if(visible)void refresh(true);};
+window.myproVisible=value=>{visible=Boolean(value);if(visible)void refresh();};
 document.addEventListener("keydown",e=>{if(e.key==="F8" && !e.repeat && !e.isComposing && snapshot){e.preventDefault();void operation(()=>command("panel.hide"))();}});
-window.addEventListener("mypro-ready",()=>void refresh(true)); document.addEventListener("visibilitychange",()=>{if(!document.hidden)void refresh(true);});
-const timer=setInterval(()=>void refresh(),2200);
+window.addEventListener("mypro-ready",()=>void refresh()); document.addEventListener("visibilitychange",()=>{if(!document.hidden)void refresh();});
+const timer=setInterval(()=>void refresh(),1000);
 window.addEventListener("pagehide",()=>{clearInterval(timer);for(const [k,e] of pending){clearTimeout(e.timer);e.reject(new Error("工具页已关闭。"));pending.delete(k);}});
-void refresh(true);
+void refresh();
 </script>
 </body>
 </html>

@@ -1,8 +1,6 @@
-use ruffle_core::mypro_observer::{
-    MorphAssetKind, MorphAssetResult, MorphRuleSnapshot, install_morph_asset_sink, publish_morph_rules,
-};
+use ruffle_core::mypro_observer::{MorphRuleSnapshot, publish_morph_rules};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -91,22 +89,9 @@ struct State {
     battle_rules: Arc<Rules>,
     in_battle: bool,
     battle_id: Option<u64>,
-    binding: u32,
-    hits: [u64; 3],
-    fallback: u64,
-    recent: VecDeque<Lookup>,
     stage: &'static str,
     error: Option<String>,
 }
-struct Lookup {
-    kind: &'static str,
-    source: u32,
-    target: u32,
-    enemy: bool,
-    state: &'static str,
-}
-
-const CHANNELS: [&str; 3] = ["body", "backpack", "portrait"];
 
 impl Default for State {
     fn default() -> Self {
@@ -115,10 +100,6 @@ impl Default for State {
             battle_rules: Default::default(),
             in_battle: false,
             battle_id: None,
-            binding: 1,
-            hits: [0; 3],
-            fallback: 0,
-            recent: VecDeque::new(),
             stage: "loading",
             error: None,
         }
@@ -136,7 +117,6 @@ impl State {
     fn boundary(&mut self, in_battle: bool) {
         self.in_battle = in_battle;
         self.battle_rules = self.desired.clone();
-        self.binding = self.binding.wrapping_add(1).max(1);
         if !in_battle {
             self.battle_id = None;
         }
@@ -162,50 +142,14 @@ impl State {
         }
     }
 
-    fn observe(&mut self, kind: MorphAssetKind, source: u32, face: u8, result: MorphAssetResult) {
-        let i = match kind {
-            MorphAssetKind::Battle => 0,
-            MorphAssetKind::Backpack => 1,
-            MorphAssetKind::Poster => 2,
-        };
-        let kind = CHANNELS[i];
-        let enemy = kind == "body" && face == 1;
-        let (target, status) = match result {
-            MorphAssetResult::Original => (source, "original"),
-            MorphAssetResult::Adapted(target) => {
-                self.hits[i] += 1;
-                (target, "selected")
-            }
-            MorphAssetResult::Fallback(target) => {
-                self.fallback += 1;
-                (target, "unavailable")
-            }
-        };
-        self.recent.retain(|r| !(r.kind == kind && r.source == source && r.enemy == enemy));
-        self.recent.truncate(23);
-        self.recent.push_front(Lookup { kind, source, target, enemy, state: status });
-    }
-
     fn snapshot(&self) -> Value {
         let mut result = self.desired.file();
         let o = result.as_object_mut().unwrap();
         o.insert("activeRevision".into(), json!(self.battle_rules.revision));
         o.insert("battleBound".into(), json!(self.in_battle));
         o.insert("battleId".into(), json!(self.battle_id));
-        o.insert("bindingId".into(), json!(self.binding));
         o.insert("stage".into(), json!(self.stage));
         o.insert("error".into(), json!(self.error));
-        o.insert("hits".into(), json!({
-            "body":self.hits[0], "backpack":self.hits[1], "portrait":self.hits[2], "waiting":self.fallback
-        }));
-        o.insert("recent".into(), Value::Array(self.recent.iter().map(|r| json!({
-            "kind":r.kind,"source":r.source,"target":r.target,"face":r.enemy,"state":r.state
-        })).collect()));
-        let mut channels = json!({});
-        for name in CHANNELS {
-            channels[name] = json!({"available":true});
-        }
-        o.insert("capabilities".into(), channels);
         result
     }
 }
@@ -217,9 +161,6 @@ fn state() -> &'static Mutex<State> {
 pub(super) fn session() {
     let mut s = state().lock().unwrap();
     s.boundary(false);
-    s.hits = [0; 3];
-    s.fallback = 0;
-    s.recent.clear();
     publish_morph_rules(s.rule_snapshot());
 }
 pub(super) fn battle(enter: bool, id: u64) {
@@ -227,10 +168,6 @@ pub(super) fn battle(enter: bool, id: u64) {
     s.boundary(enter);
     s.battle_id = enter.then_some(id);
     publish_morph_rules(s.rule_snapshot());
-}
-
-fn observe_asset(kind: MorphAssetKind, source: u32, face: u8, result: MorphAssetResult) {
-    state().lock().unwrap().observe(kind, source, face, result);
 }
 
 fn load(root: &Path) -> Result<Rules, String> {
@@ -300,7 +237,6 @@ fn finish(result: Result<Rules, String>) {
     }
 }
 pub(super) fn init(root: PathBuf) {
-    install_morph_asset_sink(observe_asset);
     std::thread::spawn(move || finish(load(&root)));
 }
 pub(super) fn command(root: &Path, name: &str, p: &Value) -> Option<Result<Value, String>> {
@@ -388,19 +324,6 @@ mod tests {
         let mut invalid = p;
         invalid["rules"]["skins"][1]["originalId"] = json!("4");
         assert!(Rules::parse(&invalid, 3).is_err());
-    }
-
-    #[test]
-    fn aola_mypro_morph_reports_http_results_per_channel_and_side() {
-        let mut s = State::default();
-        s.observe(MorphAssetKind::Battle, 4, 1, MorphAssetResult::Original);
-        s.observe(MorphAssetKind::Battle, 4, 2, MorphAssetResult::Adapted(7));
-        s.observe(MorphAssetKind::Poster, 4, 0, MorphAssetResult::Fallback(12));
-        let snapshot = s.snapshot();
-        assert_eq!(snapshot["hits"]["body"], 1);
-        assert_eq!(snapshot["hits"]["waiting"], 1);
-        assert_eq!(snapshot["recent"][1]["target"], 7);
-        assert_eq!(snapshot["recent"][2]["face"], true);
     }
 
     #[test]

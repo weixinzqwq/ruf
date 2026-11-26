@@ -37,30 +37,3 @@ pub fn publish_morph_rules(rules: MorphRuleSnapshot) {
 pub fn morph_rule_snapshot() -> Arc<MorphRuleSnapshot> {
     MORPH_RULES.read().unwrap().clone()
 }
-
-#[derive(Clone, Copy)]
-pub enum MorphAssetKind {
-    Backpack,
-    Battle,
-    Poster,
-}
-
-#[derive(Clone, Copy)]
-pub enum MorphAssetResult {
-    Original,
-    Adapted(u32),
-    Fallback(u32),
-}
-
-type MorphAssetSink = fn(MorphAssetKind, u32, u8, MorphAssetResult);
-static MORPH_ASSET_SINK: OnceLock<MorphAssetSink> = OnceLock::new();
-
-pub fn install_morph_asset_sink(sink: MorphAssetSink) {
-    let _ = MORPH_ASSET_SINK.set(sink);
-}
-
-pub fn observe_morph_asset(kind: MorphAssetKind, source: u32, face: u8, result: MorphAssetResult) {
-    if let Some(sink) = MORPH_ASSET_SINK.get() {
-        sink(kind, source, face, result);
-    }
-}

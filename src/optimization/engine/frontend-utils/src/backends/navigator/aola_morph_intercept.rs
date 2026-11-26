@@ -6,7 +6,7 @@ use super::spawn_tokio;
 use crate::backends::aoqi_cache::{AdaptedKey, AoqiCache, numeric_version};
 use quick_xml::{Reader, events::Event};
 use ruffle_core::backend::navigator::{NavigationMethod, Request, SuccessResponse};
-use ruffle_core::mypro_observer::{self, MorphAssetKind, MorphAssetResult};
+use ruffle_core::mypro_observer;
 use ruffle_core::swf::{self, Tag};
 use std::collections::HashMap;
 use std::io;
@@ -80,10 +80,7 @@ pub(super) fn try_match(request: &Request, url: &Url) -> Option<Selection> {
         MorphKind::Poster if rules.enabled => rules.poster_map.get(&source),
         _ => None,
     };
-    let Some(target) = target.copied().filter(|&id| id != 0 && id != source) else {
-        observe(source, kind, MorphAssetResult::Original);
-        return None;
-    };
+    let target = target.copied().filter(|&id| id != 0 && id != source)?;
     Some(Selection { source, target, kind })
 }
 
@@ -151,7 +148,6 @@ impl Selection {
         match result {
             Ok((body, size, phase)) => {
                 self.audit(version.as_deref().unwrap_or_default(), phase, "", size);
-                observe(self.source, self.kind, MorphAssetResult::Adapted(self.target));
                 Some(Box::new(Response {
                     url: original_url.to_string(), response_body: body,
                     text_encoding: None, status: 200, redirected: false,
@@ -159,7 +155,6 @@ impl Selection {
             }
             Err(error) => {
                 self.audit(version.as_deref().unwrap_or_default(), "official-fallback", &error.to_string(), 0);
-                observe(self.source, self.kind, MorphAssetResult::Fallback(self.target));
                 None
             }
         }
@@ -216,15 +211,6 @@ impl Selection {
             target = u64::from(self.target), kind, face = u64::from(face), part = u64::from(part),
             version, result, reason, bytes);
     }
-}
-
-fn observe(source: u32, kind: MorphKind, result: MorphAssetResult) {
-    let (kind, face) = match kind {
-        MorphKind::Backpack { .. } => (MorphAssetKind::Backpack, 0),
-        MorphKind::Battle { face, .. } => (MorphAssetKind::Battle, face),
-        MorphKind::Poster => (MorphAssetKind::Poster, 0),
-    };
-    mypro_observer::observe_morph_asset(kind, source, face, result);
 }
 
 async fn target_bytes(

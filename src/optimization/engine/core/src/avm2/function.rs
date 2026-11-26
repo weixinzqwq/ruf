@@ -278,7 +278,7 @@ pub fn exec<'gc>(
 fn observe_panel(arguments: FunctionArgs<'_, '_>, succeeded: bool) {
     if crate::mypro_observer::recording() && arguments.len() >= 2
         && let (Value::String(url), Value::String(class)) = (arguments.get_at(0), arguments.get_at(1))
-        && url.len() <= 2048 && class.len() <= 192 {
+        && url.len() <= 768 && class.len() <= 192 {
         crate::mypro_observer::observe(if succeeded {"panel"} else {"panel-error"}, &url.to_utf8_lossy(), &class.to_utf8_lossy());
     }
 }

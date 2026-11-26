@@ -1,5 +1,6 @@
 """Exercise the embedded MyPro tools page in offline Chromium using synthetic IPC."""
 from pathlib import Path
+import json
 from urllib.parse import urlsplit
 
 from playwright.sync_api import expect, sync_playwright
@@ -8,13 +9,22 @@ from playwright.sync_api import expect, sync_playwright
 PANEL = Path(__file__).resolve().parents[1] / "optimization/engine/desktop/src/mypro_panel/index.html"
 PANEL_URL = "http://mypro.localhost/index.html"
 ASSETS = PANEL.parents[2] / "assets/battle-assistant"
+SUMMONER = {"id": "summoner", "name": "召唤师",
+            "url": "activityres/activity250516/newzhaohuanshi/newzhaohuanshi_code",
+            "cls": "mmo.activity250516.newzhaohuanshi.panel.NZHS_MainPl"}
 
 
 class Fixture:
     def __init__(self):
         self.session = "fixture-one"
         self.retaining = False
-        self.latest_summary = "初始记录"
+        self.intercepting = False
+        self.packet_rows = []
+        self.capturing = False
+        self.capture_rows = []
+        self.morph = {"revision": 4, "stage": "ready", "enabled": False, "enemy": False,
+                      "rules": [{"remark": "初始测试", "originalId": "5336", "backpackId": "6044",
+                                 "fightId": "/", "spskiId": "/"}]}
         self.battle = None
         self.display = {}
         self.auto = False
@@ -43,7 +53,10 @@ class Fixture:
         self.last_request = request
         if command == "app.snapshot":
             assert message["sessionId"] is None
-            capabilities = ["packets.page", "packets.retain.set", "packets.export", "battle.snapshot", "battle.details"]
+            capabilities = ["packets.page", "packets.retain.set", "packets.export", "packets.intercept.set",
+                            "packets.clear", "battle.snapshot", "battle.details", "panel_capture.toggle",
+                            "panel_capture.clear", "panel_capture.list", "morph.rules.read",
+                            "morph.rules.replace", "morph.restore"]
             capabilities += ["settings.read", "settings.patch", "background.read", "background.choose",
                              "background.clear", "battle.auto.read", "battle.auto.set"]
             capabilities += ["workshop.validate", "workshop.readOwnBag", "game.panels", "game.panel.open", "theme.read", "theme.apply",
@@ -52,15 +65,34 @@ class Fixture:
                     "viewport": {"width": 1200, "height": 700}, "coreBuild": "offline",
                     "capabilities": {key: {"available": True} for key in capabilities}}
         assert message["sessionId"] == self.session
+        if command == "panel_capture.toggle":
+            self.capturing = args["enabled"]
+        if command == "panel_capture.clear":
+            self.capture_rows = []
+        if command.startswith("panel_capture."):
+            return {"enabled": self.capturing, "rows": self.capture_rows, "dropped": 0}
+        if command in ("morph.rules.replace", "morph.restore"):
+            assert args["expectedRevision"] == self.morph["revision"]
+            self.morph["revision"] += 1
+            if command == "morph.restore":
+                self.morph["enabled"] = False
+            else:
+                self.morph.update({k: args[k] for k in ("enabled", "enemy", "rules")})
+        if command.startswith("morph."):
+            return self.morph.copy()
         if command == "workshop.validate":
             if args["text"] == '#send={"id":13,"cmd":"1212","param":{}}|':
                 return {"steps": [{"line": 1, "kind": "message", "id": 13, "cmd": "1212", "fields": 0}], "canReadOwnBag": True}
+            if args["text"].lstrip().startswith("#send="):
+                item = json.loads(args["text"].strip().removesuffix("|").removeprefix("#send="))
+                return {"steps": [{"line": 1, "kind": "message", "id": item["id"],
+                                   "cmd": item["cmd"], "fields": 0}]}
             assert args["text"] == "#time = 0.5 | #wait"
             return {"steps": [{"line": 1, "kind": "delay", "seconds": 0.5}, {"line": 1, "kind": "wait"}]}
         if command == "game.panels":
-            return {"panels": [{"id": "summoner", "name": "召唤师"}]}
+            return {"panels": [SUMMONER]}
         if command == "game.panel.open":
-            assert args["id"] == "summoner"
+            assert args in ({"id": "summoner"}, {k: SUMMONER[k] for k in ("url", "cls")})
             return {"status": "requested"}
         if command.startswith("theme."):
             if command == "theme.apply":
@@ -86,19 +118,17 @@ class Fixture:
             if command == "battle.auto.set":
                 self.auto = args["enabled"]
             return {"status": "ready" if command.endswith("read") else "applied", "enabled": self.auto}
+        if command == "packets.intercept.set":
+            self.intercepting = args["enabled"]
+            return {"enabled": self.intercepting}
+        if command == "packets.clear":
+            self.packet_rows = []
+            return {"cleared": True}
         if command == "packets.page":
-            total = 30 if self.session == "fixture-one" else 1
-            before = args.get("after") or total + 1
-            numbers = [n for n in range(total, 0, -1)
-                       if n < before and (not args.get("exportableOnly") or n % 2 == 0)]
-            visible = numbers[:args["limit"]]
             return {
-                "rows": [{"seq": n, "timeMs": 1800000000000 + n, "direction": "send" if n % 2 == 0 else "recv",
-                          "socket": "9007199254740993", "cmd": f"{self.session}-{n:02}",
-                          "summary": self.latest_summary if n == 30 else f"观察记录 <em>{n}</em>",
-                          "length": 32, "decoded": True, "exportable": n % 2 == 0}
-                         for n in visible],
-                "oldestSeq": 1, "newestSeq": total, "nextAfter": visible[-1] if len(visible) < len(numbers) else None,
+                "rows": self.packet_rows,
+                "oldestSeq": 1, "newestSeq": len(self.packet_rows), "nextAfter": None,
+                "interceptEnabled": self.intercepting,
                 "gap": False, "droppedRows": 0, "droppedChunks": 0, "gaps": 0, "retaining": self.retaining,
                 "logFile": "logs/fixture.jsonl" if self.retaining else None, "logError": None, "droppedLogRows": 0,
             }
@@ -106,8 +136,8 @@ class Fixture:
             self.retaining = args["enabled"]
             return {"requested": self.retaining}
         if command == "packets.export":
-            assert args["seq"] % 2 == 0
-            return {"seq": args["seq"], "text": f"offline export {args['seq']}"}
+            item = next(row for row in self.packet_rows if row["seq"] == args["seq"])
+            return {"seq": item["seq"], "text": "#send=" + json.dumps(item["data"]) + "|"}
         if command == "battle.snapshot":
             details = self.battle or {"state": "unknown", "battleUniqueId": None,
                                       "selfPmmId": None, "lastCommand": None, "enemy": None}
@@ -118,6 +148,9 @@ class Fixture:
 
 BRIDGE = """
 window.myproGeneration = 3;
+Object.defineProperty(navigator, "clipboard", {value: {
+  async writeText(text) { window.fixtureClipboard = text; }
+}});
 window.ipc = { postMessage(raw) {
   const msg = JSON.parse(raw);
   window.fixtureRequest(msg).then(result => {
@@ -137,52 +170,126 @@ window.ipc = { postMessage(raw) {
 def switch_session(page, fixture, session):
     fixture.session = session
     fixture.session_events += 1
-    fixture.retaining = False
+    fixture.retaining = fixture.intercepting = fixture.capturing = False
+    fixture.packet_rows = []
+    fixture.capture_rows = []
     page.evaluate("""([seq,id]) => window.myproReceive({protocolVersion:1, kind:'event', bridgeGeneration:3,
        seq, event:'session.changed', sessionId:id, payload:{sessionId:id}})""", [fixture.session_events, session])
     expect(page.locator("#session")).to_have_text(session)
 
 
 def packets(page, fixture):
-    page.locator("[data-tab=packets]").click()
+    page.locator("[data-tab=messages]").click()
+    page.locator("#messages-tab-capture").click()
+    toggle = page.locator("#packet-intercept")
+    toggle.click()
+    expect(toggle).to_have_text("停止拦截")
+    assert fixture.intercepting
+    fixture.packet_rows = [
+        {"seq": 1, "direction": "send", "data": {"cmd": "checkNickName", "id": 1, "param": None},
+         "exportable": True, "decoded": True},
+        {"seq": 2, "direction": "recv", "data": {"cmd": "not-a-visible-recv"}, "exportable": False},
+    ]
     rows = page.locator("#packet-rows")
-    expect(rows).to_contain_text("fixture-one-30")
-    expect(rows).not_to_contain_text("fixture-one-05")
-    expect(rows.locator("em")).to_have_count(0)
-    fixture.latest_summary = "最新记录已抵达"
-    expect(rows).to_contain_text(fixture.latest_summary)
-    page.locator("#packet-older").click()
-    expect(rows).to_contain_text("fixture-one-01")
-    expect(rows).not_to_contain_text("fixture-one-06")
-    expect(page.locator("#packet-older")).to_be_disabled()
-    page.locator("#packet-newer").click()
-    expect(rows).to_contain_text("fixture-one-30")
-    page.locator("#packet-exportable").check()
-    expect(rows).to_contain_text("fixture-one-02")
-    expect(rows).not_to_contain_text("fixture-one-29")
+    row = rows.get_by_role("row").filter(has_text="checkNickName")
+    expect(row).to_contain_text("send")
+    expect(rows).not_to_contain_text("not-a-visible-recv")
+    row.get_by_role("checkbox").check()
+    page.locator("#packet-copy").click()
+    page.wait_for_function('typeof window.fixtureClipboard === "string"')
+    assert json.loads(page.evaluate("window.fixtureClipboard")) == fixture.packet_rows[0]["data"]
+    page.locator("#packet-insert").click()
+    page.locator("#messages-tab-send").click()
+    text = page.locator("#workshop-text")
+    page.wait_for_function('document.querySelector("#workshop-text").value.includes("checkNickName")')
+    page.locator("#workshop-run").click()
+    expect(page.locator("#workshop-steps")).to_contain_text("checkNickName")
+    page.locator("#messages-tab-capture").click()
     page.locator("#packet-retain").click()
-    expect(page.locator("#packets")).to_contain_text("fixture.jsonl")
+    expect(page.locator("#packet-status")).to_contain_text("fixture.jsonl")
     assert fixture.retaining
-    page.locator("#packet-retain").click()
-    expect(page.locator("#packets")).not_to_contain_text("fixture.jsonl")
-    assert not fixture.retaining
-    rows.get_by_role("button").first.click()
-    exported = page.locator("#packet-text")
-    assert exported.evaluate("(el) => el.readOnly")
-    expect(exported).to_have_value("offline export 30")
+    toggle.click()
+    expect(toggle).to_have_text("开始拦截")
+    assert not fixture.intercepting
+    page.locator("#packet-clear").click()
+    expect(rows).not_to_contain_text("checkNickName")
+    assert fixture.retaining
+    page.locator("#packet-clear-text").click()
+    expect(text).to_have_value("")
 
-    # An old reply can reach JavaScript after the host announces a new Player.
+    toggle.click()
+    expect(toggle).to_have_text("停止拦截")
+    fixture.packet_rows = [
+        {"seq": 3, "direction": "send", "data": {"cmd": "checkNickName", "id": 1, "param": None},
+         "exportable": True, "decoded": True},
+    ]
+    row.get_by_role("checkbox").check()
     page.evaluate("window.holdNext = 'packets.export'")
-    rows.get_by_role("button").first.click()
+    page.locator("#packet-insert").click()
     page.wait_for_function("typeof window.heldReply === 'function'")
     switch_session(page, fixture, "fixture-two")
     page.evaluate("window.heldReply()")
-    expect(exported).to_have_value("")
-    page.locator("#packet-exportable").uncheck()
-    expect(rows).to_contain_text("fixture-two-01")
-    expect(rows).not_to_contain_text("fixture-one")
-    assert any(call[0] == "packets.page" and call[2] == fixture.session
-               and "after" not in call[1] for call in fixture.calls)
+    expect(rows).not_to_contain_text("checkNickName")
+    expect(text).to_have_value("")
+
+
+def capture(page, fixture):
+    page.locator("[data-tab=capture]").click()
+    page.locator("#record").click()
+    expect(page.locator("#record")).to_have_text("暂停采集")
+    assert fixture.capturing
+    fixture.capture_rows = [{"seq": 1, "timeMs": 1800000000000, **SUMMONER}]
+    row = page.locator("#capture-rows").get_by_role("row").filter(has_text=SUMMONER["url"])
+    expect(row).to_contain_text(SUMMONER["cls"])
+    row.click()
+    page.locator("#capture-copy").click()
+    page.wait_for_function('typeof window.fixtureClipboard === "string"')
+    assert page.evaluate("window.fixtureClipboard") == f'{SUMMONER["url"]}\t{SUMMONER["cls"]}'
+    page.locator("#capture-fill").click()
+    expect(page.locator("#game-panel-url")).to_have_value(SUMMONER["url"])
+    expect(page.locator("#game-panel-cls")).to_have_value(SUMMONER["cls"])
+    page.locator("#game-panel-open").click()
+    expect(page.locator("#game-panel-status")).to_contain_text("已受理")
+    page.locator("[data-tab=capture]").click()
+    page.locator("#record").click()
+    expect(page.locator("#record")).to_have_text("开始采集")
+    assert not fixture.capturing
+    expect(row).to_be_visible()
+    page.locator("#capture-clear").click()
+    expect(row).to_have_count(0)
+
+
+def morph(page, fixture):
+    page.locator("[data-tab=morph]").click()
+    expect(page.get_by_role("heading", name="应用状态")).to_have_count(0)
+    original = page.locator("#morph-rows").get_by_role("row").filter(has_text="初始测试")
+    expect(original).to_contain_text("6044")
+    search = page.locator("#morph-search")
+    search.fill("未知内容")
+    expect(original).to_have_count(0)
+    search.fill("6044")
+    expect(original).to_be_visible()
+    search.clear()
+    page.locator("#m-remark").fill("新规则")
+    page.locator("#m-originalId").fill("5000")
+    page.locator("#m-backpackId").fill("6044")
+    page.locator("#morph-add").click()
+    expect(page.locator("#morph-rows")).to_contain_text("新规则")
+    page.locator("#morph-enabled").check()
+    page.locator("#morph-save").click()
+    expect(page.locator("#morph-save")).to_be_disabled()
+    assert fixture.morph["enabled"] and len(fixture.morph["rules"]) == 2
+    page.locator("#morph-restore").click()
+    expect(page.locator("#morph-enabled")).not_to_be_checked()
+    assert not fixture.morph["enabled"] and len(fixture.morph["rules"]) == 2
+    page.locator("#morph-import").click()
+    page.locator("#morph-json").fill('{"skins":[{"originalId":5099,"fightId":6000,"remark":"旧配置"}]}')
+    page.locator("#morph-import-apply").click()
+    imported = page.locator("#morph-rows").get_by_role("row").filter(has_text="旧配置")
+    expect(imported).to_contain_text("6000")
+    imported.click()
+    page.locator("#morph-remove").click()
+    expect(imported).to_have_count(0)
 
 
 def opponent(owner, name, hp):
@@ -282,13 +389,16 @@ def main():
         page.on("pageerror", lambda error: fixture.errors.append(str(error)))
         page.goto(PANEL_URL)
         expect(page.locator("#session")).to_have_text("fixture-one")
+        capture(page, fixture)
+        morph(page, fixture)
         packets(page, fixture)
         battle(page, fixture)
         presentation(page, fixture)
         page.locator("#theme-choice").select_option("10")
         page.locator("#theme-apply").click()
         expect(page.locator("#theme-status")).to_contain_text("待战斗结束")
-        page.locator("[data-tab=workshop]").click()
+        page.locator("[data-tab=messages]").click()
+        page.locator("#messages-tab-send").click()
         page.get_by_role("button", name="召唤师").click()
         expect(page.locator("#game-panel-status")).to_contain_text("已受理")
         page.locator("#workshop-text").fill("#time = 0.5 | #wait")
@@ -312,7 +422,7 @@ def main():
         expect(page.locator("#lineup-status")).to_have_text("顺序已回读")
         assert not fixture.errors, fixture.errors
         browser.close()
-    print("PASS packet logs, enemy slots, session isolation, battle presentation, themes, workshop and lineup controls")
+    print("PASS panel capture, morph rules, message tabs, enemy slots, themes and lineups")
 
 
 if __name__ == "__main__":

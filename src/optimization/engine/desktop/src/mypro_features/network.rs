@@ -17,10 +17,11 @@ const MAX_ROWS: usize = 512;
 const MAX_ROW_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EXPORT_BYTES: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 32;
+const INTERCEPT_ENABLED: u64 = 1;
 static HUB: OnceLock<Result<Arc<Hub>, String>> = OnceLock::new();
 
 enum Message {
-    Event(SocketTapEvent, usize),
+    Event(SocketTapEvent, usize, u64),
     Reset(u64),
     Retain(u64, bool),
     #[cfg(test)]
@@ -32,12 +33,15 @@ struct Ingress {
     bytes: Arc<AtomicUsize>,
     dropped: Arc<AtomicU64>,
     stopped: AtomicBool,
+    // The low bit enables display capture. The remaining bits identify the current list.
+    intercept: Arc<AtomicU64>,
 }
 impl Ingress {
     fn observe(&self, event: SocketTapEvent) {
         if self.stopped.load(Ordering::Relaxed) {
             return;
         }
+        let intercept = self.intercept.load(Ordering::Relaxed);
         let size = match &event.kind {
             SocketTapKind::Data { bytes, .. } => bytes.len(),
             _ => 0,
@@ -52,7 +56,11 @@ impl Ingress {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        if self.tx.try_send(Message::Event(event, size)).is_err() {
+        if self
+            .tx
+            .try_send(Message::Event(event, size, intercept))
+            .is_err()
+        {
             self.bytes.fetch_sub(size, Ordering::Relaxed);
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
@@ -87,6 +95,10 @@ struct View {
 impl View {
     fn push(&mut self, data: Value, export: Option<String>, bytes: usize) {
         self.seq += 1;
+        if bytes > MAX_ROW_BYTES {
+            self.dropped += 1;
+            return;
+        }
         while self.rows.len() >= MAX_ROWS || self.bytes + bytes > MAX_ROW_BYTES {
             let Some(old) = self.rows.pop_front() else {
                 break;
@@ -219,11 +231,13 @@ impl BattleFeed {
 struct Worker {
     epoch: u64,
     generation: u64,
+    observed: u64,
     battle: BattleFeed,
     root: PathBuf,
     connections: HashMap<u64, Connection>,
     view: Arc<Mutex<View>>,
     ingress_drops: Arc<AtomicU64>,
+    intercept: Arc<AtomicU64>,
     logger: Option<Logger>,
     closing: Option<JoinHandle<()>>,
 }
@@ -232,11 +246,13 @@ impl Worker {
         Self {
             epoch: 0,
             generation: 0,
+            observed: 0,
             battle: BattleFeed::default(),
             root: root.to_owned(),
             connections: HashMap::new(),
             view,
             ingress_drops,
+            intercept: Arc::default(),
             logger: None,
             closing: None,
         }
@@ -258,16 +274,22 @@ impl Worker {
         self.connections.clear();
         self.battle = BattleFeed::default();
         self.epoch = epoch;
-        *self.view.lock().unwrap() = View {
+        self.observed = 0;
+        let mut view = self.view.lock().unwrap();
+        let previous = self.intercept.load(Ordering::Relaxed);
+        self.intercept.store(
+            previous.wrapping_add(2) & !INTERCEPT_ENABLED,
+            Ordering::Relaxed,
+        );
+        *view = View {
             epoch,
             ..Default::default()
         };
     }
     fn boundary(&self, event: &str) -> Value {
-        let (seen, gaps, lost, evicted, battle) = {
+        let (gaps, lost, evicted, battle) = {
             let view = self.view.lock().unwrap();
             (
-                view.seq,
                 view.gaps,
                 view.log_drops.load(Ordering::Relaxed),
                 view.dropped,
@@ -281,7 +303,7 @@ impl Worker {
             .filter(|offset| offset.is_none())
             .count();
         json!({"event":event,"processId":std::process::id(),"timeUtc":Utc::now().to_rfc3339(),
-            "epoch":self.epoch,"observedRows":seen,"droppedChunks":self.ingress_drops.load(Ordering::Relaxed),
+            "epoch":self.epoch,"observedRows":self.observed,"droppedChunks":self.ingress_drops.load(Ordering::Relaxed),
             "gaps":gaps,"disabledDirections":disabled_directions,"droppedLogRows":lost,
             "evictedUiRows":evicted,"battle":packet_log::battle_evidence(battle.as_deref())})
     }
@@ -328,7 +350,13 @@ impl Worker {
             }
         }
     }
+    #[cfg(test)]
     fn event(&mut self, event: SocketTapEvent) {
+        let intercept = self.intercept.load(Ordering::Relaxed);
+        self.handle_event(event, intercept);
+    }
+
+    fn handle_event(&mut self, event: SocketTapEvent, intercepted_at: u64) {
         self.reset(event.session);
         if event.session != self.epoch {
             return;
@@ -372,10 +400,18 @@ impl Worker {
                 }
                 let view = &self.view;
                 let logger = self.logger.as_ref();
+                let intercept = &self.intercept;
+                let observed = &mut self.observed;
                 let generation = conn.generation;
                 let gap = conn.feed(direction, offset, &bytes, |packet| {
+                    *observed += 1;
                     let applied = self.battle.observe(event.handle, generation, &packet, view);
-                    Self::record(view, logger, event.handle, packet, applied)
+                    Self::record(view, logger, event.handle, &packet, applied, *observed);
+                    if intercepted_at & INTERCEPT_ENABLED != 0
+                        && packet.direction == Direction::Send
+                    {
+                        Self::capture(view, intercept, intercepted_at, event.handle, packet);
+                    }
                 });
                 if gap {
                     self.battle.clear(event.handle, view);
@@ -388,37 +424,46 @@ impl Worker {
         view: &Mutex<View>,
         logger: Option<&Logger>,
         handle: u64,
-        packet: Packet,
+        packet: &Packet,
         applied: bool,
+        observed: u64,
     ) {
-        let now = Utc::now();
         if let Some(logger) = logger {
+            let now = Utc::now();
             let checkpoint = (packet.direction == Direction::Receive
                 && matches!(packet.command.as_str(), "2303" | "2304" | "2401" | "2411" | "2413" | "2423" | "2426" | "2404" | "2309"))
                 .then(|| {
-                    let (seq, battle) = {
-                        let current = view.lock().unwrap();
-                        (current.seq + 1, current.battle.clone())
-                    };
+                    let battle = view.lock().unwrap().battle.clone();
                     json!({"event":"battle","timeUtc":now.to_rfc3339(),"processId":std::process::id(),
-                        "observedRow":seq,"socket":handle,"command":packet.command,"applied":applied,
+                        "observedRow":observed,"socket":handle,"command":packet.command,"applied":applied,
                         "battle":packet_log::battle_evidence(battle.as_deref())})
                 });
-            logger.push(&packet_log::record(now, handle, &packet), checkpoint);
+            logger.push(&packet_log::record(now, handle, packet), checkpoint);
         }
-        let direction = if packet.direction == Direction::Send {
-            "send"
-        } else {
-            "recv"
-        };
+    }
+    fn capture(
+        view: &Mutex<View>,
+        intercept: &AtomicU64,
+        intercepted_at: u64,
+        handle: u64,
+        packet: Packet,
+    ) {
+        if intercept.load(Ordering::Relaxed) != intercepted_at {
+            return;
+        }
         let export = packet.export.filter(|s| s.len() <= MAX_EXPORT_BYTES);
         let command: String = packet.command.chars().take(256).collect();
         let summary: String = packet.summary.chars().take(512).collect();
-        let size = command.len() + summary.len() + export.as_ref().map_or(0, String::len) + 256;
-        let data = json!({"timeMs":now.timestamp_millis(),"direction":direction,"socket":handle.to_string(),
+        let data = json!({"timeMs":Utc::now().timestamp_millis(),"direction":"send","socket":handle.to_string(),
             "cmd":command,"summary":summary,"length":packet.length,
+            "data":{"cmd":command,"id":packet.extension_id,"param":packet.parameters},
             "decoded":!matches!(packet.command.as_str(),"decode-error"|"unavailable"),"exportable":export.is_some()});
-        view.lock().unwrap().push(data, export, size);
+        let size = data.to_string().len() + export.as_ref().map_or(0, String::len);
+        let mut view = view.lock().unwrap();
+        // A queued frame from before a clear or toggle must not repopulate the list.
+        if intercept.load(Ordering::Relaxed) == intercepted_at {
+            view.push(data, export, size);
+        }
     }
     fn run(mut self, rx: mpsc::Receiver<Message>, bytes: Arc<AtomicUsize>) {
         let interval = Duration::from_millis(200);
@@ -430,9 +475,9 @@ impl Worker {
                 next_sweep = now + interval;
             }
             match rx.recv_timeout(next_sweep - now) {
-                Ok(Message::Event(e, size)) => {
+                Ok(Message::Event(e, size, intercept)) => {
                     bytes.fetch_sub(size, Ordering::Relaxed);
-                    self.event(e);
+                    self.handle_event(e, intercept);
                 }
                 Ok(Message::Reset(epoch)) => self.reset(epoch),
                 Ok(Message::Retain(epoch, enabled)) => {
@@ -476,6 +521,7 @@ impl Hub {
         let view = Arc::new(Mutex::new(View::default()));
         let dropped = Arc::new(AtomicU64::new(0));
         let worker = Worker::new(root, view.clone(), dropped.clone());
+        let intercept = worker.intercept.clone();
         let pending = bytes.clone();
         let job = thread::Builder::new()
             .name("mypro-packet-decoder".into())
@@ -487,6 +533,7 @@ impl Hub {
                 bytes,
                 dropped,
                 stopped: AtomicBool::new(false),
+                intercept,
             },
             view,
             job: Mutex::new(Some(job)),
@@ -547,7 +594,26 @@ impl Packets {
                 .map_err(|_| "Busy: 抓包后台正在处理")?;
             return Ok(json!({"requested":enabled}));
         }
-        let view = hub.view.try_lock().map_err(|_| "Busy")?;
+        let mut view = hub.view.try_lock().map_err(|_| "Busy")?;
+        if matches!(name, "packets.intercept.set" | "packets.clear") {
+            if view.epoch != self.epoch {
+                return Err("Busy: 抓包会话正在切换".into());
+            }
+            let intercept = &hub.input.intercept;
+            if name == "packets.clear" {
+                intercept.fetch_add(2, Ordering::Relaxed);
+                view.rows.clear();
+                view.bytes = 0;
+                return Ok(json!({"cleared":true}));
+            }
+            let enabled = p["enabled"].as_bool().ok_or("InvalidArguments")?;
+            let previous = intercept.load(Ordering::Relaxed);
+            if (previous & INTERCEPT_ENABLED != 0) != enabled {
+                let generation = previous.wrapping_add(2) & !INTERCEPT_ENABLED;
+                intercept.store(generation | u64::from(enabled), Ordering::Relaxed);
+            }
+            return Ok(json!({"enabled":enabled}));
+        }
         let empty = View::default();
         let current = if view.epoch == self.epoch {
             &*view
@@ -596,6 +662,8 @@ impl Packets {
         let gaps = current.gaps;
         let log_drops = current.log_drops.load(Ordering::Relaxed);
         let log = current.log.clone();
+        let intercept_enabled = view.epoch == self.epoch
+            && hub.input.intercept.load(Ordering::Relaxed) & INTERCEPT_ENABLED != 0;
         drop(view);
         let log = log.try_lock().map_err(|_| "Busy")?.clone();
         let rows: Vec<_> = selected
@@ -609,6 +677,7 @@ impl Packets {
         Ok(
             json!({"rows":rows,"nextAfter":next,"oldestSeq":first,"newestSeq":last,
             "gap":dropped>0&&after.zip(first).is_some_and(|(a,f)|a<=f),"droppedRows":dropped,"gaps":gaps,
+            "interceptEnabled":intercept_enabled,
             "droppedChunks":hub.input.dropped.load(Ordering::Relaxed).saturating_sub(self.drop_base),
             "retaining":log.enabled,"logPending":log.pending,"logFile":log.file,"logError":log.error,"droppedLogRows":log_drops}),
         )
@@ -708,7 +777,11 @@ pub(crate) mod tests {
             snapshot["details"]["enemy"]["pets"][0]["currentHp"], 100,
             "{snapshot}"
         );
-        assert_eq!(command("packets.page")["rows"][0]["cmd"], "2401");
+        let packets = command("packets.page");
+        assert_eq!(packets["interceptEnabled"], false);
+        assert_eq!(packets["rows"], json!([]));
+        assert_eq!(command("packets.clear")["cleared"], true);
+        assert_eq!(command("battle.snapshot")["details"], snapshot["details"]);
         {
             let _busy = HUB.get().unwrap().as_ref().unwrap().view.lock().unwrap();
             let same = command("battle.snapshot");
@@ -787,12 +860,13 @@ pub(crate) mod tests {
     fn test_socket(hub: &Hub) -> impl Fn(u64, SocketTapKind) + '_ {
         let lifetime = Arc::new(());
         // Direct injection into this isolated worker keeps concurrent global-session tests independent.
-        move |session, kind| {
-            hub.input
-                .tx
-                .try_send(Message::Event(tcp(session, &lifetime, kind), 0))
-                .unwrap()
-        }
+        move |session, kind| hub.input.observe(tcp(session, &lifetime, kind))
+    }
+
+    fn wait_for_worker(hub: &Hub) {
+        let (tx, rx) = mpsc::channel();
+        hub.input.tx.send(Message::Barrier(tx)).unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
     }
     fn chunk(direction: SocketDirection, offset: u64, bytes: &[u8]) -> SocketTapKind {
         SocketTapKind::Data {
@@ -844,6 +918,7 @@ pub(crate) mod tests {
             bytes: Arc::new(AtomicUsize::new(0)),
             dropped: Default::default(),
             stopped: AtomicBool::new(false),
+            intercept: Arc::default(),
         };
         let lifetime = Arc::new(());
         let e = || {
@@ -916,13 +991,13 @@ pub(crate) mod tests {
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0]["direction"], "接收");
+        assert_eq!(rows[0]["direction"], "recv");
         assert_eq!(rows[0]["cmd"], "joinOK");
         assert_eq!(rows[0]["length"], 11);
         assert_eq!(rows[0]["param"]["headerRoomId"], -1);
         assert!(rows[0]["timeUtc"].as_str().is_some());
         assert!(rows[0]["connectionPlayerId"].is_null());
-        assert_eq!(rows[1]["direction"], "发送");
+        assert_eq!(rows[1]["direction"], "send");
         assert_eq!(rows[1]["length"], 12);
         let audit_file = paths.iter().find(|p| *p != packet_file).unwrap();
         let audit = fs::read_to_string(audit_file).unwrap();
@@ -945,14 +1020,9 @@ pub(crate) mod tests {
         let first = service
             .command("packets.page", &json!({"limit":2}))
             .unwrap();
-        assert_eq!(first["rows"][0]["seq"], 3);
-        assert_eq!(first["nextAfter"], 2);
-        assert_eq!(first["rows"][0]["socket"], (u64::MAX - 2).to_string());
-        let second = service
-            .command("packets.page", &json!({"after":2,"limit":2}))
-            .unwrap();
-        assert_eq!(second["rows"][0]["seq"], 1);
-        assert!(second["nextAfter"].is_null());
+        assert_eq!(first["interceptEnabled"], false);
+        assert_eq!(first["rows"], json!([]));
+        assert!(first["nextAfter"].is_null());
         assert_eq!(
             service
                 .command("packets.page", &json!({"exportableOnly":true}))
@@ -963,12 +1033,93 @@ pub(crate) mod tests {
             service
                 .command("packets.export", &json!({"seq":1}))
                 .unwrap_err(),
-            "NotExportable"
+            "NotFound"
         );
         for path in paths {
             fs::remove_file(path).unwrap();
         }
         fs::remove_dir(dir).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn send_interception_and_clear_do_not_limit_retained_packets() {
+        let root = unique_dir();
+        let hub = Arc::new(Hub::start(&root).unwrap());
+        let epoch = u64::MAX - 1;
+        let service = Packets {
+            hub: Ok(hub.clone()),
+            epoch,
+            drop_base: 0,
+            last_details: None,
+        };
+        let lifetime = Arc::new(());
+        let deliver = |kind| hub.input.observe(tcp(epoch, &lifetime, kind));
+        let send_offset = std::cell::Cell::new(0);
+        let outgoing = |data: &[u8]| {
+            let offset = send_offset.get();
+            send_offset.set(offset + data.len() as u64);
+            chunk(SocketDirection::Send, offset, data)
+        };
+        let frame = [0, 0, 0, 7, 0, 0x4e, 0x33, 255, 255, 255, 255];
+        let page = |p: Value| service.command("packets.page", &p).unwrap();
+        let toggle = |enabled| {
+            service
+                .command("packets.intercept.set", &json!({"enabled":enabled}))
+                .unwrap()
+        };
+        deliver(open());
+        wait_for_worker(&hub);
+        assert_eq!(page(json!({}))["interceptEnabled"], false);
+        service
+            .command("packets.retain.set", &json!({"enabled":true}))
+            .unwrap();
+        deliver(outgoing(b"<stopped/>\0"));
+        deliver(chunk(SocketDirection::Recv, 0, &frame));
+        wait_for_worker(&hub);
+        assert_eq!(page(json!({}))["rows"], json!([]));
+
+        assert_eq!(toggle(true)["enabled"], true);
+        deliver(outgoing(b"<one/>\0<two/>\0<three/>\0"));
+        deliver(chunk(SocketDirection::Recv, frame.len() as u64, &frame));
+        wait_for_worker(&hub);
+        let newest = page(json!({"limit":2}));
+        assert_eq!(newest["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(newest["rows"][0]["direction"], "send");
+        assert_eq!(newest["rows"][1]["direction"], "send");
+        assert_eq!(newest["nextAfter"], 2);
+        let older = page(json!({"after":newest["nextAfter"]}));
+        assert_eq!(older["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(older["rows"][0]["seq"], 1);
+        assert!(older["nextAfter"].is_null());
+
+        let stale = hub.input.intercept.load(Ordering::Relaxed);
+        assert_eq!(service.command("packets.clear", &json!({})).unwrap()["cleared"], true);
+        hub.input.tx.send(Message::Event(
+            tcp(epoch, &lifetime, outgoing(b"<cleared/>\0")), 0, stale
+        )).unwrap();
+        deliver(outgoing(b"<fresh/>\0"));
+        wait_for_worker(&hub);
+        assert_eq!(page(json!({}))["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(toggle(false)["enabled"], false);
+        deliver(outgoing(b"<stopped-again/>\0"));
+        deliver(chunk(SocketDirection::Recv, 2 * frame.len() as u64, &frame));
+        hub.finish();
+        let after = page(json!({}));
+        assert_eq!(after["interceptEnabled"], false);
+        assert_eq!(after["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(after["rows"][0]["seq"], 4);
+
+        let log_path = after["logFile"].as_str().unwrap();
+        let logged: Vec<Value> = fs::read_to_string(log_path).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(logged.iter().filter(|row| row["direction"] == "send").count(), 7);
+        assert_eq!(logged.iter().filter(|row| row["direction"] == "recv").count(), 3);
+        let logs = root.join("logs");
+        for item in fs::read_dir(&logs).unwrap() {
+            fs::remove_file(item.unwrap().path()).unwrap();
+        }
+        fs::remove_dir(logs).unwrap();
         fs::remove_dir(root).unwrap();
     }
 
@@ -1220,7 +1371,9 @@ pub(crate) mod tests {
             bytes: Default::default(),
             dropped: Default::default(),
             stopped: AtomicBool::new(false),
+            intercept: worker.intercept.clone(),
         };
+        worker.intercept.store(INTERCEPT_ENABLED, Ordering::Relaxed);
         for victim in [2, owner] {
             let lease = live.remove(&victim).unwrap();
             input.observe(evt(
@@ -1233,11 +1386,11 @@ pub(crate) mod tests {
             worker.reap_closed();
             assert!(worker.connections.contains_key(&victim));
             assert!(worker.view.lock().unwrap().battle.is_some());
-            let Message::Event(event, size) = rx.try_recv().unwrap() else {
+            let Message::Event(event, size, intercept) = rx.try_recv().unwrap() else {
                 panic!()
             };
             input.bytes.fetch_sub(size, Ordering::Relaxed);
-            worker.event(event);
+            worker.handle_event(event, intercept);
             assert_eq!(
                 worker.view.lock().unwrap().rows.back().unwrap().data["cmd"],
                 "policy"
@@ -1291,6 +1444,10 @@ pub(crate) mod tests {
         let login = login();
         let send = test_socket(&hub);
         send(epoch, open());
+        wait_for_worker(&hub);
+        service
+            .command("packets.intercept.set", &json!({"enabled":true}))
+            .unwrap();
         send(epoch, chunk(SocketDirection::Send, 0, &login));
         send(
             epoch,
@@ -1306,6 +1463,11 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(page["rows"].as_array().unwrap().len(), 1);
         let seq = &page["rows"][0]["seq"];
+        assert_eq!(page["rows"][0]["direction"], "send");
+        assert_eq!(
+            page["rows"][0]["data"],
+            json!({"cmd":"fixture","id":42,"param":{"text":"quoted | value"}})
+        );
         let row = service
             .command("packets.export", &json!({"seq":seq}))
             .unwrap();

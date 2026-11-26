@@ -1,13 +1,13 @@
 //! Parse a complete workshop script for the local rehearsal page.
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Message {
     id: u16,
     cmd: String,
-    param: Map<String, Value>,
+    param: Value,
 }
 
 fn step(text: &str) -> Result<Value, String> {
@@ -31,7 +31,11 @@ fn step(text: &str) -> Result<Value, String> {
     }
     let raw = text.strip_prefix("#send=").ok_or("无法识别的指令")?;
     let message: Message = serde_json::from_str(raw)
-        .map_err(|e| format!("#send 需要 id、cmd 和 param 对象（{e}）"))?;
+        .map_err(|e| format!("#send 需要 id、cmd 和 param（{e}）"))?;
+    let param = message.param.as_object();
+    if param.is_none() && !message.param.is_null() {
+        return Err("param 需要对象或 null".into());
+    }
     if message.cmd.is_empty()
         || message.cmd.trim() != message.cmd
         || message.cmd.encode_utf16().count() > 256
@@ -39,8 +43,8 @@ fn step(text: &str) -> Result<Value, String> {
         return Err("cmd 需要 1～256 个字符，首尾不能有空白".into());
     }
     let mut row = json!({"kind":"message","id":message.id,"cmd":message.cmd,
-        "fields":message.param.keys().filter(|k| k.as_str() != ":ext_seq;").count()});
-    if message.id == 13 && message.cmd == "1212" && message.param.is_empty() {
+        "fields":param.map_or(0, |p| p.keys().filter(|k| k.as_str() != ":ext_seq;").count())});
+    if message.id == 13 && message.cmd == "1212" && param.is_some_and(|p| p.is_empty()) {
         row["action"] = json!("readOwnBag");
     }
     Ok(row)
@@ -104,6 +108,13 @@ pub(crate) fn validate(payload: &Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observed_null_param_rehearses_without_granting_the_native_action() {
+        let result = validate(&json!({"text": "#send={\"id\":13,\"cmd\":\"1212\",\"param\":null}|"})).unwrap();
+        assert_eq!(result["steps"][0]["fields"], 0);
+        assert_eq!(result["canReadOwnBag"], false);
+    }
 
     #[test]
     fn only_a_single_targetless_own_bag_read_offers_the_native_action() {

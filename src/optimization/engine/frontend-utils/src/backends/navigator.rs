@@ -328,7 +328,6 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
             }
         };
 
-        ruffle_core::mypro_observer::observe("resource", processed_url.as_str(), "");
         let game_ui = self.aola_game_ui.as_ref().and_then(|root| {
             aola_game_ui::Asset::requested(&request, &processed_url)
                 .map(|asset| aola_game_ui::Selection {root:root.clone(),url:processed_url.to_string(),asset})
@@ -1128,28 +1127,14 @@ mod tests {
     #[tokio::test]
     async fn morph_fetch_adapts_official_target_then_streams_disk_and_restores_source() {
         use aola_morph_transform::tests::fixture;
-        use ruffle_core::mypro_observer::{
-            MorphAssetKind, MorphAssetResult, MorphRuleSnapshot, install_morph_asset_sink,
-            publish_morph_rules,
-        };
+        use ruffle_core::mypro_observer::{MorphRuleSnapshot, publish_morph_rules};
         use ruffle_core::swf::{self, Compression, DefineBinaryData, Header, SwfStr, SymbolClassLink, Tag, TagCode};
-
-        static LAST_REPORT: Mutex<Option<MorphAssetResult>> = Mutex::new(None);
-        fn capture_report(kind: MorphAssetKind, source: u32, face: u8, result: MorphAssetResult) {
-            if matches!(kind, MorphAssetKind::Backpack) && source == 431 && face == 0 {
-                *LAST_REPORT.lock().unwrap() = Some(result);
-            }
-        }
 
         struct ResetRules;
         impl Drop for ResetRules {
-            fn drop(&mut self) {
-                publish_morph_rules(MorphRuleSnapshot::default());
-                let _ = LAST_REPORT.lock().unwrap().take();
-            }
+            fn drop(&mut self) { publish_morph_rules(MorphRuleSnapshot::default()); }
         }
         let _reset = ResetRules;
-        install_morph_asset_sink(capture_report);
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("cache");
         let cache = AoqiCache::new(root.clone()).unwrap();
@@ -1192,11 +1177,9 @@ mod tests {
             backend.fetch(Request::get(url.to_string())).await.ok().unwrap()
         }
         assert_eq!(get(&backend, &source).await.body().await.unwrap(), original, "catalog unavailable");
-        assert!(matches!(LAST_REPORT.lock().unwrap().take(), Some(MorphAssetResult::Fallback(12345))));
         assert_eq!(get(&backend, &catalog).await.body().await.unwrap(), catalog_bytes);
         let response = get(&backend, &source).await;
         assert_eq!(response.url(), source.as_str());
-        assert!(matches!(LAST_REPORT.lock().unwrap().take(), Some(MorphAssetResult::Adapted(12345))));
         let adapted = response.body().await.unwrap();
         let movie = swf::decompress_swf(adapted.as_slice()).unwrap();
         let parsed = swf::parse_swf(&movie).unwrap();
@@ -1213,13 +1196,11 @@ mod tests {
         assert_eq!(response.expected_length().unwrap(), Some(adapted.len() as u64));
         assert_eq!(response.next_chunk().await.unwrap().unwrap(), adapted);
         assert!(response.next_chunk().await.unwrap().is_none());
-        assert!(matches!(LAST_REPORT.lock().unwrap().take(), Some(MorphAssetResult::Adapted(12345))));
         drop(response);
         std::fs::rename(&offline, &official).unwrap();
 
         publish_morph_rules(MorphRuleSnapshot { revision: 2, ..Default::default() });
         assert_eq!(get(&backend, &source).await.body().await.unwrap(), original);
-        assert!(matches!(LAST_REPORT.lock().unwrap().take(), Some(MorphAssetResult::Original)));
     }
 
     #[tokio::test]

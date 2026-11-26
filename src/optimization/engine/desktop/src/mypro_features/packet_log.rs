@@ -16,7 +16,7 @@ pub fn record(now: DateTime<Utc>, handle: u64, packet: &Packet) -> Value {
     let mut row = json!({
         "timeUtc": now.to_rfc3339_opts(SecondsFormat::Micros, true),
         "timeLocal": now.with_timezone(&Local).to_rfc3339_opts(SecondsFormat::Micros, false),
-        "direction": if packet.direction == Direction::Send { "发送" } else { "接收" },
+        "direction": if packet.direction == Direction::Send { "send" } else { "recv" },
         "processId": std::process::id(), "socket": handle, "connectionPlayerId":packet.connection_player_id,
         "length": packet.length, "decoded": !matches!(packet.command.as_str(),"decode-error"|"unavailable"),
         "summary":packet.summary
@@ -146,7 +146,7 @@ impl Logger {
                     let dest = open(&file)?;
                     let mut writer = BufWriter::with_capacity(64 * 1024, dest);
                     *status.lock().unwrap() = LogStatus {
-                        file: Some(file),
+                        file: Some(dir.join(file).to_string_lossy().into_owned()),
                         enabled: true,
                         ..Default::default()
                     };

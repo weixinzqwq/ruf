@@ -96,19 +96,44 @@ pub fn sync(player: &PlayerController) {
     }
 }
 
+const PANELS: [(&str, &str, &str, &str); 2] = [
+    (
+        "theme-settings",
+        "控制栏装扮",
+        "activityres/activity240927/controlbarskinsetting/controlbarskinsetting_code",
+        "mmo.activity240927.controlbarskinsetting.panel.CBSS_MainPl",
+    ),
+    (
+        "summoner",
+        "召唤师",
+        "activityres/activity250516/newzhaohuanshi/newzhaohuanshi_code",
+        "mmo.activity250516.newzhaohuanshi.panel.NZHS_MainPl",
+    ),
+];
+
 pub fn command(
     player: &PlayerController,
     name: &str,
     payload: &Value,
 ) -> Option<Result<Value, String>> {
     match name {
-        "game.panels" => Some(Ok(json!({"panels":[
-            {"id":"theme-settings","name":"控制栏装扮"},{"id":"summoner","name":"召唤师"}]}))),
+        "game.panels" => {
+            let panels: Vec<_> = PANELS.iter().map(|&(id, name, url, cls)| {
+                json!({"id":id,"name":name,"url":url,"cls":cls})
+            }).collect();
+            Some(Ok(json!({"panels":panels})))
+        }
         "game.panel.open" => {
-            let id = payload["id"].as_str().unwrap_or("");
-            if !matches!(id, "theme-settings" | "summoner") {
+            let panel = PANELS.iter().find(|&&(id, _, url, cls)| {
+                if let Some(requested) = payload["id"].as_str() {
+                    requested == id
+                } else {
+                    payload["url"] == url && payload["cls"] == cls
+                }
+            });
+            let Some(&(id, _, _, _)) = panel else {
                 return Some(Err("InvalidArguments: 未知游戏面板".into()));
-            }
+            };
             let result = player.get().and_then(|mut p| {
                 p.try_call_internal_interface("onAolaOpenPanel", [Flash::from(id.to_owned())])
             });

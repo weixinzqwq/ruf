@@ -22,7 +22,8 @@ impl Operation {
     pub(super) fn for_method(abc: &AbcFile, index: u32) -> Self {
         // Check the cheap method index before inspecting the owner and binding.
         let (operation, instance, package, class, member) = match index {
-            14 if crate::mypro_observer::installed() => (Self::OpenActivityPanel, 0, "mmo.play.activity.helper", "Panel_Helper", "loadResAndShow"),
+            // Method bindings are cached before the tools window can enable capture.
+            14 => (Self::OpenActivityPanel, 0, "mmo.play.activity.helper", "Panel_Helper", "loadResAndShow"),
             222 => (Self::ClassifyView, 28, "mmo.petpackage.controller.skin", "PackageSkinManager", "changeClassify"),
             224 => (Self::DisposeSkin, 28, "mmo.petpackage.controller.skin", "PackageSkinManager", "dispose"),
             317 => (Self::ConstructPanel, 41, "mmo.petpackage.panel", "PetPackagePanel", ""),
