@@ -124,7 +124,8 @@ public class MyProBackpackPatch {
                 .filter(abc -> abc.findClassByName(DETAIL) >= 0).findFirst().orElseThrow();
             revision(game, true);
             scale(game, true);
-            System.out.println("Verified backpack revision and scale callbacks in " + candidate);
+            MyProBackpackVisualPatch.apply(game, true);
+            System.out.println("Verified backpack revision, scale and visual skin callbacks in " + candidate);
         }
     }
 
@@ -142,6 +143,7 @@ public class MyProBackpackPatch {
         PetActiveTabSwitchPatch.apply(abc);
         revision(abc, false);
         scale(abc, false);
+        MyProBackpackVisualPatch.apply(abc, false);
         try (var out = Files.newOutputStream(Path.of(args[2]))) { abc.saveToStream(out); }
     }
 }

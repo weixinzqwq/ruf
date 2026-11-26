@@ -1157,7 +1157,21 @@ mod tests {
             &["mmo.peticon.PetMovie431_1", "mmo.peticon.PetMovie431Config"]);
         let replacement = fixture(Compression::Zlib, TagCode::DoAbc2,
             &["mmo.peticon.PetMovie12345_2", "mmo.peticon.PetMovie12345Config"]);
-        let xml = br#"<version><f n="peticon/movie/type0/petmovie12345/petmovie12345_0" v="42" /></version>"#;
+        let icon_original = fixture(Compression::None, TagCode::DoAbc2, &["mmo.pet.peticon431"]);
+        let icons = [
+            ("peticon/petfighticon/peticon", "_Half"),
+            ("peticon/peticon", "_S"),
+        ].map(|(prefix, suffix)| {
+            let url = |file| Url::parse(&format!("https://aola.100bt.com/play/{prefix}{file}.swf")).unwrap();
+            let bytes = fixture(Compression::Zlib, TagCode::DoAbc2,
+                &["mmo.pet.peticon12345_F", &format!("mmo.pet.peticon12345{suffix}")]);
+            (url("431~17"), url("12345~42"), bytes, format!("mmo.pet.peticon431{suffix}"))
+        });
+        let xml = br#"<version>
+            <f n="peticon/movie/type0/petmovie12345/petmovie12345_0" v="42" />
+            <f n="peticon/petfighticon/peticon12345" v="42" />
+            <f n="peticon/peticon12345" v="42" />
+        </version>"#;
         let mut catalog_bytes = Vec::new();
         swf::write_swf(&Header::default_with_swf_version(18), &[
             Tag::DefineBinaryData(DefineBinaryData { id: 1, data: xml }),
@@ -1169,8 +1183,15 @@ mod tests {
             let policy = AoqiCache::response_policy(url, url, 200, &header::HeaderMap::new()).unwrap();
             assert!(cache.store(url, &policy, bytes).unwrap());
         }
+        for (source, target, bytes, _) in &icons {
+            for (url, bytes) in [(source, &icon_original), (target, bytes)] {
+                let policy = AoqiCache::response_policy(url, url, 200, &header::HeaderMap::new()).unwrap();
+                assert!(cache.store(url, &policy, bytes).unwrap());
+            }
+        }
         publish_morph_rules(MorphRuleSnapshot {
-            enabled: true, revision: 1, backpack_map: [(431, 12345)].into(), ..Default::default()
+            enabled: true, revision: 1, backpack_map: [(431, 12345)].into(),
+            head_icon_map: [(431, 12345)].into(), ..Default::default()
         });
 
         async fn get(backend: &ExternalNavigatorBackend<TestFutureSpawner, ()>, url: &Url) -> Box<dyn SuccessResponse> {
@@ -1189,6 +1210,18 @@ mod tests {
         assert_eq!(cache.lookup(&target).unwrap().unwrap().bytes, replacement);
         assert_eq!(cache.lookup(&source).unwrap().unwrap().bytes, original);
 
+        let mut icon_adapted = Vec::new();
+        for (source, _, _, view) in &icons {
+            let bytes = get(&backend, source).await.body().await.unwrap();
+            let movie = swf::decompress_swf(bytes.as_slice()).unwrap();
+            let parsed = swf::parse_swf(&movie).unwrap();
+            assert!(parsed.tags.iter().any(|tag| matches!(tag, Tag::SymbolClass(links)
+                if links.iter().any(|link| link.class_name.as_bytes() == view.as_bytes()))));
+            icon_adapted.push(bytes);
+            assert_eq!(cache.lookup(source).unwrap().unwrap().bytes, icon_original);
+        }
+        assert_eq!(cache.stats().unwrap()["morphAdaptedEntries"], 3);
+
         let official = cache.root().join("v1");
         let offline = cache.root().join("offline-test");
         std::fs::rename(&official, &offline).unwrap();
@@ -1197,10 +1230,16 @@ mod tests {
         assert_eq!(response.next_chunk().await.unwrap().unwrap(), adapted);
         assert!(response.next_chunk().await.unwrap().is_none());
         drop(response);
+        for ((url, _, _, _), bytes) in icons.iter().zip(icon_adapted) {
+            assert_eq!(get(&backend, url).await.body().await.unwrap(), bytes);
+        }
         std::fs::rename(&offline, &official).unwrap();
 
         publish_morph_rules(MorphRuleSnapshot { revision: 2, ..Default::default() });
         assert_eq!(get(&backend, &source).await.body().await.unwrap(), original);
+        for (url, _, _, _) in &icons {
+            assert_eq!(get(&backend, url).await.body().await.unwrap(), icon_original);
+        }
     }
 
     #[tokio::test]

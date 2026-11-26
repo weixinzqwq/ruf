@@ -138,7 +138,11 @@ impl State {
             enemy_enabled: self.battle_rules.enabled && self.battle_rules.enemy,
             backpack_map: mappings(&self.desired, |r| r.backpack),
             battle_map: mappings(&self.battle_rules, |r| r.fight),
-            poster_map: mappings(&self.desired, |r| r.portrait),
+            head_icon_map: mappings(&self.battle_rules, |r| r.fight.or(r.backpack)),
+            poster_map: self.desired.rows.iter()
+                .filter(|_| self.desired.enabled)
+                .filter_map(|(&source, row)| row.portrait.map(|skin| (source, skin)))
+                .collect(),
         }
     }
 
@@ -293,7 +297,8 @@ mod tests {
     fn aola_mypro_morph_keeps_identity_and_battle_binding() {
         let p = json!({"enabled":true,"enemy":true,"rules":{"skins":[
             {"originalId":"4","fightId":7,"backpackId":12,"spskiId":45},
-            {"originalId":7,"fightId":"9"}
+            {"originalId":7,"fightId":"9"},
+            {"originalId":8,"backpackId":10,"spskiId":8}
         ]}});
         let mut s = State::default();
         s.publish(Rules::parse(&p, 1).unwrap());
@@ -303,8 +308,11 @@ mod tests {
         assert!(active.enabled);
         assert!(active.enemy_enabled);
         assert_eq!(active.battle_map.get(&4), Some(&7));
+        assert_eq!(active.head_icon_map.get(&4), Some(&7));
+        assert_eq!(active.head_icon_map.get(&8), Some(&10));
         assert_eq!(active.backpack_map.get(&4), Some(&12));
         assert_eq!(active.poster_map.get(&4), Some(&45));
+        assert_eq!(active.poster_map.get(&8), Some(&8));
 
         s.publish(Rules {
             revision: 2,
@@ -315,11 +323,13 @@ mod tests {
         assert!(!restored.enabled);
         assert!(restored.enemy_enabled);
         assert_eq!(restored.battle_map.get(&4), Some(&7));
+        assert_eq!(restored.head_icon_map.get(&8), Some(&10));
         assert!(restored.backpack_map.is_empty());
         assert!(restored.poster_map.is_empty());
 
         s.boundary(false);
         assert!(s.rule_snapshot().battle_map.is_empty());
+        assert!(s.rule_snapshot().head_icon_map.is_empty());
         assert!(!s.rule_snapshot().enemy_enabled);
         let mut invalid = p;
         invalid["rules"]["skins"][1]["originalId"] = json!("4");

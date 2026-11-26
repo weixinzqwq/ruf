@@ -357,17 +357,37 @@ fn arguments(args: &[Value]) -> &[Value] {
     }
 }
 
+fn asset_id(value: &Value) -> Option<u32> {
+    match value {
+        Value::Number(id) if (1.0..=f64::from(i32::MAX)).contains(id) && id.fract() == 0.0 => {
+            Some(*id as u32)
+        }
+        _ => None,
+    }
+}
+
 fn backpack_target(args: &[Value], rules: &ruffle_core::mypro_observer::MorphRuleSnapshot) -> u32 {
-    let [Value::Number(source)] = arguments(args) else {
+    let [source] = arguments(args) else { return 0 };
+    if !rules.enabled { return 0; }
+    asset_id(source)
+        .and_then(|id| rules.backpack_map.get(&id))
+        .copied()
+        .unwrap_or_default()
+}
+
+fn visual_skin_id(args: &[Value], rules: &ruffle_core::mypro_observer::MorphRuleSnapshot) -> u32 {
+    let [view, skin @ Value::Number(_), confirmed @ ..] = arguments(args) else { return 0 };
+    let Some(view) = asset_id(view).filter(|_| rules.enabled && confirmed.len() <= 1) else {
         return 0;
     };
-    if !rules.enabled || !(1.0..=f64::from(i32::MAX)).contains(source) || source.fract() != 0.0 {
-        return 0;
-    }
-    rules
-        .backpack_map
-        .get(&(*source as u32))
+    rules.poster_map.get(&view)
+        .or_else(|| asset_id(skin).and_then(|id| rules.poster_map.get(&id)))
         .copied()
+        .or_else(|| {
+            // The SWF confirms the ID against the game's skin table before retrying.
+            let candidate = confirmed.first().and_then(asset_id)?;
+            (rules.backpack_map.get(&view) == Some(&candidate)).then_some(candidate)
+        })
         .unwrap_or_default()
 }
 
@@ -506,6 +526,13 @@ impl ExternalInterfaceProvider for AolaInterface {
                 return Value::from(0u32);
             }
             return Value::from(backpack_target(
+                args,
+                &ruffle_core::mypro_observer::morph_rule_snapshot(),
+            ));
+        }
+        if name == "aolaMyProVisualSkinId" {
+            if !crate::mypro_host::enabled() { return Value::from(0u32); }
+            return Value::from(visual_skin_id(
                 args,
                 &ruffle_core::mypro_observer::morph_rule_snapshot(),
             ));
@@ -846,6 +873,28 @@ mod tests {
             assert_eq!(backpack_target(&[Value::Number(invalid)], &rules), 0);
         }
         assert_eq!(backpack_target(&[], &rules), 0);
+    }
+
+    #[test]
+    fn aola_visual_skin_prefers_poster_then_confirmed_backpack_target() {
+        let mut rules = ruffle_core::mypro_observer::MorphRuleSnapshot {
+            enabled: true,
+            backpack_map: [(5336, 6044), (5337, 5999)].into(),
+            poster_map: [(5336, 1029), (1030, 1100)].into(),
+            ..Default::default()
+        };
+        let query = |rules: &_, view, skin, confirmed: Option<i32>| {
+            let mut args = vec![Value::from(view), Value::from(skin)];
+            args.extend(confirmed.map(Value::from));
+            visual_skin_id(&args, rules)
+        };
+        assert_eq!(query(&rules, 5336, 1030, Some(6044)), 1029);
+        assert_eq!(query(&rules, 5337, 1030, Some(5999)), 1100);
+        assert_eq!(query(&rules, 5337, 0, None), 0);
+        assert_eq!(query(&rules, 5337, 0, Some(6044)), 0);
+        assert_eq!(query(&rules, 5337, 0, Some(5999)), 5999);
+        rules.enabled = false;
+        assert_eq!(query(&rules, 5336, 1030, Some(6044)), 0);
     }
 
     #[test]

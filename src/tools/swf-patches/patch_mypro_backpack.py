@@ -21,7 +21,8 @@ def build(work,emit=False):
     bundle.mkdir()
     scripts = Path(__file__).resolve().parent
     lib = str(ROOT / "toolchain/ffdec/lib/*")
-    names = ["MyProBackpackPatch", "PetListSwitchPatch", "PetTabSwitchPatch", "PetActiveTabSwitchPatch", "PetSwitchPatch"]
+    names = ["MyProBackpackPatch", "MyProBackpackVisualPatch", "PetListSwitchPatch", "PetTabSwitchPatch",
+             "PetActiveTabSwitchPatch", "PetSwitchPatch"]
     subprocess.run([JAVA.with_name("javac.exe"), "-encoding", "UTF-8", "-cp", lib, "-d", classes,
                     *(scripts / (name+".java") for name in names)],check=True)
     globals_dir = ENGINE / "core/src/avm2/globals"

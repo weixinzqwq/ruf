@@ -25,6 +25,7 @@ pub struct MorphRuleSnapshot {
     pub backpack_map: HashMap<u32, u32>,
     // An empty map means battle replacement is disabled at the last boundary.
     pub battle_map: HashMap<u32, u32>,
+    pub head_icon_map: HashMap<u32, u32>,
     pub poster_map: HashMap<u32, u32>,
 }
 

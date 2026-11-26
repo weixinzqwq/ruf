@@ -113,6 +113,7 @@ pub struct ToolsHost {
     session: Option<Option<i64>>,
     event_sequence: u64,
     background_revision: u32,
+    visual_morph_revision: u64,
     services: ToolsService,
     lineups: crate::mypro_features::lineups::Lineups,
     features: Features,
@@ -250,7 +251,7 @@ impl ToolsHost {
         Ok(Self { input: None, web: None, context: WebContext::new(Some(root.join("mypro-webview"))),
             toolbar, panel_move, panel, parent, proxy, generation: Rc::new(Cell::new(0)), queued: Rc::new(Cell::new(0)),
             ready: 0, last_request: 0, visible: false, shown: false, session: None, event_sequence: 0,
-            background_revision: 0, services: ToolsService::new(root.clone()),
+            background_revision: 0, visual_morph_revision: 0, services: ToolsService::new(root.clone()),
             lineups: crate::mypro_features::lineups::Lineups::new(root.join("mypro")), features: Features::new(root) })
     }
 
@@ -421,6 +422,13 @@ impl ToolsHost {
                 movie.try_call_internal_interface("aolaRefreshBattleBackground", []);
                 self.background_revision = revision;
             }
+        }
+        let visual_revision = ruffle_core::mypro_observer::morph_rule_snapshot().revision;
+        if visual_revision != self.visual_morph_revision && !crate::mypro_services::in_battle()
+            && let Some(mut movie) = player.get()
+        {
+            movie.try_call_internal_interface("onAolaMyProVisualRefresh", []);
+            self.visual_morph_revision = visual_revision;
         }
         if self.session != Some(current) { self.lineups.reset(); }
         self.lineups.tick(player,crate::mypro_services::in_battle);

@@ -1,4 +1,4 @@
-"""Exercise the packaged backpack revision and HD scaling with an offline host."""
+"""Exercise the packaged backpack revision, visual skin and HD scaling with an offline host."""
 import struct
 
 from observe_skin_motion import INTERFACES, abc_tags, iter_tags, unpack_swf
@@ -22,6 +22,17 @@ if __name__ == "__main__":
     run_probe(args, "aola_backpack_revision", "MyProBackpackProbe", "MyProBackpackHost.java", native_scale,
               "initial false true\nrule changed true true\nsame rule false true\nrestore true true\n"
               "missing result false true\nmissing host false true\nhost resumed true true\n"
+              "visual poster priority 5997 5336,533601,0\n"
+              "visual invalid explicit poster 533601\n"
+              "visual backpack skin 6044 5336,533601,0;5336,533601,6044\n"
+              "visual missing skin record 533601 5336,533601,0\n"
+              "visual confirmation changed 533601\nvisual rule restored 533601\nvisual absent host 533601 0\n"
+              "visual refresh callback registered true\nvisual refresh updates active view 1 true\n"
+              "visual refresh updates controls and icons 3 1 1 1 1 0\n"
+              "visual refresh drops closed view 1 3 1 1 1 1 0\n"
+              "visual background guards stale loads current,replacement\n"
+              "visual normal voice handled locally true 6044,6044,6044\n"
+              "visual mapped unlock stays local true 5997,5997\nvisual official unlock retained false 533601\n"
               "native scale groups true\n"
               "normal to .3 true true true true\nfresh attachment true true true true\n"
               ".3 to normal true true true true\n.3 to .4 true true true true\n"

@@ -274,10 +274,14 @@ fn touch(path: &Path) {
 }
 
 fn versioned_morph_path(path: &str) -> bool {
-    ["/play/fightassets/bitmap/", "/play/peticon/movie/", "/play/pet/petskin/background/"]
-        .iter().any(|prefix| path.starts_with(prefix))
-        && path.strip_suffix(".swf").and_then(|path| path.rsplit_once('~'))
-            .is_some_and(|(_, version)| numeric_version(version))
+    let Some((name, version)) = path.strip_suffix(".swf").and_then(|path| path.rsplit_once('~')) else { return false; };
+    numeric_version(version) && (
+        ["/play/fightassets/bitmap/", "/play/peticon/movie/", "/play/pet/petskin/background/"]
+            .iter().any(|prefix| name.starts_with(prefix))
+        || ["/play/peticon/petfighticon/peticon", "/play/peticon/peticon"]
+            .into_iter().filter_map(|prefix| name.strip_prefix(prefix))
+            .any(|id| !id.is_empty() && !id.starts_with('0') && id.bytes().all(|byte| byte.is_ascii_digit()))
+    )
 }
 
 pub(super) fn numeric_version(version: &str) -> bool {
@@ -293,7 +297,7 @@ fn adapted_entry_name(path: &Path) -> bool {
     let Some((part, version)) = fields.next().and_then(|rest| rest.rsplit_once('-')) else { return false; };
     source.is_some_and(|id| id > 0) && target.is_some_and(|id| id > 0)
         && source != target && numeric_version(version)
-        && matches!(part, "poster" | "backpack-0" | "backpack-1" | "backpack-2" | "backpack-3"
+        && matches!(part, "poster" | "head-icon" | "head-icon-legacy" | "backpack-0" | "backpack-1" | "backpack-2" | "backpack-3"
             | "battle-1-0" | "battle-1-1" | "battle-1-2" | "battle-2-0" | "battle-2-1" | "battle-2-2")
 }
 
@@ -483,6 +487,12 @@ mod tests {
         headers.insert("cache-control", "private, no-cache, max-age=0".parse().unwrap());
         assert!(AoqiCache::response_policy(&url, &url, 200, &headers).is_some());
         assert!(AoqiCache::response_policy(&unversioned, &unversioned, 200, &headers).is_none());
+        for name in ["peticon/petfighticon/peticon5336", "peticon/peticon4167"] {
+            let url = Url::parse(&format!("https://aola.100bt.com/play/{name}~1210.swf")).unwrap();
+            assert!(AoqiCache::response_policy(&url, &url, 200, &headers).is_some());
+        }
+        let unrelated = Url::parse("https://aola.100bt.com/play/peticon/peticon_skin~1210.swf").unwrap();
+        assert!(AoqiCache::response_policy(&unrelated, &unrelated, 200, &headers).is_none());
         headers.append("cache-control", "no-store".parse().unwrap());
         assert!(AoqiCache::response_policy(&url, &url, 200, &headers).is_none());
     }

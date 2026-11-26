@@ -1,4 +1,4 @@
-//! Serve adapted Aola model leaves without putting them in the official URL cache.
+//! Serve adapted Aola resources without putting them in the official URL cache.
 
 use super::aola_morph_transform::{self, MorphKind};
 use super::fetch::{self, MovieBodyFilter, Response, ResponseBody};
@@ -17,6 +17,8 @@ use url::Url;
 const OFFICIAL_HOST: &str = "aola.100bt.com";
 const BACKPACK: &str = "peticon/movie/type0/";
 const BATTLE: &str = "fightassets/bitmap/";
+const FIGHT_HEAD_ICON: &str = "peticon/petfighticon/peticon";
+const LEGACY_HEAD_ICON: &str = "peticon/peticon";
 const POSTER: &str = "pet/petskin/background/";
 const VERSION_CLASS: &[u8] = b"mmo.versiondata.VersionData_versionClass";
 // VersManager.getVersion uses this SWF version when setVersionXml has no row.
@@ -77,7 +79,8 @@ pub(super) fn try_match(request: &Request, url: &Url) -> Option<Selection> {
         MorphKind::Battle { face, .. } if face == 2 || rules.enemy_enabled => {
             rules.battle_map.get(&source)
         }
-        MorphKind::Poster if rules.enabled => rules.poster_map.get(&source),
+        MorphKind::HeadIcon { .. } => rules.head_icon_map.get(&source),
+        // The backpack drives the native poster request with its visual skin ID.
         _ => None,
     };
     let target = target.copied().filter(|&id| id != 0 && id != source)?;
@@ -120,6 +123,10 @@ fn parse_asset(path: &str) -> Option<(u32, MorphKind)> {
         let face = match face { "1" => 1, "2" => 2, _ => return None };
         let part = match part { "0" => 0, "1" => 1, "2" => 2, _ => return None };
         Some((source, MorphKind::Battle { face, part }))
+    } else if let Some(source) = path.strip_prefix(FIGHT_HEAD_ICON) {
+        Some((id(source)?, MorphKind::HeadIcon { legacy: false }))
+    } else if let Some(source) = path.strip_prefix(LEGACY_HEAD_ICON) {
+        Some((id(source)?, MorphKind::HeadIcon { legacy: true }))
     } else {
         let source = id(path.strip_prefix(POSTER)?.strip_prefix("petskinbackground")?)?;
         Some((source, MorphKind::Poster))
@@ -130,6 +137,8 @@ fn asset_name(id: u32, kind: MorphKind) -> String {
     match kind {
         MorphKind::Backpack { index } => format!("{BACKPACK}petmovie{id}/petmovie{id}_{index}"),
         MorphKind::Battle { face, part } => format!("{BATTLE}pet{id}/pet{id}_{face}_{part}"),
+        MorphKind::HeadIcon { legacy: false } => format!("{FIGHT_HEAD_ICON}{id}"),
+        MorphKind::HeadIcon { legacy: true } => format!("{LEGACY_HEAD_ICON}{id}"),
         MorphKind::Poster => format!("{POSTER}petskinbackground{id}"),
     }
 }
@@ -167,6 +176,8 @@ impl Selection {
         let part = match self.kind {
             MorphKind::Backpack { index } => format!("backpack-{index}"),
             MorphKind::Battle { face, part } => format!("battle-{face}-{part}"),
+            MorphKind::HeadIcon { legacy: false } => "head-icon".to_owned(),
+            MorphKind::HeadIcon { legacy: true } => "head-icon-legacy".to_owned(),
             MorphKind::Poster => "poster".to_owned(),
         };
         let key = AdaptedKey::new(self.source, self.target, &part, version)
@@ -205,6 +216,8 @@ impl Selection {
         let (kind, face, part) = match self.kind {
             MorphKind::Backpack { index } => ("backpack", 0, index),
             MorphKind::Battle { face, part } => ("battle", face, part),
+            MorphKind::HeadIcon { legacy: false } => ("head-icon", 0, 0),
+            MorphKind::HeadIcon { legacy: true } => ("head-icon-legacy", 0, 0),
             MorphKind::Poster => ("poster", 0, 0),
         };
         tracing::info!(target: "aola_morph_http", source = u64::from(self.source),
@@ -431,6 +444,10 @@ mod tests {
             Some((5336, MorphKind::Backpack { index: 3 })));
         assert_eq!(parse_versioned_asset(&url("fightassets/bitmap/pet5336/pet5336_2_0~1210.swf")),
             Some((5336, MorphKind::Battle { face: 2, part: 0 })));
+        assert_eq!(parse_versioned_asset(&url("peticon/petfighticon/peticon5336~1210.swf")),
+            Some((5336, MorphKind::HeadIcon { legacy: false })));
+        assert_eq!(parse_versioned_asset(&url("peticon/peticon4167~1210.swf")),
+            Some((4167, MorphKind::HeadIcon { legacy: true })));
         assert_eq!(parse_versioned_asset(&url("pet/petskin/background/petskinbackground1029~12.swf")),
             Some((1029, MorphKind::Poster)));
         for path in [
@@ -438,6 +455,9 @@ mod tests {
             "peticon/movie/type1/petmovie1/petmovie1_0~1210.swf",
             "fightassets/bitmap/pet5336/pet5336_3_0~1210.swf",
             "fightassets/bitmap/pet5336/pet5336_1_3~1210.swf",
+            "peticon/petfighticon/peticon5336_0~1210.swf",
+            "peticon/peticon4167.swf",
+            "peticon/peticon04167~1210.swf",
             "pet/petskin/background/petskinbackground1029~bad.swf",
         ] { assert!(parse_versioned_asset(&url(path)).is_none(), "{path}"); }
         let other = Url::parse("https://local.example/play/fightassets/bitmap/pet53/pet53_2_0~1210.swf").unwrap();

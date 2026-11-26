@@ -19,6 +19,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 pub(super) enum MorphKind {
     Backpack { index: u8 },
     Battle { face: u8, part: u8 },
+    HeadIcon { legacy: bool },
     Poster,
 }
 
@@ -95,6 +96,7 @@ fn unpack_movie(bytes: Vec<u8>) -> Result<Vec<u8>> {
 struct ClassNames {
     mappings: Vec<(String, String)>,
     config: Option<String>,
+    head_icon: bool,
 }
 
 impl ClassNames {
@@ -115,6 +117,10 @@ impl ClassNames {
                     (format!("Pet{target}Config_{face}"), format!("Pet{source}Config_{face}"))
                 }),
             ),
+            MorphKind::HeadIcon { .. } => (
+                vec![(format!("peticon{target}"), format!("peticon{source}"))],
+                None,
+            ),
             MorphKind::Poster => (
                 vec![
                     (format!("Background{target}"), format!("Background{source}")),
@@ -131,7 +137,11 @@ impl ClassNames {
             mappings.push(mapping);
             name
         });
-        Self { mappings, config }
+        Self {
+            mappings,
+            config,
+            head_icon: matches!(kind, MorphKind::HeadIcon { .. }),
+        }
     }
 
     fn replace(&self, name: &[u8], matches: &mut ClassMatches) -> Option<Vec<u8>> {
@@ -151,7 +161,10 @@ impl ClassNames {
             if self.config.as_ref() == Some(old) {
                 matches.config |= suffix.is_empty();
             } else {
-                matches.asset = true;
+                // Some legacy URLs hold only a large icon. Require a head export,
+                // while keeping the other target exports addressable by the source ID.
+                matches.asset |= !self.head_icon
+                    || matches!(suffix, b"" | b"_F" | b"_Half" | b"_S");
             }
             let mut out = Vec::with_capacity(start + new.len() + suffix.len());
             out.extend_from_slice(&name[..start]);
@@ -459,6 +472,32 @@ pub(super) mod tests {
             }
             check(&output, &expected);
         }
+    }
+
+    #[test]
+    fn head_icon_rewrites_bare_and_suffixed_export_names_at_id_boundaries() {
+        let original = [
+            "mmo.pet.peticon4167",
+            "mmo.pet.peticon4167_F",
+            "mmo.pet.peticon4167_Half",
+            "mmo.pet.peticon4167_S",
+            "mmo.pet.peticon4167_L",
+            "mmo.pet.peticon41670_F",
+        ];
+        let expected = [
+            "mmo.pet.peticon531",
+            "mmo.pet.peticon531_F",
+            "mmo.pet.peticon531_Half",
+            "mmo.pet.peticon531_S",
+            "mmo.pet.peticon531_L",
+            "mmo.pet.peticon41670_F",
+        ];
+        let bytes = fixture(Compression::Zlib, TagCode::DoAbc2, &original);
+        let output = transform_movie(bytes, 531, 4167, MorphKind::HeadIcon { legacy: true }).unwrap();
+        check(&output, &expected);
+
+        let only_large = fixture(Compression::None, TagCode::DoAbc2, &["mmo.pet.peticon4167_L"]);
+        assert!(transform_movie(only_large, 531, 4167, MorphKind::HeadIcon { legacy: true }).is_err());
     }
 
     #[test]
