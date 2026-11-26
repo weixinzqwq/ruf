@@ -1,0 +1,583 @@
+newpetpackage.swf：切换亚比时 2—3 秒卡顿的静态分析
+分析日期：2026-11-23
+
+一、结论与证据边界
+==================
+
+本次文件中已经找到一条明确的开销放大链：
+
+选择另一只亚比 → 获取/更新详情缓存 → 同步广播 PET_DETAIL_UPDATE
+→ 多个监听者分别创建并解析详情对象
+→ 整排背包槽位刷新
+→ 已构造的隐藏页继续解析，已初始化的隐藏页还可能更新 UI
+→ 主模型、背景、标签及特效进入各自更新流程。
+
+因此，“点一下只换一个模型”不符合这个模块的实际行为。缓存命中只省掉了一部分
+网络等待，并没有消除详情对象的重复解析，也没有把刷新范围限定在当前可见内容。
+这些是直接由本次 SWF 字节码确认的冗余工作，值得优先计时并优化。
+
+另有一条不同性质的延迟：某些皮肤明确等待前置动画完成，才调用主模型 setIcon。
+这可能造成“等了几秒才出现亚比”，但不能单凭这一分支认定主线程卡死。
+
+本报告没有运行 SWF 或客户端，没有修改原附件，没有产生 CPU/GPU 采样或毫秒实测。
+不能仅凭静态结果认定上述任何一个函数独占用户观察到的 2—3 秒，也不能给出修复
+后的帧率或耗时承诺。当前 PetDetailedInfo、PetIconHandler、PetIconContainer、
+DisplayUtil、资源调度和皮肤服务的具体实现位于外部模块，尚未由这次附件闭合。
+
+证据标签：
+[本包确认] 本次上传文件的字节码、时间轴或资源定义直接支持。
+[推断] 从已确认调用关系提出的性能解释，仍需计时。
+[外部待查] 决定性实现或资源不在本次 SWF 中。
+[旧版对照] 先前其他客户端资源中的实现，仅帮助理解，不视为当前版本事实。
+
+二、样本与复核坐标
+==================
+
+输入：newpetpackage.swf
+原始格式：ZWS，SWF version 18
+原始大小：1,524,996 字节
+原始 SHA-256：
+f5dad71ae74427d3510f55ed8dbced9e53c483f90c11be254b2df204d927d7e4
+
+解压后 FWS 大小：2,197,510 字节
+解压后 SHA-256：
+df774ad8442902aa5801e1a21c4940ac49301f0183c6ca798a68e82eb3b2d43e
+
+舞台声明：960×560，23 FPS，根时间轴 1 帧。
+这不是运行时 FPS 实测，也不代表所有嵌套动画只有 1 帧。
+一个 ABC，211,736 字节，152 个类，1,502 个方法体。
+本次方法反汇编未遇到未知指令或解析错误。
+
+以下 m编号 @0x地址 均指本文件 ABC0 的 method ID 和方法 code 首字节在“解压后
+FWS 文件”中的偏移。不能直接在原始压缩 ZWS 中按这个地址定位，也不是 EXE 地址。
+伪代码是根据字节码整理，便于解释；不是原作者的 AS3 源码。
+反汇编中 pushbyte ff 的实际有符号值是 -1，不应误读为 ID 255。
+
+主要 package：
+PetDetailDataMap：mmo.petpackage.data
+PetList、PetBigIconDetail：mmo.petpackage.panel.inclusion
+PetSingleIconBase、PetSingleIconDetail：mmo.petpackage.panel.inclusion.petlist
+PetDetailBase、PetDetectInfo：mmo.petpackage.panel.inclusion.petdetailinfo
+
+三、普通点击的真实执行链
+======================
+
+1. PetList.onClick：m689 @0x20984a
+   当前图标 id > 0 时调用 setSelectedPet；空格子走其他入口。
+
+2. PetList.setSelectedPet：m691 @0x209896
+   如果仍是同一个图标且 force=false，会直接返回，已有同项点击保护。
+   真正换宠时，依次更新选中状态、解析一份 PetBriefInfo，调用：
+   IPetDataService.setSelectPetId(id)
+   PetDetailDataMap.saveCurrentPet(id)
+   PetDetailDataMap.tryUpdateCachhe(id)
+
+   注意 tryUpdateCachhe 是文件中的原始拼写。
+   setSelectPetId 的外部实现不在本包，不能据函数名断言它每次额外广播哪些事件。
+
+3. PetDetailDataMap.tryUpdateCachhe：m200 @0x1ffde2
+   逻辑等价于：
+
+     if (force || !hasCache(id)) {
+         updateCaching(id);
+         PetClient.instance.viewSinglePM(id);
+     } else {
+         tryDispatcherCurrentDetailedCachedEvent(id);
+     }
+
+   缓存命中直接走同步刷新。网络缓存未命中则先请求详情，响应到达以后再走同一条
+   更新链。因此，必须把“等待响应的时间”与“响应后阻塞刷新时间”分开。
+   本入口没有先用 isCaching 去重在途请求；快速来回选择尚未缓存的 id 可能重复
+   发请求，但普通一次点击是否重复请求不能由此直接推定。
+
+4. 网络响应路径：
+   onPMDetailUpdate：m207 @0x1ffea7
+   updateCache：m208 @0x1ffecd
+   map[id] 保存的是网络返回的原始 pm 对象，随后进入：
+
+5. tryDispatcherCurrentDetailedCachedEvent：m209 @0x1ffee8
+   只有 id 仍为当前选择才派发：
+   PET_DETAIL_UPDATE，参数为 { id: id, pm: map[id] }。
+   PetPackageEventDispatcher 直接继承 EventDispatcher，未覆写 dispatchEvent。
+   这里没有把每个监听器安排到下一帧，也没有工作线程。
+
+   Ruffle 官方 v0.7.1 的 core/src/avm2/events.rs 中，事件派发路径
+   收集监听器后，循环直接 handler.call(...)。它支持“派发期间同步调用监听器”
+   这一机制解释；不表示本次运行客户端一定就是 v0.7.1，也不构成耗时测量。[R1]
+
+实际意义：
+即使两只亚比的数据和资源都已下载，点击仍可能在一次连续调用中承担众多解析、
+UI 更新以及同步资源构造。下载缓存存在，不代表选择操作已经轻量化。
+
+四、最明确的 CPU 冗余：缓存命中后，每个消费者重新解析
+====================================================
+
+证据 P01：PetDetailDataMap.getPetDetailInfo，m194 @0x1ffd46，方法长度 40 字节。
+
+其核心行为等价于：
+
+  function getPetDetailInfo(id) {
+      var raw = map[id];
+      if (raw == null) return null;
+      var result = new PetDetailedInfo();
+      result.parseInfo(raw);
+      return result;
+  }
+
+关键指令：
+  +0x16 findpropstrict PetDetailedInfo
+  +0x18 constructprop PetDetailedInfo, 0
+  +0x20 callpropvoid parseInfo, 1
+  +0x25 returnvalue
+
+准确含义是“缓存原始资料，再按读取次数创建解析对象”，不是“直接返回已解析结果”。
+多个面板各调用一次，便各做一次 new + parse；同一个回调调用两次也不合并。
+
+本文件没有 PetDetailedInfo.parseInfo 的当前实现，所以这里能够确认重复调用，
+不能从 40 字节 getter 的体积推算解析速度，也不能断言一次解析耗时几十毫秒。
+对象分配可能增加 GC 压力，但本包不能证明某次 2—3 秒停顿正是 GC。
+
+两个额外明显的重复点：
+- GodCardList.onPetDetailedCached，m414 @0x2038b3：
+  先 getPetDetailInfo(event.id)，缓存检查成功后又 getPetDetailInfo(pdi.id)。
+  后面还会清理/更新卡片显示与提示。
+- PetCardList.onPetDetailedCached，m638 @0x208561：
+  同样存在一次同步回调内对同一详情的第二次读取，然后加载/刷新卡片列表。
+
+优先修正：
+按宠物 id + 数据修订号解析一次，向同次更新的消费者提供只读快照；或者在一次
+更新上下文中共享解析结果。缓存失效需覆盖网络更新、清理及原始对象的其他修改。
+不能直接永久共享同一个可变 PetDetailedInfo：原实现每次给出独立对象，调用方
+若会修改它，无条件共享会改变行为。必须先明确对象所有权、只读约束或复制策略。
+
+五、列表和隐藏页怎样放大一次切换
+==============================
+
+5.1 整排列表刷新，两个层级各取一次详情
+------------------------------------
+
+证据 P02：
+PetList.onPMDetailUpdate，m690 @0x209885：
+直接 refreshUI()，没有先按事件 id 缩小更新范围。
+PetList.refreshUI，m685 @0x209713：
+遍历 pets，为每个有数据的格子 setData，为空格子 nullPet，最后更新全屏图标区。
+
+单格链条：
+PetSingleIconBase.setData → updateUI → PetSingleIconDetail.setData → updateUI。
+
+PetSingleIconBase.setData，m1180 @0x21072e：
+保存 objData 后直接 updateUI，没有数据版本未变的早退。
+PetSingleIconBase.updateUI，m1186 @0x2107b7：
+new/parse PetBriefInfo；若详情缓存存在，再 getPetDetailInfo 一次；
+再调用子图标 setData，更新血条、类别、标签等。
+PetSingleIconDetail.setData，m1043 @0x20f43e：
+已经收到 pbi，仍再次从详情缓存 getPetDetailInfo，然后更新分类及 UI。
+PetSingleIconDetail.updateUI，m1046 @0x20f6d4：
+更新名称、HP、等级及附加能力，然后才检查 viewId 是否变化。
+
+时间轴证明：PetList symbol 3020 实际有 6 个格子（pet_0 至 pet_5）。
+若本次刷新的非空且有详情缓存格子数为 C，则这部分有 2C 次完整详情解析；
+六格都有缓存时是 12 次。此数已包含父子两层，不能再重复加算。
+除此之外的 PetBriefInfo 简略解析并未算在 2C 中。
+
+已有保护：
+头像 viewId 相同便不进入 loadYabiFightHead；ActPetLoader 也按需创建并复用。
+所以“全槽刷新”不等于“六个头像每次全部重新下载或重新构造”。
+这个末端保护无法免去此前已经发生的详情解析、配置查询和文本更新。
+
+refreshMcPetIconFullScreen，m674 @0x20940b，另遍历 6 个全屏图标槽，
+为非空项重新解析简略数据、设置文本/帧；调用处没有先判断全屏模式是否显示。
+
+5.2 隐藏页仍解析，已初始化页还可能继续刷新 UI
+--------------------------------------------
+
+证据 P03：
+PetDetailBase 构造器，m1161 @0x21044b：
+构造时就注册 PET_DETAIL_UPDATE → onPetDetailedCached。
+
+onPetDetailedCached，m1174 @0x210605：
+  pdi = PetDetailDataMap.instance.getPetDetailInfo(event.params.id);
+  tryRefreshUI();
+
+tryRefreshUI，m1172 @0x210570：
+  if (canUpdateUI && pdi != null) refreshUI();
+
+详情解析发生在 canUpdateUI 判断之前；这里没有当前页/active 判定。
+
+PetPackagePanel.setTabInfoVisible，m361 @0x202752：
+当前页 updateUI 后 visible=true；
+其他页 removeUI 后 visible=false。
+
+但 PetDetailBase.removeUI，m1163 @0x2104b6，是空返回。
+23 个直接子类都未覆写 removeUI、updateUI、onPetDetailedCached，
+且构造器会调用父构造器。真正解除监听发生在 dispose，m1167 @0x210506。
+
+23 的来源经过两层核对：
+- ABC 的继承关系中有 23 个直接子类；
+- PetPackagePanel symbol 3296 的首帧时间轴确实放置这 23 类各一个，
+  并非仅凭类名数量推测实例数。
+
+因此，完整面板正常构造且尚未 dispose 时存在这一组事件消费者。
+实际某次运行仍应按已构造且未移除的监听实例数 H 计数；23 不是采样实测值。
+
+必须区分：
+- UI 尚未初始化的隐藏页：也可能先创建和解析详情，但不继续 refreshUI。
+- 已初始化后隐藏的页：还能进入 refreshUI；实际工作受宠物类型和子类自身保护影响。
+- 不能由此声称 23 页每次全部重建、都发起下载，或都参与屏幕渲染。
+
+真实的隐藏 UI 工作例子：
+PetDetailSkill.refreshUI，m1428 @0x215b41，继续更新技能/评分；
+refreshSkillUI，m1432 @0x215bf1，遍历技能格、更新 PP/提示、隐藏或重显控件。
+PetDetailAbility.refreshUI，m1357 @0x213a55，进入
+updateView，m1360 @0x213b49，处理属性、天赋、学习力、附加值、文本和提示。
+这些工作都比只保存一个当前 id 更重，但其时间比例没有测量。
+
+修正时的两个陷阱：
+1. canUpdateUI 不是专门的“标签激活”标记。updateUI，m1162 @0x210494，
+   在它为 false 时会再调用 initUI。隐藏时简单设 false，可能造成重开页时重复初始化。
+   应另设 active、dirty、dataVersion，显示时补最新快照。
+2. SimpleViewController、SimpleBar 也继承这个基类；一些控制器即使不可见也需要
+   维护当前模型/皮肤状态。不能对所有子类机械添加 if (!visible) return。
+   应区分纯展示页和必要控制器，且显式 active 比单一 visible 更能表达当前页状态。
+
+5.3 解析次数：为什么可能达到数十次
+--------------------------------
+
+一次 PET_DETAIL_UPDATE 的已列明直接详情读取，可写为：
+
+  N = H + 2C + S
+
+H：活跃 PetDetailBase 监听实例数。
+C：本次全列表刷新里非空且详情缓存存在的格子数。
+S：其他独立监听回调按实际实例及分支累加的详情读取数。
+
+以下 14 个非基类回调在各有一个活跃实例且条件成立时，贡献如下：
+
+PetPackagePanel.onCurrentPetUpdate   m346 @0x201d49   1
+AstralSpiritPanel.onDetailUpdate     m392 @0x203179   1，id 匹配
+GodCardList.onPetDetailedCached      m414 @0x2038b3   2，第二次缓存检查通过
+LegendSoulPanel.onDetailUpdate       m448 @0x204400   1，id 匹配
+PackageControlBar.onSelectedData     m504 @0x20574e   1
+PetBigIconDetail.onPMDetailUpdate     m567 @0x206a13   1
+PetCard2Panel.onDetailUpdate          m610 @0x207ddd   1，id 匹配
+PetCardList.onPetDetailedCached      m638 @0x208561   2，第二次缓存检查通过
+PetShareBar.onSelectedData           m698 @0x2099ef   1
+DegeneratorSoulPanel.onDetailUpdate  m814 @0x20b23f   1，id 匹配
+BargainIcon.onSelectedData           m853 @0x20b959   1
+ChangeViewIcon.onSelectedData        m863 @0x20bd9d   1
+HKTipsPanel.onDetailUpdate           m891 @0x20c477   1，id 匹配
+PetDetectInfo.onSelectedData        m1024 @0x20eb52   1
+
+上述集合成立时 S=16。若 H=23、C=6、S=16，则一次广播列出的这些路径合计：
+  23 + 2×6 + 16 = 51 次详情读取/创建解析。
+
+这是指定状态下的结构推导，不是实际测出的固定次数，不是每次切换必然值，
+也不是所有额外调用的上界。额外实例、重入、外部方法和后续回调不在公式内。
+不能把 51 次直接换算成 2—3 秒；必须测单次解析及事件总耗时。
+
+六、同一网络响应导致的双刷新
+==========================
+
+证据 P04：PetDetectInfo.init，m1002 @0x20ddf9，同时监听：
+- PET_DETAIL_UPDATE → onSelectedData；
+- 原始 RSPN_VIEW_SINGLE_PM → onViewSinglePM。
+
+PetDetailDataMap 构造器 m191 @0x1ffcca 以 int.MAX_VALUE 优先级监听原始响应；
+PetDetectInfo 对原始响应使用默认优先级。
+
+当两个监听器都在、响应属于当前亚比且没有异常或中断时，执行顺序有直接依据：
+
+1. 高优先级 DataMap 收到原始响应；
+2. 更新缓存，同步派发 PET_DETAIL_UPDATE；
+3. PetDetectInfo.onSelectedData，m1024 @0x20eb52，
+   getPetDetailInfo → new/parse → refreshView；
+4. 回到原始响应的监听循环；
+5. PetDetectInfo.onViewSinglePM，m1004 @0x20def2，
+   又 new PetDetailedInfo、parseInfo(event.params.pm)，对当前亚比再次 refreshView。
+
+onViewSinglePM 的解析还发生在 id 匹配判断之前，所以非当前亚比的响应也会先解析，
+只是之后不刷新当前视图。这个直接 new/parse 没有包含在上面的 getter 次数公式中。
+
+refreshView，m1013 @0x20e088，遍历 6 类检测指标、更新子控件和文本、装备与天赋、
+并查询学习力/性格推荐配置。因此重复刷新不仅是重复保存一个对象。
+它是固定 6 类指标的局部循环，不能描述成遍历全游戏数据库。
+
+另有 SELECTE_CHAGNE 入口，但外部 setter 是否每次发这个事件未闭合，
+不能断言普通点击一定发生第三次完整刷新。
+
+主当前标签页也有“自身详情监听”和“主面板 setTabInfoVisible → updateUI”两条
+刷新入口，可能重复刷新。二者的实际先后顺序未采样，本报告不认定一定先用旧数据。
+
+优先修正：明确一个规范的数据更新来源；按 id/version 合并同一次更新，避免原始
+响应监听和缓存后广播各完整刷新一遍。还要保留确有不同含义的更新事件。
+
+七、主模型、背景与前置动画：区分阻塞和等待
+========================================
+
+7.1 真正换主模型前，旧模型先被清理
+--------------------------------
+
+证据 P05：
+PetBigIconDetail.onPMDetailUpdate，m567 @0x206a13：
+取得详情，保存旧 wordText，更新当前 pbi、名称和标签，调用 updatePetIcon。
+updatePetIcon，m582 @0x20732b：
+- 特定背包状态或 DIY 背景分支清理/隐藏大图；
+- 若前后 skinId 和 wordText 相同，会提前返回，已有重复模型保护；
+- 需要换图时，停止旧声音，调用 tryDisposePetIcon；
+- 再决定直接加载还是等前置动画。
+
+tryDisposePetIcon，m589 @0x20755a：
+调用已有 _petIconHandler.clearIcon，重置视图/皮肤 ID。
+
+afterOtherOperate，m583 @0x207424：
+按 PetIconContainer.isBitMapType(viewId) 选择 BIT_MAP 或 LARGE，
+调用 _petIconHandler.setIcon(curPbi.viewId, iconType, curPbi)。
+
+Handler 在组件初始化时创建，不是每点击一次都 new 整个 Handler。
+但“清旧图 → 为新图 setIcon”的顺序会形成内容空白窗口。
+如果异步等待资源期间其他 UI 仍活动，不能把空白时间全部算成同步脚本卡死。
+clearIcon 和 setIcon 内部是否递归停止、复用对象、解压、构造或预加载，需当前外部模块。
+
+7.2 特定皮肤明确把主模型加载放到前置动画之后
+------------------------------------------
+
+证据 P06：
+SimpleViewController.refreshUI，m1226 @0x211360：
+先调用外部 initDIYBgSkinData(raceId, refreshSkin)。
+refreshSkin，m1227 @0x211380，最终 showPreMovie(changeSkins)。
+showPreMovie，m1229 @0x211504：
+没有前置动画、不可播放或特殊背包状态时，直接继续；
+满足条件时，getAndShowPreMovie(skinId, closure1228) 并挂入返回的动画 Sprite。
+
+closure1228，m1228 @0x2114d3，依次：
+广播 ON_SKIN_PRE_MOVIE_FINISH；
+移除前置动画 Sprite；
+调用后续 changeSkins。
+
+PetBigIconDetail 监听这一完成事件；
+onPreMovieFinish，m565 @0x2069d7，进入 afterOtherOperate，再调用主模型 setIcon。
+与此同时主模型 updatePetIcon 中，在需要前置动画时会暂时 return。
+
+由此可确认：对符合条件的皮肤，当前这条主模型 setIcon 发生在前置动画完成信号后。
+如果其他位置没有预取，动画等待与模型准备时间可能串行叠加。
+没有动画时长、外部预取实现或运行日志，不能声称动画固定 2—3 秒或所有亚比都走此路。
+
+优化若选择减少/跳过前置动画，必须保留完成通知和后续流程；只把 showPreMovie
+改成直接 return，可能让主模型一直等不到完成事件。更稳妥的候选是预取与动画并行，
+并用选择版本处理取消和过期回调。
+
+7.3 相同视觉资源、不同亚比实例，也可能重走背景流程
+----------------------------------------------
+
+证据 P07：
+SimpleViewController.isNothingChange，m1225 @0x211312，
+要求以下四项都相同才能跳过：
+pet.id、viewId、specialSkinId、useDIYBgId。
+
+因此换另一只同形象/同背景的亚比，也会因为 pet.id 不同而进入后续刷新。
+changeBg，m1235 @0x211833，开头调用 clearBg，再选择：
+- getPackageBackground；
+- getDIYBackgroundView；
+- getPetSkinBackground；
+并按条件加载公共粒子。
+
+这是“停止/清理 → 重新获取资源对象 → 挂载”的证据；不是“每次重新下载”的证据。
+外部资源服务可能缓存下载字节、ApplicationDomain 或类定义。
+
+应把“视觉资源 key”与“当前选择数据”分开：
+背景/粒子在资源 key 未变时复用；选中亚比的文字、按钮、交互状态仍照常更新。
+不能简单删除 pet.id 比较后跳过整个 refreshSkin，因为其中还承担其他状态更新。
+
+7.4 类缓存命中仍会同步 new，热切换不保证没有构造成本
+---------------------------------------------------
+
+证据 P08：
+PetPackageHelper.loadObject，m57 @0x1fe10d：
+currentDomain.hasDefinition(className) 为真时，getDefinition → new Class() →
+立即回调；未命中才走 SimpleCustomLoader。
+
+缓存一个类的定义与缓存它的显示实例是两件事。这个 helper 的命中路径仍然构造
+新对象，可能执行 MovieClip 子树与首帧初始化。具体成本需外部资源本身。
+神兵特效入口 updateGQShenBingIcon，m529 @0x205d5c，每次先清容器；
+满足条件后调用这个 helper，未见相同 shenBingRaceId 的本地早退。
+
+这支持“即使网络缓存命中也可能有同步构造成本”的解释。
+不能据此推定每一条大模型/背景路径都经过该 helper，或全部缓存都无效。
+
+7.5 快速切换时的过期回调与已有保护
+--------------------------------
+
+公共粒子资源 key：pet/commonhaibaolvzimv。
+公共粒子回调 m1239 @0x211a8f 会比较回调身份、检查背景父容器；
+clearBg，m1244 @0x211d49，还会取消旧请求。
+这条路径已经有取消/过期回调保护，不能说全部异步回调毫无保护。
+
+本地仍可见的缺口：
+- DIY 背景 onGetDIYBg，m1237 @0x211a31，仅 _bg.addChild(arg)，
+  没有当前 id/skinId/请求代次的检查；
+- 神兵回调 m528 @0x205d13 只检查容器及 parent，不比较当前 shenBingRaceId；
+- 前置动画完成广播没有选择身份；本地闭包没有比对当前选择版本。
+
+若外部服务未补偿取消/去重，旧请求晚到可能造成额外构造、错误挂图或重复更新。
+这里只确认本地校验缺口，未证明当前运行实际发生竞态，也不能据此认定内存泄漏。
+可沿用公共粒子已有模式，为其他请求增加 selection generation / resource key 校验。
+
+八、渲染、字体、位图和 GC：哪些能确认，哪些不能
+============================================
+
+本包资源库存：
+- 1,168 个 Shape 定义，payload 584,973 字节；
+- 1,220 个 Sprite 定义，其中 1,107 个只有 1 帧，798 个 payload 不超过 32 字节；
+- 13 个 DefineFont3，共 434 个内嵌 glyph，payload 109,063 字节；
+- 138 个位图定义。按每定义 RGBA 每像素 4 字节展开，约 13.33 MiB。
+
+上述不是每次切换的构造量、活跃显示对象量或当前 RAM/VRAM 实测。
+位图估算未计外部模型、对齐、多副本及滤镜目标，也未扣除共享。
+没有证据表明普通选择会重新解压整个 newpetpackage.swf 或重建完整根面板。
+
+跨全部 Sprite/帧的时间轴记录共 1,309 条带 FilterList，1,595 个滤镜项；
+92 条 cacheAsBitmap=true 记录，382 条非普通混合模式记录。
+这些不是“单帧同时跑 1,309 个滤镜”或“同时新建 92 张纹理”。
+
+能定位到当前切换 UI 的滤镜：
+大图名称及列表名称、HP、等级文本带 4×4、1 pass 的 Glow。
+它们是小文本区域，不是全屏大模糊。
+真正的文字变化会带来布局/绘制等更新；重复写同值是否避免重建，要看实际运行实现。
+不能仅看 setter 就断言所有滤镜缓存每次全部失效。
+
+本包没有直接 BitmapData.draw、drawWithQuality、copyPixels、applyFilter 的
+已闭合切换调用链。一个遗留 onLoaded 方法中有 icon2BitmapWithScale，但没有追到
+它与当前 ActPetLoader 路径的有效回调注册，不能说每切一次都截图整个背包。
+直接 cacheAsBitmap setter 属于 24×24 属性图标，并非全屏截图。
+
+本包确实会在更新时重建一两个属性图标，是有界分配，不能称为无界大量对象。
+正常关闭有 dispose / removeEventListener；主面板关闭时才见到特定资源释放入口。
+没有证据证明每次普通切换都强制 System.gc，更不能把旧客户端的内存/空闲策略
+自动套到当前未知版本。
+
+判断 Ruffle 的角色：
+此 SWF 中的重复读取、事件扇出和多面板工作会增加 AVM2 与对象/显示系统负担。
+至于目标客户端是否用解释器、做了哪些原生替换、每阶段成本多高，需当前播放器证据。
+本次 SWF 不能证明某函数已被 Rust/原生替换，也没有证明 GPU 是主要瓶颈。
+
+九、原因排序与建议的修改顺序
+==========================
+
+下列顺序代表“证据明确、容易验证、修复范围可控”的优先级，不是已测得的耗时排名。
+
+P0 建立极少量聚合计时：
+记录一次选择的详情等待、同步广播、主模型清理/加载、前置动画、实际首帧。
+先确认 2—3 秒属于哪一段，避免把异步等待当 CPU 时间。
+
+P1 消除数据层重复工作：
+- 详情按数据版本解析一次；同次更新共享只读快照或使用明确复制语义；
+- 去掉 GodCardList/PetCardList 同回调的第二次取详情；
+- 列表已取得的详情直接传给子图标，不让子层再次解析；
+- PetDetectInfo 合并原始响应与缓存广播的重复视图刷新。
+
+P2 缩小刷新范围：
+- 选择变化仅更新旧/新选中状态；
+- 详情变化仅刷新相关 id 的格子及必要汇总；
+- 隐藏纯展示页只记 dirty/version，真正显示时更新；
+- 保留必要控制器，使用独立 active 状态，避免把 canUpdateUI 当开关。
+
+P3 减少视觉资源重建：
+- 背景按真正影响视觉的资源 key 复用，与 pet.id 分开；
+- 相同神兵/标签/粒子资源避免无意义清空再构造；
+- 若要保留旧图直到新图可用，需限制缓存数量和内存预算，不能无限保留模型。
+
+P4 优化显式等待与异步一致性：
+- 对命中前置动画的皮肤，考虑预取与动画并行，或提供可选跳过；
+- 跳过时保留完成事件和后续状态推进；
+- 为 DIY、神兵、前置动画补请求代次，忽略和清理过期结果。
+
+P5 再考虑特定 AS3 热点原生化：
+只有计时证明 PetDetailedInfo.parseInfo 或外部配置/能力计算是主要耗时，
+才优先替换这些具体热点；必须保持字段、默认值、错误和对象所有权语义。
+原生化单次解析不能消除“一次广播重复解析几十次”的调用结构。
+事件合并、数据快照和刷新范围收缩往往应先做，收益仍需 A/B 测量。
+
+十、用最少的运行数据分辨 2—3 秒在哪里
+====================================
+
+每次真正选择变化分配 selection_seq，记录 petId/viewId/skinId，使用单调时钟。
+按一次选择聚合计数和时间，不要在每条指令、每个字形中大量 trace。
+嵌套耗时不能简单相加：例如 getPetDetailInfo 累计时间已经包含在 dispatch 总时间中。
+异步并行阶段也不能直接累加成总墙钟时间。
+
+建议打点：
+
+T0：PetList.onClick / setSelectedPet 入口与出口。
+T1：详情命中缓存，或实际网络响应到达。
+T2：PET_DETAIL_UPDATE dispatch 前后。
+    同时统计 getPetDetailInfo 次数及累计时间、各类面板 refresh 累计时间，
+    并区分当前可见展示页、隐藏页和控制器。
+T3：clearIcon / clearBg 前后。
+T4：preMovie 开始与完成。
+T5：setIcon 调用前后，以及实际外部资源 request/cache_hit/body_complete。
+T6：外部解压、ABC 初始化、类/显示树构造、实际 ready/attach。
+T7：新内容第一帧的 CPU update/render 和提交/呈现。
+
+不要把本包中未证明可达的 onPetIconLoaded/onLoaded 当唯一完成回调。
+第一条 ENTER_FRAME 回调也不证明 GPU 已经呈现新图；如需精确 GPU 时间，
+应使用后端计时/图形分析，不通过每帧强制 GPU 同步来制造新卡顿。
+
+少量对照即可：
+- 冷首次 A→B，与资源和数据已准备后的 A→B→A；
+- 普通皮肤，与有前置动画/动态背景的皮肤；
+- 刚打开背包，与访问过若干复杂标签页后；
+- 同一外观的不同个体，与不同外观个体。
+
+同一个已选图标的普通重复点击有 early return，不应拿它作为“热切换没有卡顿”
+的唯一对照。用真正 A↔B 的选择变化，保持相同客户端、分辨率和设置。
+
+现象与判读：
+- 游戏内其他动画、按钮悬停反馈一起冻结，dispatch 本身长：
+  优先查同步解析与 UI、构造和清理；系统鼠标仍能移动不能证明游戏主线程正常。
+- UI 仍活动，只有亚比区域空白，网络/前置动画阶段长：
+  优先解释为内容等待，不应把整段算作脚本阻塞。
+- 热切换仍停顿，且没有新请求：
+  优先查同步重复解析、实例重建及首帧；这仍不是仅凭现象排除 GPU 的证明。
+- 访问越多页之后切换越慢：
+  与已初始化隐藏页继续刷新相符，需对各页累计时间验证。
+- 只有特定皮肤明显慢：
+  优先查看前置动画分支、外部模型/背景复杂度和具体加载阶段。
+
+如需进一步精确到哪个函数占用绝大部分时间，最有价值的补充是：
+1. 当前实际运行版本中定义 PetDetailedInfo、PetIconHandler/PetIconContainer、
+   DisplayUtil 和皮肤/资源服务的控制 SWF；
+2. 发生问题的具体亚比/皮肤及对应模型、背景资源；
+3. 冷/热 A↔B 切换的一小段计时日志或性能采样。
+当前证据已经足以定位冗余结构，但还不足以给各项分配真实的秒数。
+
+附录 A：旧控制模块对照，不能代替当前版本
+======================================
+
+先前 Flux 样本的 controlv2 中，PetDetailedInfo 解析会进入 PetBriefInfo 的
+公共字段及子信息解析，包含字符串拆分、数值转换、技能、能力、装备等字段处理。
+这说明同类解析可能远非一次 map 查找，但不能证明当前版本的实现和耗时相同。
+
+旧 DisplayUtil.stop 会递归处理显示子树；旧 stopAndRemoveChild 会停止并删除
+传入容器的子项，而保留传入容器本身。当前主模型/背景清理是否如此须核对对应版本。
+若当前实现相同，某些公共粒子空壳容器的保留值得检查，但本报告不认定已经发生泄漏。
+
+旧 PetIconHandler.setIcon 自己也 clearIcon；本包调用前亦 clearIcon。
+旧实现第一次清理通常已经移除主模型并置空，不能夸大为每切一次必然两次完整树遍历。
+
+这些对照仅帮助选取下一步打点；主要结论始终以本次 newpetpackage.swf 为依据。
+
+附录 B：公开参考
+================
+
+[R1] Ruffle 官方仓库，v0.7.1，core/src/avm2/events.rs：
+https://github.com/ruffle-rs/ruffle/blob/v0.7.1/core/src/avm2/events.rs
+读取到的该文件 Git blob SHA：
+050f0ebf65f70eea72a05352c0296baaf30835a0
+用于核对同步调用事件监听器的机制，不作为当前客户端版本/性能的证明。
+
+[R2] AIR SDK / ActionScript 3.0 EventDispatcher API：
+https://airsdk.dev/reference/actionscript/3.0/flash/events/EventDispatcher.html
+用于核对事件监听、移除和优先级等 API 语义。
+
+本报告的具体类名、调用关系、资源数量与偏移来自用户提供的文件，
+不是从 Ruffle 通用文档推测所得。保留输入 SHA-256 与解压后地址，可复核上述各点。

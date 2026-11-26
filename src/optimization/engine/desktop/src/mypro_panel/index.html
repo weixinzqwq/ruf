@@ -1,0 +1,555 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<title>功能面板</title>
+<style>
+:root {
+  color-scheme:light;
+  --bg:#f1f4f9; --paper:#fff; --ink:#203049; --sub:#51637a;
+  --line:#d8e0eb; --blue:#2057a7; --wash:#e6effe;
+  font:14px/1.55 "Source Sans 3","Microsoft YaHei UI",sans-serif;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink)}
+button,select,input,textarea{font:inherit;color:inherit}
+button,summary{cursor:pointer}
+button:disabled{cursor:default;opacity:.53}
+:where(button,select,input,textarea,summary):focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+[hidden]{display:none!important}
+.shell{min-height:100vh;display:grid;grid-template-columns:146px minmax(0,1fr)}
+.rail{position:sticky;top:0;align-self:start;height:100vh;display:flex;flex-direction:column;overflow-y:auto;padding:23px 12px 14px;background:#fff;border-right:1px solid var(--line)}
+.rail h1{margin:0 0 24px 9px;font-size:21px;line-height:1.25;letter-spacing:-.5px;color:#20344f}
+nav{display:grid;gap:4px}
+nav button,.hide-window{min-height:38px;border:0;border-radius:6px;background:transparent;color:var(--sub);text-align:left;font-size:14px}
+nav button{position:relative;padding:7px 13px 7px 16px;font-weight:600}
+nav button:hover,.hide-window:hover{background:#f2f5fa}
+nav button[aria-current=page]{background:var(--wash);color:var(--blue)}
+nav button[aria-current=page]::before{content:"";position:absolute;left:5px;top:12px;bottom:12px;width:3px;border-radius:3px;background:#3670cd}
+.rail-footer{margin-top:auto;padding-top:16px}
+.hide-window{width:100%;padding:6px 8px;display:flex;align-items:center;justify-content:space-between;gap:4px;font-size:12px}
+kbd{font:11px/1.4 "IBM Plex Mono",Consolas,monospace;color:var(--sub);border:1px solid var(--line);border-radius:3px;padding:0 4px}
+main{width:100%;max-width:1220px;min-width:0;padding:20px clamp(14px,2.5vw,30px) 28px;margin:0 auto}
+section{display:grid;align-items:start;gap:14px}
+.card{min-width:0;border:1px solid var(--line);border-radius:9px;background:var(--paper);padding:16px 18px}
+h2{font-size:18px;line-height:1.4;margin:0 0 12px}
+h3{font-size:14px;margin:14px 0 7px}
+.muted,.hint{color:var(--sub);font-size:12px}
+.hint{margin:6px 0;overflow-wrap:anywhere}
+.row{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+.between{justify-content:space-between}.between h2{margin:0}
+.btn{min-height:32px;border:1px solid #bcc9da;border-radius:5px;background:#fff;padding:4px 12px;font-size:13px}
+.btn:not(:disabled):hover{background:#f0f5fc}
+.btn.primary{background:var(--blue);border-color:var(--blue);color:#fff;font-weight:600}
+.btn.primary:not(:disabled):hover{background:#184786}
+.btn.small{min-height:28px;font-size:12px;padding:3px 9px}
+dl{margin:9px 0 0}
+dl div{display:grid;align-items:start;gap:10px;grid-template-columns:auto minmax(0,1fr);padding:7px 0;border-bottom:1px solid #e7ecf3}
+dl div:last-child{border:0}
+dt{color:var(--sub);font-size:12px}
+dd{text-align:right;margin:0;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.state{display:inline-flex;align-items:center;gap:7px;font-size:16px;font-weight:600}
+.state::before{content:"";display:inline-block;width:8px;height:8px;border-radius:50%;background:#8996a6}.state[data-on=true]::before{background:#248566}
+.controls{margin-top:10px}
+label.field{min-width:0;font-size:12px;color:var(--sub);display:grid;gap:4px}
+select,input,textarea{width:100%;min-width:0;padding:6px 8px;border:1px solid #bdcbdc;border-radius:5px;background:#fff}
+select:disabled,input:disabled,textarea:disabled{color:#64778b;background:#f4f6f9}
+input[type=checkbox]{width:auto;margin:0;accent-color:var(--blue)}
+textarea{resize:vertical}
+.filters{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px 12px;margin:10px 0}
+details>summary{color:var(--blue);font-size:13px;font-weight:600}
+.record{display:block;width:100%;padding:8px 5px;text-align:left;color:var(--ink);background:none;border:0;border-bottom:1px solid #e3eaf2}
+.record:hover,.record[aria-pressed=true]{background:var(--wash)}
+.record span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.record .meta{font-size:11px;color:var(--sub)}
+.list{max-height:38vh;overflow:auto;scrollbar-gutter:stable}
+.note{position:sticky;top:8px;z-index:1;margin:0 0 10px;padding:8px 10px;background:#fff3df;color:#73431c;border:1px solid #edcca0;border-radius:5px;font-size:12px;overflow-wrap:anywhere}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:32vh;overflow:auto;padding:9px;background:#f2f5fa;border-radius:4px;font:12px/1.6 "IBM Plex Mono",Consolas,monospace}
+.spaced>*+*{margin-top:9px}
+.morph-targets{grid-template-columns:repeat(3,minmax(0,1fr))}
+.rule-options{padding-top:12px;border-top:1px solid #e7ecf3}
+.rule-options label{display:inline-flex;align-items:center;gap:5px}
+.rule-actions{margin-top:12px}
+#morph-recent{white-space:pre-line}
+#morph-channels+details{margin-top:9px}
+@media(min-width:1000px){
+  #overview{grid-template-columns:minmax(0,1fr) minmax(0,1.1fr)}
+  #morph{grid-template-columns:minmax(0,1.55fr) minmax(235px,1fr)}
+  .morph-editor{grid-row:span 2}
+}
+@media(max-width:700px){
+  .shell{grid-template-columns:112px minmax(0,1fr)}
+  .rail{padding:17px 8px 12px}.rail h1{font-size:18px;margin:2px 0 19px 6px}
+  main{padding:14px 12px 22px}.card{padding:13px 14px}
+}
+@media(max-width:520px){
+  .shell{grid-template-columns:78px minmax(0,1fr)}
+  .rail{padding:12px 5px}.rail h1{font-size:14px;letter-spacing:0;margin:3px 0 15px;text-align:center}
+  nav button{text-align:center;padding:6px 4px;font-size:13px}
+  .hide-window{justify-content:center;padding:4px 0}.hide-window kbd{display:none}
+  main{padding:10px 8px 16px}.card{padding:11px 10px}.morph-targets{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media(max-width:390px){
+  .filters{grid-template-columns:minmax(0,1fr)}
+  h2{font-size:16px}
+}
+</style>
+</head>
+<body>
+<div class="shell">
+<aside class="rail">
+<h1>功能面板</h1>
+<nav aria-label="功能导航">
+<button data-tab="overview" aria-current="page">概览</button><button data-tab="morph">形态</button><button data-tab="capture">采集</button><button data-tab="battle">战况</button><button data-tab="settings">表现</button>
+</nav>
+<div class="rail-footer"><button id="hide" class="hide-window" type="button" title="隐藏窗口后，可在游戏中按 F8 打开" disabled>隐藏窗口<kbd aria-hidden="true">F8</kbd></button></div>
+</aside>
+<main>
+<p id="notice" class="note" role="status" hidden></p>
+<section id="overview">
+  <article class="card">
+    <h2>播放器</h2>
+    <div class="row between"><span id="play-state" class="state" role="status">连接中</span><button class="btn primary" id="play" disabled>暂停播放</button></div>
+    <dl><div><dt>游戏视口</dt><dd id="viewport">—</dd></div><div><dt>核心版本</dt><dd id="build">—</dd></div><div><dt>当前会话</dt><dd id="session">—</dd></div></dl>
+  </article>
+  <article class="card"><div class="row between"><h2>功能状态</h2><button class="btn small" id="refresh">刷新</button></div><dl id="capabilities"></dl></article>
+</section>
+<section id="capture" hidden>
+  <article class="card">
+    <div class="row between"><h2>记录采集</h2><button class="btn primary" id="record" disabled>开始采集</button></div>
+    <p id="capture-state" class="hint" role="status"></p>
+    <div class="filters"><label class="field">记录来源<select id="source"><option value="live">当前会话</option><option value="import">已导入文件</option></select></label>
+    <label class="field">事件类别<select id="kind"><option value="">全部</option><option value="resource">资源请求</option><option value="battle">战斗</option><option value="backpack">背包</option><option value="panel">游戏面板</option></select></label></div>
+    <div class="row between"><span class="muted" id="range"></span><button class="btn small" id="follow" disabled>暂停显示</button></div>
+    <div id="rows" class="list" aria-label="采集记录"></div><p id="empty" class="hint"></p>
+    <div class="row controls"><button class="btn small" id="first" disabled>最早</button><button class="btn small" id="back" disabled>上一页</button><button class="btn small" id="next" disabled>下一页</button><button class="btn small" id="latest" disabled>最新</button></div>
+    <div id="detail" hidden><div class="row between"><h3>记录详情</h3><button class="btn small" id="close-detail">收起详情</button></div><pre id="record-data" tabindex="0"></pre></div>
+  </article>
+  <details class="card spaced"><summary>导出与导入</summary>
+    <p class="hint">导出当前会话的选定类别。文件保存在本包的 aola-data/mypro/recordings 目录。</p>
+    <div class="filters"><label class="field">起始序号<input id="from" type="number" min="1" step="1" placeholder="最早"></label><label class="field">结束序号<input id="to" type="number" min="1" step="1" placeholder="最新"></label></div>
+    <button class="btn" id="export" disabled>导出 JSONL</button>
+    <label class="field">导入文件名<input id="file" type="text" maxlength="90" placeholder="留空读取最近一次导出"></label>
+    <button class="btn" id="import" disabled>只读导入</button><p id="job" class="hint" role="status"></p>
+  </details>
+</section>
+<section id="battle" hidden>
+  <article class="card"><h2>战斗记录</h2><span id="battle-state" class="state">等待读取</span>
+    <dl><div><dt>战斗编号</dt><dd id="battle-id">—</dd></div><div><dt>换宠次数</dt><dd id="switches">—</dd></div><div><dt>最近更新</dt><dd id="battle-time">—</dd></div><div><dt>数据来源</dt><dd id="battle-source">—</dd></div></dl>
+  </article>
+</section>
+<section id="settings" hidden>
+  <article class="card">
+    <h2>游戏表现</h2><p class="hint">设置在下一次对应内容出现时生效。</p>
+    <div id="setting-options"></div><p class="hint" id="setting-status" role="status"></p>
+  </article>
+</section>
+<section id="morph" hidden>
+  <article class="card spaced morph-editor">
+    <h2>亚比形态</h2>
+    <label class="field">素材映射规则<select id="morph-choice"><option value="-1">新增规则</option></select></label>
+    <div class="filters">
+      <label class="field">原素材 ID<input id="m-originalId" inputmode="numeric" maxlength="12"></label>
+      <label class="field">备注<input id="m-remark" maxlength="128"></label>
+    </div>
+    <div class="filters morph-targets">
+      <label class="field">背包目标 ID<input id="m-backpackId" inputmode="numeric" maxlength="12"></label>
+      <label class="field">战斗目标 ID<input id="m-fightId" inputmode="numeric" maxlength="12"></label>
+      <label class="field">海报目标 ID（仅保存）<input id="m-spskiId" inputmode="numeric" maxlength="12"></label>
+    </div>
+    <p class="hint">按外观素材 ID 匹配。目标留空时沿用官方素材。</p>
+    <div class="row"><button id="morph-add" class="btn small" disabled>加入列表</button><button id="morph-remove" class="btn small" disabled>移除所选</button></div>
+    <div class="row rule-options"><label><input id="morph-enabled" type="checkbox">启用形态规则</label><label><input id="morph-enemy" type="checkbox">作用敌方主体</label></div>
+    <p class="hint">双方的战斗头像都使用战斗目标 ID。</p>
+    <div class="row rule-actions"><button id="morph-save" class="btn primary" disabled>保存规则</button><button id="morph-discard" class="btn" disabled>撤销编辑</button></div>
+    <p class="hint" id="morph-draft" role="status"></p>
+  </article>
+  <article class="card">
+    <div class="row between"><h2>应用状态</h2><button class="btn small" id="morph-restore" disabled>恢复官方</button></div>
+    <p class="hint" id="morph-status" role="status">正在读取规则…</p>
+    <dl id="morph-channels"></dl>
+    <details><summary>最近的素材 ID</summary><p class="hint" id="morph-recent"></p></details>
+  </article>
+  <details class="card spaced"><summary>导入 MyPro 规则</summary>
+    <label class="field">规则 JSON<textarea rows="5" maxlength="200000" id="morph-json" spellcheck="false" placeholder='[{"originalId":"…","fightId":"…"}]'></textarea></label>
+    <button id="morph-import" class="btn" disabled>替换编辑列表</button><p class="hint">支持规则数组或含 skins 数组的对象。核对列表后点击保存。</p>
+  </details>
+</section>
+</main>
+</div>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const pending = new Map();
+let requestNo = 0, snapshot = null, activeTab = "overview", visible = true, epoch = 0;
+let page = null, after, previous = [], following = true, selected = null, captureQuery = 0, jobId = null;
+const commandLabels = {
+  "session.pause":"暂停播放","session.resume":"继续播放","capture.page":"采集记录","capture.configure":"采集开关",
+  "capture.export":"记录导出","capture.import":"只读导入","battle.snapshot":"战斗记录","settings.patch":"游戏表现",
+  "workshop.validate":"工坊脚本","morph.rules.read":"形态规则","lineups.read":"阵容","assets.list":"本地资源"
+};
+const kinds = {resource:"资源请求",battle:"战斗",backpack:"背包",panel:"游戏面板"};
+const cap = cmd => snapshot?.capabilities?.[cmd]?.available === true;
+function notify(message) { $("notice").textContent = message; $("notice").hidden = !message; }
+function operation(action) {
+  return async () => { notify(""); try { await action(); } catch (e) { notify(e.message); } };
+}
+function command(name, payload = {}) {
+  const generation = window.myproGeneration;
+  if (!Number.isSafeInteger(generation) || generation < 1 || !window.ipc)
+    return Promise.reject(new Error("工具页尚未连接播放器。"));
+  if (pending.size >= 16) return Promise.reject(new Error("播放器正在处理其他请求，请稍后再试。"));
+  const requestId = "ui-" + ++requestNo;
+  const dto = {protocolVersion:1, bridgeGeneration:generation, requestId,
+    sessionId:name === "app.snapshot" ? null : snapshot?.sessionId ?? null, command:name, payload};
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { pending.delete(requestId); reject(new Error("播放器未在 8 秒内答复。可刷新查看当前状态。")); }, 8000);
+    pending.set(requestId,{resolve,reject,timer,generation});
+    try {
+      const json=JSON.stringify(dto);
+      if(new TextEncoder().encode(json).length>512*1024)throw new Error("请求超过 512 KiB，请缩小导入内容。");
+      window.ipc.postMessage(json);
+    }
+    catch (e) { pending.delete(requestId); clearTimeout(timer); reject(e); }
+  });
+}
+window.myproReceive = msg => {
+  if (!msg || msg.bridgeGeneration !== window.myproGeneration || (msg.protocolVersion!=null && msg.protocolVersion!==1)) return;
+  if(msg.kind==="event") {
+    if(msg.event==="session.changed") void refresh(true);
+    return;
+  }
+  if(msg.kind!=="response") return;
+  const entry = pending.get(msg.requestId);
+  if (!entry || entry.generation !== msg.bridgeGeneration) return;
+  pending.delete(msg.requestId); clearTimeout(entry.timer);
+  if (msg.ok) entry.resolve(msg.result);
+  else entry.reject(new Error(msg.error?.message || msg.error?.code || "播放器未完成此操作。"));
+};
+function setButton(id, enabled, reason) {
+  const node = $(id); node.disabled = !enabled; node.title = enabled ? "" : reason || "";
+}
+function statusState(id,text,on) { $(id).textContent=text; $(id).dataset.on=String(Boolean(on)); }
+function showOverview() {
+  if (!snapshot) return;
+  const s=snapshot, playCommand=s.playing ? "session.pause" : "session.resume";
+  statusState("play-state",s.hasMovie ? (s.playing ? "正在播放" : "已暂停") : "等待游戏加载",s.hasMovie && s.playing);
+  $("play").textContent=s.hasMovie && !s.playing ? "继续播放" : "暂停播放";
+  setButton("play",s.hasMovie && cap(playCommand),s.capabilities?.[playCommand]?.reason);
+  $("build").textContent=s.coreBuild || "—"; $("session").textContent=s.sessionId || "—";
+  $("viewport").textContent=s.viewport?.width && s.viewport?.height ? s.viewport.width+" × "+s.viewport.height : "—";
+  $("hide").disabled=false;
+  const facts=[];
+  for (const [key,label] of Object.entries(commandLabels)) {
+    const value=s.capabilities?.[key]; if (!value) continue;
+    const line=document.createElement("div"), dt=document.createElement("dt"), dd=document.createElement("dd");
+    dt.textContent=label; dd.textContent=value.available ? "可用" : value.reason || "未就绪";
+    line.append(dt,dd); facts.push(line);
+  }
+  $("capabilities").replaceChildren(...facts);
+  for (const [id,name] of [["export","capture.export"],["import","capture.import"]]) setButton(id,!jobId && cap(name),s.capabilities?.[name]?.reason);
+}
+async function updateSession() {
+  const s=await command("app.snapshot");
+  if (snapshot && snapshot.sessionId !== s.sessionId) {
+    resetPage(); page=null; jobId=null; $("rows").replaceChildren(); $("job").textContent="";
+    $("battle-state").textContent="等待读取"; ++epoch; ++morphRequest; ++settingsQuery;
+  }
+  snapshot=s; showOverview();
+}
+function timeLabel(value) {
+  if (!Number.isFinite(value)) return "—";
+  if (value >= 1e11) return new Date(value).toLocaleTimeString("zh-CN",{hour12:false});
+  return (value/1000).toFixed(1)+" 秒";
+}
+const presentationOptions = {hideNotice:"隐藏公告",blockWanyu:"跳过万域之潮出招演出",hideTransformPortrait:"隐藏变身立绘",skipBattleBackdrop:"跳过战场背景切换"};
+let presentation=null, writingSetting=false, settingsQuery=0;
+for(const [key,title] of Object.entries(presentationOptions)) {
+  const row=document.createElement("label");
+  row.style.cssText="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--line)";
+  const input=document.createElement("input"); input.type="checkbox"; input.disabled=true; input.id="setting-"+key;
+  input.style.cssText="width:17px;height:17px;margin:0;accent-color:var(--green)";
+  row.append(input,document.createTextNode(title)); $("setting-options").append(row);
+  input.onchange=operation(async()=>{
+    const enabled=input.checked; writingSetting=true; ++settingsQuery; showSettings();
+    try {
+      presentation=await command("settings.patch",{expectedRevision:presentation.revision,values:{[key]:enabled}});
+    } catch(e) {
+      presentation=null; throw e;
+    } finally { writingSetting=false; await readSettings(); }
+  });
+}
+function showSettings() {
+  const waiting=presentation?.stage==="saving" || writingSetting;
+  for(const key of Object.keys(presentationOptions)) {
+    const input=$("setting-"+key); input.checked=presentation?.values?.[key]===true;
+    input.disabled=!cap("settings.patch") || !presentation || waiting;
+  }
+  const status=waiting ? "正在保存…" : presentation?.stage==="failed" ? presentation.error || "保存失败。" :
+    presentation ? "设置版本 "+presentation.revision : snapshot?.capabilities?.["settings.read"]?.reason || "等待读取设置。";
+  $("setting-status").textContent=status;
+}
+async function readSettings() {
+  if (!writingSetting && cap("settings.read")) {
+    const id=++settingsQuery, result=await command("settings.read");
+    if (id===settingsQuery) presentation=result;
+  }
+  showSettings();
+}
+const morphKeys=["originalId","remark","backpackId","fightId","spskiId"];
+const channelNames={body:"战斗主体",icon:"战斗头像",backpack:"背包模型",portrait:"海报"};
+let morph=null, draft=null, morphDirty=false, formDirty=false, writingMorph=false, afterSave=false, morphRequest=0;
+function formRule(row) {
+  const result={};
+  for(const key of morphKeys) {
+    const item=row[key];
+    if(key==="remark") {
+      if(item!=null && typeof item!=="string") throw new Error("备注须为文本。");
+      if(item && [...item].length>128) throw new Error("备注最多可写 128 个字。");
+      result[key]=item || ""; continue;
+    }
+    if((item==null || item==="" || item==="/") && key!=="originalId") {result[key]="/";continue;}
+    if(!["number","string"].includes(typeof item) || !/^\d+$/.test(String(item).trim()) || !Number.isSafeInteger(Number(item)) || Number(item)<=0 || Number(item)>2147483647)
+      throw new Error("素材 ID 须是 1 到 2147483647 之间的整数。");
+    result[key]=String(Number(item));
+  }
+  return result;
+}
+function loadForm() {
+  const i=Number($("morph-choice").value), rule=draft?.rules[i];
+  for(const key of morphKeys) $("m-"+key).value=rule?.[key]==="/" ? "" : rule?.[key] ?? "";
+  formDirty=false; updateMorphButtons();
+}
+function choices(selected=-1) {
+  const options=[new Option("新增规则","-1")];
+  draft.rules.forEach((r,i)=>options.push(new Option((r.remark ? r.remark+" · " : "")+r.originalId,String(i))));
+  $("morph-choice").replaceChildren(...options);
+  $("morph-choice").value=String(selected); loadForm();
+}
+function resetMorph() {
+  draft={revision:morph.revision,rules:morph.rules.map(r=>({...r}))};
+  morphDirty=false; formDirty=false;
+  $("morph-enabled").checked=Boolean(morph.enabled); $("morph-enemy").checked=Boolean(morph.enemy);
+  choices(); updateMorphButtons();
+}
+function updateMorphButtons() {
+  const modifiable=Boolean(draft && !writingMorph && morph.stage!=="saving" && morph.stage!=="loading" && cap("morph.rules.replace"));
+  const existing=Number($("morph-choice").value)>=0;
+  $("morph-add").textContent=existing ? "更新这一条" : "加入列表";
+  setButton("morph-remove",modifiable && existing);
+  setButton("morph-add",modifiable && formDirty);
+  setButton("morph-import",modifiable);
+  setButton("morph-restore",Boolean(morph && !writingMorph && morph.stage==="ready" && cap("morph.restore")));
+  setButton("morph-save",modifiable && (morphDirty || formDirty) && draft.revision===morph.revision);
+  setButton("morph-discard",!writingMorph && Boolean(morph) && (morphDirty || formDirty));
+  $("morph-enabled").disabled=$("morph-enemy").disabled=!modifiable;
+  for(const key of morphKeys) $("m-"+key).disabled=!modifiable;
+  $("morph-choice").disabled=!modifiable || formDirty;
+  $("morph-draft").textContent=draft ? (draft.revision!==morph.revision ? "规则版本已变化，请撤销编辑并重新核对。" :
+    draft.rules.length+" 条规则"+(morphDirty || formDirty ? " · 有未保存更改" : "")) : "";
+}
+function showMorph() {
+  if(!morph){$("morph-status").textContent=snapshot?.capabilities?.["morph.rules.read"]?.reason || "当前核心未提供形态规则。";$("morph-recent").textContent="尚未收到素材查询。";$("morph-channels").replaceChildren();updateMorphButtons();return;}
+  const status={loading:"正在读取规则…",saving:"正在保存规则…",failed:morph.error || "规则保存失败。"};
+  $("morph-status").textContent=status[morph.stage] || ("已保存版本 "+morph.revision+" · 战斗规则版本 "+morph.activeRevision+
+    (morph.battleBound && morph.revision!==morph.activeRevision ? " · 下场战斗应用新规则" : "")+" · 背包在下次展示时读取");
+  const nodes=[];
+  for(const [key,name] of Object.entries(channelNames)){
+    const ch=morph.capabilities?.[key];
+    const line=document.createElement("div"),term=document.createElement("dt"),value=document.createElement("dd");
+    term.textContent=name;
+    value.textContent=!ch?.available ? (ch?.reason || "未就绪") :
+      Number.isSafeInteger(morph.hits?.[key]) ? "查询命中 "+morph.hits[key]+" 次" : "可用";
+    line.append(term,value);nodes.push(line);
+  }
+  $("morph-channels").replaceChildren(...nodes);
+  const states={original:"沿用官方",requested:"等待检查",unavailable:"目标未就绪，已回退",selected:"已选目标素材键"};
+  const reasons={
+    "pm-data-missing":"游戏中缺少目标亚比资料","config-missing":"目标模型配置尚未载入",
+    "frame-missing":"目标动画仍缺少帧图","invalid-config":"目标动画配置无法解析",
+    "class-mismatch":"目标素材类型不匹配","preload-pending":"正在准备目标素材",
+    "preload-error":"目标资源加载失败","preload-timeout":"目标资源加载超时",
+    "display-check-error":"检查目标素材时出错","unsupported-id":"当前入口不支持此素材 ID"
+  };
+  const recent=(morph.recent || []).slice(0,24).map(r=>{
+    const side=r.kind==="body" ? (r.face ? "敌方" : "己方") : "";
+    const mapped=r.target>0 && r.target!==r.source ? " → "+r.target : "";
+    const info=[states[r.state]||"状态未知"];
+    if(r.state==="unavailable"){
+      if(reasons[r.reason]) info.push(reasons[r.reason]);
+      const p=r.preparation;
+      if(p){
+        const part="第 "+p.part+"/"+p.total+" 片";
+        const progress={loading:"正在加载"+part,loaded:p.total+" 片已返回，下次展示重新检查",
+          "load-error":part+"加载失败",timeout:part+"加载超时"};
+        if(progress[p.stage]) info.push(progress[p.stage]);
+      }
+    }
+    return side+(channelNames[r.kind]||"素材")+" "+r.source+mapped+" · "+info.join("；");
+  });
+  $("morph-recent").textContent=recent.join("\n") || "尚未收到素材查询。";
+  if(Number(morph.hits?.waiting)>0)$("morph-status").textContent+=" · 等待或回退 "+morph.hits.waiting+" 次";
+  updateMorphButtons();
+}
+async function readMorph() {
+  if(!writingMorph && cap("morph.rules.read")) {
+    const q=++morphRequest, next=await command("morph.rules.read");if(q!==morphRequest)return;
+    morph=next;
+    if(afterSave && morph.stage==="failed") afterSave=false;
+    if(afterSave && morph.stage==="ready") {afterSave=false;resetMorph();}
+    else if(!draft || (draft.revision!==morph.revision && !morphDirty && !formDirty)) resetMorph();
+  }
+  showMorph();
+}
+function applyForm() {
+  const i=Number($("morph-choice").value),row=formRule(Object.fromEntries(morphKeys.map(k=>[k,$("m-"+k).value.trim()])));
+  if(draft.rules.some((r,n)=>n!==i && r.originalId===row.originalId)) throw new Error("列表中已有该原素材 ID。");
+  if(i<0 && draft.rules.length>=500) throw new Error("最多保存 500 条规则。");
+  if(i<0) draft.rules.push(row);else draft.rules[i]=row;
+  morphDirty=true;choices(i<0 ? draft.rules.length-1 : i);
+}
+async function commitMorph(restore) {
+  if(writingMorph)return;
+  if(restore && (formDirty || morphDirty)) throw new Error("请先保存或撤销当前编辑，再恢复官方。");
+  if(!restore && formDirty) applyForm();
+  writingMorph=true;++morphRequest;updateMorphButtons();
+  try {
+    const payload=restore ? {expectedRevision:morph.revision} : {expectedRevision:draft.revision,rules:draft.rules,enabled:$("morph-enabled").checked,enemy:$("morph-enemy").checked};
+    morph=await command(restore ? "morph.restore" : "morph.rules.replace",payload);
+    if(morph.stage==="failed") throw new Error(morph.error || "保存失败。");
+    if(morph.stage==="saving") afterSave=true; else resetMorph();
+  } finally {writingMorph=false;await readMorph();}
+}
+$("morph-choice").onchange=loadForm;
+for(const key of morphKeys) $("m-"+key).oninput=()=>{formDirty=true;updateMorphButtons();};
+for(const id of ["morph-enabled","morph-enemy"]) $(id).onchange=()=>{morphDirty=true;updateMorphButtons();};
+$("morph-add").onclick=operation(async()=>applyForm());
+$("morph-save").onclick=operation(()=>commitMorph(false));$("morph-restore").onclick=operation(()=>commitMorph(true));
+$("morph-discard").onclick=operation(async()=>resetMorph());
+$("morph-remove").onclick=operation(async()=>{const i=Number($("morph-choice").value);if(i>=0){draft.rules.splice(i,1);morphDirty=true;choices();}});
+$("morph-import").onclick=operation(async()=>{
+  let data; try{data=JSON.parse($("morph-json").value);}catch{throw new Error("规则 JSON 解析失败。");}
+  const list=Array.isArray(data) ? data : data?.skins;
+  if(!Array.isArray(list) || list.length>500)throw new Error("请输入最多 500 条规则的数组，或含 skins 数组的对象。");
+  const imported=list.map((r,i)=>{try{return formRule(r);}catch{throw new Error("第 "+(i+1)+" 条规则的 ID 或备注无效。");}});
+  if(new Set(imported.map(r=>r.originalId)).size!==imported.length)throw new Error("导入列表含重复的原素材 ID。");
+  draft.rules=imported;morphDirty=true;choices();$("morph-json").value="";
+});
+function resetPage() {
+  ++captureQuery; after=undefined; previous=[]; following=true; selected=null;
+  $("detail").hidden=true; $("record-data").textContent="";
+}
+function renderPage(data) {
+  page=data;
+  const live=$("source").value==="live", rows=data.rows || [];
+  $("record").textContent=data.enabled ? "停止采集" : "开始采集";
+  setButton("record",cap("capture.configure")); setButton("follow",live && after===undefined);
+  $("follow").textContent=following ? "暂停显示" : "恢复显示";
+  const info=[data.enabled ? "采集中" : "采集已停止"];
+  if (data.dropped) info.push("已移出 "+data.dropped+" 条");
+  if (data.gap) info.push("本页起点前有缺口");
+  $("capture-state").textContent=info.join(" · ");
+  $("range").textContent=rows.length ? "#"+rows[0].seq+"–"+rows.at(-1).seq+" · "+rows.length+" 条" : "";
+  $("empty").textContent=rows.length ? "" : live ? "当前范围内暂无记录。" : "当前范围内暂无导入记录。";
+  const list=rows.map(row => {
+    const button=document.createElement("button"),meta=document.createElement("span"),summary=document.createElement("span");
+    button.className="record"; meta.className="meta"; meta.textContent="#"+row.seq+" · "+timeLabel(row.timeMs)+" · "+(kinds[row.kind] || row.kind);
+    summary.textContent=row.summary || row.source || "查看详情"; button.setAttribute("aria-pressed",String(selected?.seq===row.seq));
+    button.append(meta,summary);
+    button.onclick=() => { selected=row; following=false; $("detail").hidden=false; $("record-data").textContent=JSON.stringify(row,null,2); renderPage(page); $("record-data").focus(); };
+    return button;
+  });
+  $("rows").replaceChildren(...list);
+  setButton("first",Boolean(data.newestSeq) && after!==0); setButton("back",previous.length>0);
+  setButton("next",after!==undefined && rows.length>0 && data.nextAfter!=null && data.nextAfter<data.newestSeq);
+  setButton("latest",after!==undefined || !following);
+}
+async function readCapture() {
+  if (!cap("capture.page")) { $("capture-state").textContent=snapshot?.capabilities?.["capture.page"]?.reason || "当前核心未提供采集记录。"; return; }
+  const key=++captureQuery, filter=$("kind").value;
+  const data=await command("capture.page",{source:$("source").value,after,limit:40,kind:filter || undefined});
+  if (key===captureQuery && activeTab==="capture") renderPage(data);
+}
+async function readBattle() {
+  if (!cap("battle.snapshot")) { statusState("battle-state","战况数据未就绪",false); return; }
+  const battle=await command("battle.snapshot");
+  const states={unknown:"等待战斗记录",active:"战斗进行中",ended:"战斗已结束"};
+  statusState("battle-state",states[battle.state] || "状态未知",battle.state==="active");
+  $("battle-id").textContent=battle.battleId ?? "—"; $("switches").textContent=battle.switches ?? "—";
+  $("battle-time").textContent=timeLabel(battle.updatedMs); $("battle-source").textContent=battle.source || "—";
+}
+async function pollJob() {
+  if (!jobId) return;
+  const id=jobId, state=await command("capture.job",{jobId:id});
+  if (jobId!==id) return;
+  if (state.state==="completed" || state.state==="failed") {
+    jobId=null; showOverview();
+    if (state.state==="failed") { $("job").textContent=state.error || "文件操作失败。"; return; }
+    $("job").textContent="已完成 · "+(state.rows ?? 0)+" 条"+(state.file ? " · "+state.file : "");
+    if (state.file) $("file").value=state.file;
+    if (jobKind==="import") { $("source").value="import"; resetPage(); await readCapture(); }
+  }
+}
+let jobKind="";
+async function startFileJob(mode) {
+  if (jobId) return;
+  let payload={};
+  if (mode==="export") {
+    if ($("kind").value) payload.kind=$("kind").value;
+    for (const [id,key] of [["from","fromSeq"],["to","toSeq"]]) if ($(id).value) {
+      const value=Number($(id).value);
+      if (!Number.isSafeInteger(value) || value<1) throw new Error("序号须为正整数。");
+      payload[key]=value;
+    }
+    if (payload.fromSeq>payload.toSeq) throw new Error("起始序号须小于或等于结束序号。");
+  } else if ($("file").value.trim()) payload.file=$("file").value.trim();
+  setButton("export",false); setButton("import",false);
+  try {
+    const result=await command("capture."+mode,payload);
+    jobId=result.jobId; jobKind=mode; $("job").textContent=mode==="export" ? "正在导出…" : "正在导入…";
+    await pollJob();
+  } finally { showOverview(); }
+}
+let busy=false;
+async function refresh(manual=false) {
+  if (busy || !visible || document.hidden || !window.myproGeneration) return;
+  busy=true;
+  try {
+    await updateSession(); const at=epoch;
+    if (activeTab==="capture") { if (following || !page || manual) await readCapture(); if (at===epoch) await pollJob(); }
+    else if (activeTab==="battle") await readBattle();
+    else if (activeTab==="settings") await readSettings();
+    else if (activeTab==="morph") await readMorph();
+  } catch(e) { if (visible) notify(e.message); }
+  finally { busy=false; }
+}
+function activate(id) {
+  if(activeTab!==id)window.scrollTo(0,0);
+  activeTab=id; ++epoch;
+  document.querySelectorAll("main>section").forEach(s=>s.hidden=s.id!==id);
+  document.querySelectorAll("[data-tab]").forEach(b=>{if(b.dataset.tab===id)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current");});
+  void refresh(true);
+}
+document.querySelectorAll("[data-tab]").forEach(b=>b.onclick=()=>activate(b.dataset.tab));
+$("hide").onclick=operation(()=>command("panel.hide"));
+$("refresh").onclick=operation(()=>refresh(true));
+$("play").onclick=operation(async()=>{setButton("play",false);try{await command(snapshot.playing ? "session.pause" : "session.resume");await updateSession();}finally{showOverview();}});
+$("record").onclick=operation(async()=>{setButton("record",false);try{await command("capture.configure",{enabled:!page?.enabled});await readCapture();}finally{setButton("record",cap("capture.configure"));}});
+for (const id of ["source","kind"]) $(id).onchange=operation(async()=>{resetPage();await readCapture();});
+$("follow").onclick=operation(async()=>{following=!following;if(following)await readCapture();else renderPage(page);});
+$("first").onclick=operation(async()=>{previous=[];after=0;following=false;await readCapture();});
+$("next").onclick=operation(async()=>{previous.push(after);after=page.nextAfter;following=false;await readCapture();});
+$("back").onclick=operation(async()=>{after=previous.pop();following=false;await readCapture();});
+$("latest").onclick=operation(async()=>{resetPage();await readCapture();});
+$("close-detail").onclick=()=>{selected=null;$("detail").hidden=true;renderPage(page);};
+$("export").onclick=operation(()=>startFileJob("export"));$("import").onclick=operation(()=>startFileJob("import"));
+window.myproVisible=value=>{visible=Boolean(value);if(visible)void refresh(true);};
+document.addEventListener("keydown",e=>{if(e.key==="F8" && !e.repeat && !e.isComposing && snapshot){e.preventDefault();void operation(()=>command("panel.hide"))();}});
+window.addEventListener("mypro-ready",()=>void refresh(true)); document.addEventListener("visibilitychange",()=>{if(!document.hidden)void refresh(true);});
+const timer=setInterval(()=>void refresh(),2200);
+window.addEventListener("pagehide",()=>{clearInterval(timer);for(const [k,e] of pending){clearTimeout(e.timer);e.reject(new Error("工具页已关闭。"));pending.delete(k);}});
+void refresh(true);
+</script>
+</body>
+</html>

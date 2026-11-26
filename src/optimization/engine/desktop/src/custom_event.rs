@@ -1,0 +1,76 @@
+//! Custom event type for desktop ruffle
+
+use ruffle_core::events::PlayerNotification;
+use ruffle_frontend_utils::content::ContentDescriptor;
+
+use crate::gui::DialogDescriptor;
+use crate::player::{LaunchOptions, PlayerRunnable};
+
+pub enum OpenType {
+    File,
+    Directory,
+}
+
+/// User-defined events.
+pub enum RuffleEvent {
+    /// Keep the player advancing inside Windows' native move/size loop.
+    #[cfg(windows)]
+    WindowMoveTick(winit::window::WindowId),
+    #[cfg(windows)]
+    AolaPageState(String),
+    #[cfg(windows)]
+    AolaNavigate(String),
+    #[cfg(windows)]
+    AolaCookie(String, String, String),
+    #[cfg(windows)]
+    MyProPageReady(u64),
+    #[cfg(windows)]
+    MyProRequest(u64, String),
+    #[cfg(windows)]
+    MyProGameFocus(bool),
+    #[cfg(windows)]
+    MyProFullscreen(bool),
+    #[cfg(windows)]
+    MyProOpenPanel,
+    #[cfg(windows)]
+    MyProTogglePanel,
+    /// A deferred native host command is ready on the window thread.
+    AoqiWake,
+    /// Recreate the AS runtime while retaining the in-memory login handoff.
+    AoqiRestart,
+    /// Indicates that a task is ready to be polled.
+    TaskPoll(PlayerRunnable),
+
+    /// Indicates that an asynchronous SWF metadata load has been completed.
+    OnMetadata(ruffle_core::swf::HeaderExt),
+
+    /// The user requested to pick and then open a file.
+    BrowseAndOpen(Box<LaunchOptions>, OpenType),
+
+    /// The user requested to open a movie.
+    Open(ContentDescriptor, Box<LaunchOptions>),
+
+    /// The user requested to close the current SWF.
+    CloseFile,
+
+    /// The user requested to enter full screen.
+    EnterFullScreen,
+
+    /// The user requested to exit full screen.
+    ExitFullScreen,
+
+    /// The user requested to exit Ruffle.
+    ExitRequested,
+
+    /// The user selected an item in the right-click context menu.
+    ContextMenuItemClicked(usize),
+
+    /// The movie wants to open a dialog.
+    OpenDialog(DialogDescriptor),
+
+    /// Ruffle core has a notification to handle.
+    PlayerNotification(PlayerNotification),
+
+    /// Export Ruffle Bundle from currently playing content and open save dialog.
+    ExportBundle,
+}

@@ -1,0 +1,839 @@
+MyPro 前端与原生 Ruffle 集成实施指南
+====================================
+版本：1.0　日期：2026-11-25
+交付性质：分析与实施文档，供后续开发 Agent 执行；本次不生成或修改目标项目代码。
+目标平台：优先 Windows；目标架构：Rust 原生宿主 + 已完善的原生 Ruffle 核心 + Web 功能面板。
+
+阅读提示
+--------
+负责人先读第1、2、3、15、17节；宿主开发读3—6、13—14；功能开发读7—12；执行总Agent直接从第17节开始。
+本文中“已确认”是对上传的MyPro v1.0.1样本的静态结论；“建议/必须/验收”是新项目设计合同。
+RuntimeAdapter、GameAdapter、MorphService等是建议名称，不是声称Ruffle上游已有同名SDK。
+本指南替代此前以C#宿主为主的实施方案。不要把旧方案的项目目录、跨语言ABI或线程模型带入本次工作。
+
+1. 项目目标与关键决策
+====================
+
+1.1 目标
+
+把用户已经完善、能够播放官方SWF的原生Ruffle核心变成新客户端的游戏播放区；围绕它增加MyPro式功能面板，重点包括工坊、形态/模型替换、消息采集与导出、URL/CLS调用记录、本地资源和面板、对战助手、脚本/阵容/活动与设置。
+
+已有播放能力、渲染优化、资源回收和稳定性是项目基线。优先在现有Rust桌面宿主上增加薄适配层，不重新实现播放器，不为接前端顺便升级整个Ruffle/wgpu依赖图。
+
+1.2 主方案
+
+宿主：保留当前原生Rust窗口与事件循环；如果现有实现采用winit，就继续由winit管理顶层窗口。
+游戏：原生Ruffle Player及现有renderer、navigator、audio、storage等后端；直接输出到原生游戏窗口/surface。
+工具界面：Wry在Windows上承载WebView2；打包的HTML/CSS/JavaScript仅承担面板交互。
+业务：Rust服务拥有任务、规则、记录、战斗状态及资源调度；页面通过类型化命令与事件通信。
+前端工程：建议Vue 3 + TypeScript + Vite；若已有成熟React/TypeScript项目则可保留。它是新UI工程的选择，不是MyPro原面板的已确认框架。[S1][S2][S8][S9]
+
+发布构建交付静态前端资源及原生程序。Node/Vite用于开发构建，不要求用户运行开发服务器。选择框架是为了组件与类型维护，不承诺因此提高游戏FPS。
+
+1.3 本轮范围的完成定义
+
+“按钮画出来”“IPC返回成功”“任务已入队”“游戏方法已调用”“服务器返回业务成功”“模型已真正显示”是不同阶段。每个功能必须给出实际动作入口、数据来源、结果状态、失败路径和验收证据。
+
+保持可恢复的原始播放模式：关闭扩展规则后继续官方资源和原游戏流程。未知SWF版本只禁用对应扩展能力，并显示原因，不能让整个游戏无法进入。
+
+H5/Spine模型增强与FSR作为独立后续能力。工坊和普通形态规则不以这两项完成为前提。
+
+2. MyPro 前端框架：样本已经证明什么
+==================================
+
+2.1 框架构成
+
+层次 | 样本已确认的实现 | 对新项目的意义
+原生主体 | Rust原生Windows程序；自述MyPro desktop client (Ruffle + egui + wry) | 功能面板可以直接接在原生宿主上
+播放 | 原生Ruffle与GPU渲染路径 | 游戏不必迁移到浏览器WASM
+原生界面 | egui、egui-winit、egui-wgpu路径；分辨率菜单走原生egui | 现有顶栏可先保留，逐步调整UI
+Web宿主 | wry的webview2模块路径 | Windows工具页由WebView2承载
+功能面板 | 内嵌HTML/CSS/JavaScript，直接使用DOM查询、事件监听、classList和手工列表 | MyPro的这份面板是手写DOM实现
+业务接入 | 自定义JSON IPC与Rust分发器，再连游戏桥/资源/任务状态 | 复制HTML不足以复现功能
+
+样本中保留wry-0.57.1、winit-0.30.13、egui-0.36.2等源码路径。这些是该样本线索，不是要求新项目安装的版本清单。不能由“出现wry”直接断言“这是Tauri应用”；本次也不以字符串缺失证明整个EXE绝无其他框架。[M1]
+
+功能面板HTML位于EXE raw 0x14ae5a1，提取长度323,804字节。原生游戏纹理与WebView面板分开，FSR针对游戏纹理；Web面板不在该游戏纹理中。本次没有完整还原MyPro所有HWND父子关系、窗口数量和Z序。后文“同一父窗口左右分栏”是新项目建议，不冒充MyPro窗口源码。[M1][M6]
+
+2.2 MyPro 已恢复的网页通信
+
+页面业务调用ipc.emit(channel,args,callback)。宿主注入脚本提供window.__aolaIpc，管理监听器和pending回调，并发送：
+
+  {"reqId":123,"channel":"某个命令","args":[...]}
+
+这段JSON经window.ipc.postMessage进入Wry，再经window.chrome.webview.postMessage进入Rust。Wry的window.ipc在样本中是冻结对象，只提供postMessage；MyPro另建封装，新项目也应使用自己的bridge命名空间。[M2]
+
+Rust回传两种消息：
+
+  window.__aolaResolve(reqId, result)       一次请求的答复
+  window.__aolaDispatch(channel, args)     主动事件通知
+
+reqId只关联本机网页调用，不是游戏协议的事务号。新项目无需复制这个回调协议的缺陷，应增加请求超时、取消、订阅注销、会话代数和明确的错误类型。
+
+2.3 重要的原始面板命令
+
+功能 | MyPro页面实际发送 | 后续作用/返回
+开始/停止采集 | SetIntercept([true/false]) | 控制记录及addDevRow推送，不等于阻断网络
+运行工坊脚本 | ExecuteDevToolsScript([content,count,delay,true]) | 原生parser与任务状态机
+停止工坊脚本 | ExecuteDevToolsScript(["",0,0,false]) | 清除当前工坊任务
+保存/读取脚本 | SaveMyaScript([text]) / ReadMyaScript([]) | 保存/读入脚本文本；磁盘封装未完整还原
+发送业务对象 | SendPacket([JSON.stringify(packet)]) | 排入游戏send1回调
+等待业务结果 | SendAndGetResult([JSON.stringify(packet)]) | 单个在途等待路径，异步scriptResult
+读取形态规则 | LoadSkinList([]) | 返回规则列表
+保存形态规则 | saveSkinJSON([JSON.stringify(rules)]) | 编译/保存映射，并尝试请求游戏数据刷新
+启用形态 | modifySettings([9,enabled,""]) | Gaimo
+作用敌方 | modifySettings([10,enabled,""]) | GaimoisFace
+H5模型增强 | modifySettings([19,enabled,""]) | H5PetModel，资源和核心的独立能力
+FSR | modifySettings([20,enabled,""]) | 游戏画面后处理
+阵容读取/应用 | GetLineup([remark,isAdd,index]) / SetLineup([petId,pcp,sbsJson]) | 读取/应用游戏当前阵容的业务流程
+打开背包 | btnclick([3,""]) | 调游戏背包入口，不在HTML重画游戏背包
+老活动 | activ([entry.url]) | entry.url可包含带引号的url与cls二元文本，宿主解析后调huodong
+对战助手 | 接收updateFightHelper/resetFightHelper | 网页展示宿主整理的数据
+
+该表是MyPro兼容输入的证据，不建议把所有名称和数字下标原样作为新项目公共API。[M2][M3][M4][M5][M6]
+
+3. 如何把现有 Ruffle 核心内嵌播放
+================================
+
+3.1 第一版窗口结构
+
+采用一个原生父窗口，其客户区分为两个不重叠的矩形：游戏区域和工具区域。
+
+对象 | 拥有者 | 内容
+父窗口与LayoutController | 原生UI线程 | 标题、尺寸、分栏、DPI、焦点、关闭协调
+游戏子窗口 | 原生窗口层 | 作为Ruffle现有渲染后端的输出目标
+游戏Surface/renderer | 现有运行时所有者 | 官方SWF产生的画面及已有原生渲染优化
+工具WebView | UI线程/Wry | 工坊、模型、资源、对战助手、设置等标签页
+Rust功能服务 | 应用层 | 接受命令、管理任务、发布快照与结果
+
+Wry提供build_as_child、with_bounds及set_bounds；winit的with_parent_window在Windows可创建WS_CHILD。具体调用签名以实际项目锁定版本为准。不要额外启动一个Tao事件循环来与现有winit事件循环争夺窗口管理。[S1][S2][S3]
+
+这种“内嵌”是原生窗口嵌入。HTML div本身不是wgpu Surface。第一版让Rust决定分栏位置，避免同时让CSS布局和原生窗口代码独立决定游戏区域。
+
+3.2 现有核心最小适配
+
+先识别当前核心已经暴露的会话、渲染和后端入口，再实现薄的RuntimeAdapter。优先保留原有Player创建代码；把“创建自己的顶层窗口”与“构建Player/绑定输出目标”拆开。
+
+上游desktop/src/player.rs可作为定位参考：PlayerBuilder组装renderer、navigator、audio、storage、UI和ExternalInterface等后端。宿主围绕Player执行tick、输入事件、viewport更新和render。用户fork的具体API必须实查；本指南不提供可直接粘贴的上游版本补丁。[S5]
+
+建议只增加以下内部端口，名称可依仓库调整：
+
+端口 | 最小职责
+PlayerSession | 创建、加载、暂停/恢复、会话代数、停止
+ViewportBinding | 绑定宿主提供的原生目标；尺寸/DPI/输入变换
+GameCommandQueue | 在Player所有者上下文执行有限的游戏语义动作
+RuntimeEventSink | 输出已复制、有界、可序列化的事件
+ResourceResolver | 为现有navigator增加本地包、替换规则与可解释路由
+HostExternalInterface | 承接游戏到宿主的同步查询及异步通知
+
+Web页面不能传HWND、Rust指针、任意内存地址或任意类反射路径。原生输出目标的绑定是宿主内部功能，不暴露为通用网页命令。
+
+如果当前成果只有一个完整EXE，尚无可调用crate或源码级会话入口，P0先完成这一适配拆分。跨进程SetParent一个任意旧播放器不是本指南的目标集成方案；它不能自然得到核心生命周期、输入与业务桥。
+
+3.3 窗口与输入验收
+
+游戏鼠标位置以游戏子窗口客户区为原点，再使用原有letterbox/舞台缩放变换。不要把父窗口坐标直接当游戏坐标，也不要在两个层重复乘DPI。
+
+工具面板输入框拥有焦点时，键盘事件只给WebView；切回游戏时恢复游戏焦点。保留中文IME、文本输入与物理按键的区别、滚轮、双击、鼠标捕获。失焦、取消拖拽或隐藏游戏区时清理按键/鼠标按下状态，避免粘键。
+
+统一由LayoutController处理Resize/ScaleFactorChanged，按最新尺寸更新两个区域和Ruffle viewport。连续resize合并处理；最小化或宽高为零时停止present和surface配置，恢复后重配。重配不能与仍引用旧surface的帧冲突，窗口句柄必须活得比对应surface久。[S2][S6]
+
+至少检查100%、125%、150%、200%缩放、跨屏、最大化/还原、最小化恢复和连续拖拽。WebView内弹窗仅覆盖其自身区域；跨区域模态层优先使用独立原生对话框或覆盖窗口。若使用Web模态层，LayoutController需隐藏游戏子窗口并临时扩大WebView到所需覆盖区域，关闭后恢复布局和焦点；只禁用游戏输入或隐藏游戏窗口不会自动扩大WebView。
+
+3.4 Tauri 的位置
+
+本项目主方案直接使用Wry，便于保留现有窗口循环。如果后续采用Tauri，它仍需接入上述原生窗口、surface、输入和生命周期适配，不能仅添加一个div或WebviewWindow就完成原生Ruffle嵌入。
+
+核查时Tauri的Window::add_child接收WebviewBuilder，是多WebView API，并带unstable及Windows同步创建的相关限制。选择Tauri需要单独的架构决策与第一阶段原型，不能与winit各自运行独立主循环。[S7]
+
+4. 线程、状态与生命周期
+======================
+
+4.1 保持明确的所有权
+
+WebView2需要STA UI线程和消息泵；Wry WebView不是可随意跨线程调用的对象。WebView的IPC回调只做解析、校验和排队，结果经主线程调度后回传。[S2][S4]
+
+Player、AVM2、GC对象与renderer继续由现有运行时上下文拥有。若现有Player在UI线程上，接入WebView并不会自动隔离AS3长帧；第一阶段先保持所有权，单独记录长帧。只有确有必要且类型/后端约束允许时，才将完整会话从创建起放入专用线程。
+
+后台任务负责网络等待、文件扫描、哈希、资源解压/转换、索引与导出。完成后提交不可变结果，不从后台线程直接操作AVM对象、WebView或持有整个Player的长锁。
+
+禁止为实现线程图而给Player/AVM对象强加unsafe Send。禁止在UI事件、IPC回调或同步ExternalInterface查询中阻塞join、等网络、等磁盘或等另一个网页回调。
+
+4.2 三类状态分开
+
+UI临时状态：当前标签、筛选词、草稿、选中行；允许页面本地维护。
+应用权威状态：设置、规则版本、任务、日志游标、战斗快照；由Rust服务拥有。
+游戏真实状态：当前会话、连接、AS3对象、战斗流程和服务器回包；由游戏及经过验证的适配层提供。
+
+WebView重载时重新握手、取得能力和快照；不重建Player，不从localStorage反向覆盖运行中的宿主规则，不重复启动脚本。任务是否继续由宿主的显式策略决定。
+
+4.3 上下文标识
+
+所有涉及运行中游戏的操作携带sessionId；战斗相关结果再带battleId；背包异步加载带viewGeneration；资源/形态切换带rulesRevision和bindingId；长任务带jobId。WebView每次加载/重载由宿主分配新的bridgeGeneration，独立于游戏sessionId，避免旧页面回调误落入新页面。
+
+账号重登、刷新游戏、战斗结束、切换当前展示亚比时推进相应代数。任务出队和完成回写时都校验上下文。上一场战斗的消息、上一个亚比的下载结果、旧页面的请求不能落入新上下文。
+
+5. 新项目的命令与事件合同
+========================
+
+以下JSON为建议协议，不是MyPro原报文，也不是游戏线上协议。
+
+5.1 请求、答复和事件
+
+  {
+    "protocolVersion": 1,
+    "bridgeGeneration": 12,
+    "requestId": "ui-104",
+    "sessionId": "session-3",
+    "command": "morph.rules.replace",
+    "payload": {"expectedRevision": 7, "rules": []}
+  }
+
+即时答复：
+
+  {
+    "protocolVersion": 1,
+    "kind": "response",
+    "bridgeGeneration": 12,
+    "requestId": "ui-104",
+    "ok": true,
+    "stage": "accepted",
+    "result": {"jobId": "job-8"}
+  }
+
+后续状态事件（尚未代表模型生效或任务终结）：
+
+  {
+    "protocolVersion": 1,
+    "kind": "event",
+    "bridgeGeneration": 12,
+    "sessionId": "session-3",
+    "seq": 282,
+    "event": "morph.rules.changed",
+    "payload": {"jobId": "job-8", "desiredRevision": 8, "activeRevision": 7, "state": "pending-safe-point"}
+  }
+
+最终状态由命令合同决定：保存命令完成表示规则已保存，prepare任务完成表示资源已准备，activate完成必须有Active版本更新及相应应用证据。真正的模型规则生效用morph.applied或等价事件确认；上例activeRevision仍为7时不能显示“模型已替换”。
+
+接受请求时返回的jobId必须关联后续进度和终态。发布规则成功与已存在模型重建成功还应区分结果scope；只有目标viewGeneration/bindingId的模型完成应用，才能显示“当前模型已替换”。
+
+seq可序列化为安全范围内整数，或统一为十进制字符串，避免JS超过安全整数范围；选择一种并在schema冻结。seq应按事件流定义，不能让客户端误以为多个独立流共享连续序号。
+
+错误至少区分UnsupportedCapability、UnsupportedGameProfile、NotInGame、StaleContext、Busy、InvalidArguments、AssetMissing、AssetIncompatible、Timeout、Cancelled、IoError。页面展示可读描述，日志保留结构化上下文。
+
+5.2 功能能力握手
+
+首次加载请求app.snapshot，返回coreBuild、gameProfile、sessionId、settingsRevision以及capabilities。每个能力包含available/state/reason；例如workshop.send可用，但morph.backpack因为当前SWF签名未知而不可用。
+
+“有按钮”不构成能力。按钮按能力启用，并显示未就绪原因；未知profile只影响对应功能。
+
+5.3 建议命令分组
+
+分组 | 示例命令 | 主要事件
+会话 | session.query、session.pause、session.resume、session.reload | session.changed、capabilities.changed
+采集 | capture.configure、capture.page、capture.export | capture.batch、capture.gap、export.progress/completed
+工坊 | workshop.validate、workshop.start、workshop.stop、workshop.import/export | workshop.jobChanged、workshop.stepChanged
+形态 | morph.rules.read/replace、morph.prepare、morph.activate、morph.restore | morph.rules.changed、morph.prepared、morph.applied
+资源 | assets.import/scan/resolve/explain、panels.list/open | assets.progress、resources.batch、panel.calls
+助手 | battle.snapshot、battle.subscribe/unsubscribe | battle.snapshotChanged、battle.ended、battle.stale
+阵容 | lineups.read/save/capture/apply | lineups.jobChanged
+设置 | settings.read/patch | settings.changed
+
+命令参数使用对象和具名字段；MyPro的modifySettings数字下标只出现在可选兼容导入层。Rust/TypeScript类型由单一schema生成或共同校验，不能长期手工维护两份互不一致的参数表。
+
+5.4 桥实现约束
+
+Web到Rust使用固定入口发送序列化DTO。Rust回Web时使用固定接收函数，数据经JSON序列化后作为参数，不将捕获文本、文件路径或错误消息拼成可执行JS。
+
+工具页使用打包的本地应用资源。只给自己的工具页装载宿主能力；远程登录页或外链页面使用隔离的权限与上下文。自定义资源协议将资源ID解析到已登记文件，拒绝目录越界；网页不获得任意磁盘读写接口。
+
+每个requestId在一个bridgeGeneration内只完成一次；pending有超时和页面销毁清理，事件订阅有unsubscribe。宿主绑定并验证命令来源页面代数，响应带回原代数；旧页面响应直接失效。新页面订阅运行中job时通过当前代数取得快照/事件，不继承旧pending。超时只表示等待没有完成，不自动代表已提交的游戏动作被撤销。
+
+6. 从播放核心到游戏功能：GameAdapter 必须补齐
+============================================
+
+6.1 播放能力和游戏语义能力的差别
+
+通用Ruffle能够执行官方SWF，不代表已经注册MyPro使用的send1、sendAndCallBack、huodong、scene等接口。增加Web按钮后仍需把它接到实际游戏语义入口。
+
+新项目应建立版本化GameAdapter。每个profile记录所识别SWF的内容指纹、类/方法/签名、桥版本、已支持能力及回归夹具。优先复用当前核心已有桥；没有桥时，可选最小SWF适配补丁或受限的AVM2方法适配。选择一种有证据、可回退的入口，不对任意同名方法全局替换。
+
+原始官方播放作为基线。所有游戏特定扩展留在独立模块/profile，关闭后可回到原流程。写清扩展影响哪些SWF和哪些语义，不把未知版本强行当旧版。
+
+6.2 两个方向的桥
+
+宿主调用游戏：Rust语义命令排队，Player在可安全执行的边界调用已注册回调或已核验方法。WebView线程不直接重入AVM2。
+
+游戏通知宿主：ExternalInterface或受控方法观察点复制小DTO，写入有界事件队列；不保留整棵AVM对象图作为日志。
+
+游戏同步查询：例如形态解析、表现开关、隐藏公告查询，直接读取Rust/运行时内的已发布不可变配置快照并返回。该路径不能等待Web UI、网络或异步文件读取。
+
+6.3 MyPro 桥的可参考事实
+
+定制socketclient.swf注册send1→sendXtMessage1、sendAndCallBack→sendXtMessage2、room→joinRoom。send1把{id,cmd,param}交给游戏当前socketServerClient的sendXtMessage，使用已有连接；工坊JSON不是原始TCP字节。[M3]
+
+start.swf中的huodong、scene、auto、close、showpackage等回调负责活动、场景、自动操作和面板。新项目应复核实际版本中相同语义的入口，不能假定官方原SWF已带这些MyPro自定义名称。
+
+消息观察、URL资源观察、面板URL/CLS调用观察是不同能力。资源fetch只能看到加载请求；缓存命中的面板调用可能完全不发生新fetch。要捕获URL与CLS的配对，必须观察实际面板调用语义入口。
+
+6.4 给Agent的底线
+
+不得用Winsock注入作为本程序已有游戏后端接口的默认替代。需要字节诊断时，可以包装自己的socket backend；需要业务消息时，应在已解码对象边界采集。没有明确framing和解码器的字节片段不能标成完整游戏包。
+
+对任何观察补丁，验证原函数恰好执行一次、原返回值和异常语义保持；对刻意改变表现的适配，单列行为合同，不混入纯观察器。
+
+7. 工坊：实际逻辑与新实现要求
+==========================
+
+7.1 面板应包含什么
+
+工坊拆为采集列表、脚本编辑器、运行任务三块。列表显示时间、方向、来源、命令、摘要和完整内容；编辑器支持校验、错误定位、插入选中发送、插入延时、导入导出；任务区显示循环、步骤、等待条件、超时和取消状态。
+
+“暂停显示”只暂停UI订阅；“停止采集”停止该记录通道；“停止脚本”取消任务。三个动作不能共用一个布尔值。业务状态处理不依赖工坊表格是否显示。
+
+7.2 MyPro 的采集链
+
+SetIntercept修改共享记录开关。普通游戏发送包装函数通知on_send，Rust序列化{id,cmd,param}并入有限队列，UI事件收集器生成addDevRow，页面显示并可转为#send脚本。[M3]
+
+已核实的这条路径中，SWF忽略on_send返回值，随后继续原发送。因此其“拦截”在此表示采集记录。样本记录有200条上限和单条32768字节限制，并排除部分命令；丢弃的是日志，不能据此称游戏丢包。
+
+样本send1/sendAndCallBack直达较底层通信客户端，可能绕过普通on_send观察点。新项目如果要求工坊记录脚本、自定义发送和普通游戏请求，应选择共同业务发送边界，或对每个发送入口补齐来源标签，并用同一dispatchId去重；不要只装一个on_send就宣称全覆盖。
+
+7.3 MyPro 的脚本语言与执行地点
+
+工坊把文本、循环次数、轮间隔和开始/停止布尔值交给Rust。原生parser按ASCII竖线“|”分段、trim、跳过空段，再解析有限命令，并交原生定时状态机执行。不是JavaScript eval，也不是把脚本原文发到游戏服务器。[M3]
+
+命令 | MyPro已核实语义 | 新项目实现建议
+#send={...} | 校验id/cmd/param，排入send1；之后约200ms节拍推进 | SendBusinessMessage，发出状态与业务结果分开
+#time=N | 毫秒非负整数，零按至少1ms推进 | 单调时钟deadline；让出执行权
+#auto=true/false | 排入auto回调 | SetAuto，校验当前会话与能力
+#activ='url','cls' | 解析两个字符串，排入huodong | OpenPanel，保留url和cls两个独立字段
+#scene=name | 排入scene | ChangeScene，明确允许参数格式
+#room=name | 排入room | JoinRoom，作为profile内能力
+#wait | 战斗结束等待子状态 | 新语义使用指定battleId及明确开始/结束条件
+
+MyPro的#wait先等约3秒，之后检查战斗状态，约250ms复查，约600秒超时；状态为false后延时、尝试close，再延时推进。它不强制曾经观察到本次战斗开始，也不是“等任意下一条回包”。兼容导入可以保留legacy语义，但新格式应明确写waitBattleEnd或waitResponse，不能悄悄改变旧脚本含义。[M3]
+
+部分MyPro内置脚本在页面JS中使用Promise、setTimeout等编排，并不与工坊共享一个执行器。新项目将长任务统一放入Rust调度器，前端只提供文本、配方参数和操作；关闭标签或刷新WebView不破坏任务状态。[M1][M3]
+
+7.4 parser 与任务状态机
+
+先实现版本化输入格式：mya-legacy保留MyPro分段/类型规则，structured-v1使用结构化步骤。两者编译到同一中间表示：Send、Delay、SetAuto、OpenPanel、ChangeScene、JoinRoom、WaitBattle、WaitResponse。未知命令和无效字段在执行前一次性报告，附原文本位置。
+
+不要用简单split('|')冒充支持任意JSON字符串中的竖线。旧格式保持其真实限制；新格式使用JSON数组或真正带引号/转义识别的parser，并在导出时标明格式版本。禁止用eval、Function或任意系统命令作为脚本执行捷径。
+
+任务状态：Validated、Queued、Running、Waiting、Stopping、Completed、Failed、Cancelled。一个账号会话默认只允许一个会改变游戏状态的工坊/内置脚本任务；读取快照、导出日志等独立任务可并行。
+
+每一步至少记录jobId、stepId、loopIndex、sessionId、开始时间、deadline、发出状态、结果依据和错误。任务出队时重新验证会话与前置条件；一次设置按钮不能把不同任务之间的等待器共用为全局变量。
+
+取消只停止后续步骤并撤销本任务等待器，不撤回已送出的游戏请求。超时不自动重发消耗或其他非幂等操作。重试策略必须由具体动作profile声明。
+
+7.5 等待回包的边界
+
+MyPro的sendAndCallBack按cmd装一次性监听，经onSyncResult通知宿主；原生等待路径有单个在途限制。它的IPC reqId不能补成不存在的服务器关联号。[M3]
+
+新项目只有在协议确实包含可核对的关联字段时，才做多请求并发匹配。否则对相同cmd或缺少关联依据的操作串行化，额外校验session/battle/目标标识。收到其他请求的同名事件不能误判本步骤成功。
+
+7.6 工坊验收闭环
+
+采集一条普通游戏发送；确认同一发送继续正常执行一次；将该发送转换为编辑器步骤；先解析校验，不自动执行；在专用测试适配器中验证循环、延时和取消；最后验证实际授权会话中的对应无歧义操作与响应来源。
+
+脚本文件导入只解析和显示。记录文件导入只读展示。二者不能在选择文件后自动执行。
+
+8. 形态/模型替换：MyPro 的精确实现
+================================
+
+8.1 三个不同层次先分清
+
+能力 | 改变什么 | 主要入口
+形态规则 | 游戏用于展示的素材标识、外观配置 | pmview、flaId、flaId_icon等游戏桥
+资源替换 | 某个资源请求交付的字节及其导出契约 | navigator/ResourceResolver与资源适配器
+H5/Spine增强 | 为旧资源接口提供新的模型数据和渲染能力 | H5资源准备、兼容SWF、核心Spine扩展
+
+FSR另属整幅游戏画面的后处理。不要把这四件事实现为一个“换模型”开关；它们的依赖、缓存、失败回退和生效时机不同。[M4][M6][M7]
+
+8.2 MyPro 规则字段及保存动作
+
+页面规则包含remark、originalId、backpackId、fightId、spskiId。后三个标签分别是背包、战斗、海报目标。原页面用字符串保存ID，用“/”表示没有填写该类目标；导入接受数组或带skins数组的对象，过滤无效originalId并限制最多500项。[M4]
+
+saveSkinJSON并非仅写一个文件：原生分支解析规则，进入映射编译/保存逻辑，持久化配置，并尝试通过已注册send1排入以下刷新请求：
+
+  {"id":13,"cmd":"1212","param":{}}
+
+这个已确认请求不携带目标模型ID；不能据此称“将改模ID上传到服务器”。回调未注册时不能保证刷新已经送出。也不能把“已保存”直接写成“当前模型已显示”。[M7]
+
+样本持久化函数统一处理settings、skins、lineups、script。my_petskin.json是导入UI约定名；本次不据此断言运行配置只存于这个独立文件。
+
+8.3 originalId 究竟是什么键
+
+原生将规则编译成三张素材ID映射；本次闭合了32位键值存储与查表，不将未完整恢复的整数符号范围固定为公共协议。它们按相应显示入口取得的素材键查表，不应直接用宠物个体ID、UQI、pmSView.i、pmSView.r或pmPId代替。[M7]
+
+背包回包路径：socketclient只在已核验的2211/2212分支调用pmview并使用返回对象。
+2211对应pm.pmPView；2212遍历pmList[*].pmSView。对每个view，优先取有效skin作为查表键，否则取f；backpackId命中后回写被选中的skin/f。关闭形态功能时该分支返回原输入。[M7]
+
+海报配置：spskiId映射使用同一来源素材键，仅在pmPView路径中读取pcp字符串，按spski关键字改写其中相应配置文本，再回写pcp。不是直接设置pmPView.spski属性，也不是直接把一张PNG地址写进规则。该pcp子格式未被完整恢复；新实现需针对实际profile用真实样本补齐解析与回读验证。[M7]
+
+8.4 战斗模型与头像
+
+战斗SWF的MCPetContainer.init先调用PetAssetsMap.getPetFlaId(playerBattleInfo.viewId)，再调用：
+
+  ExternalInterface.call("flaId", sourceFlaId, isFace)
+
+返回值写回模型使用的flaId。源素材键经过PetAssetsMap转换，不能把任何输入viewId未经核对就当作同一域的素材ID。
+
+宿主flaId用fightId映射。是否允许影响相应朝向由游戏传入的isFace及GaimoisFace共同决定，而不是宿主单凭某个URL推断敌我。新项目应从已确认的战斗上下文传入side/owner信息，避免只看资源名判断。
+
+头像路径PetHeadIconHandler.setIcon调用：
+
+  ExternalInterface.call("flaId_icon", PetAssetsMap.getPetFlaId(inputId))
+
+此调用只有一个业务参数。原生将其作为icon模式，复用fightId映射；不能假定头像和主体使用相同的敌方限制。[M7]
+
+样本还有兼容例外：flaId_icon绕过上述敌方门控；flaId源ID=270存在门控例外；开启PetTransparent时，非icon接口会优先返回2011。它们属于该样本的具体政策，不能把270/2011推广成所有版本通用的隐藏模型或队伍规则。新实现用显式透明策略和profile描述这些兼容行为。
+
+8.5 新项目的形态服务
+
+建议拆分四项：RuleRepository管理持久规则；MorphResolver提供纯映射；AssetPreparer准备所需素材；MorphCoordinator决定何时发布和刷新。
+
+新规则至少包含：
+
+字段 | 作用
+ruleId、enabled、remark | 稳定身份、启停与备注
+sourceKey、sourceNamespace | 明确素材键域；不把个体/种族/外观ID混用
+backpackTarget、battleTarget、portraitTarget | 分别表示三种显示目标；无目标用null，不传播“/”魔法字符串
+scope | self/enemy/both及适用上下文；头像是否跟随单独声明
+profileId | 当前游戏适配合同
+revision | 并发保存和回滚依据
+
+兼容导入器读取MyPro五字段格式，转换为具名的新规则，并保留sourceFormat。不同目标入口的素材键域若不一致，由profile转换并显示解释，不做数字碰巧相同的隐式关联。
+
+MorphResolver输入至少包括原始素材键、展示上下文、side/owner、会话/战斗标识、规则快照版本，输出原ID、目标ID、命中ruleId、策略及原因。它只做有限查表，不下载、解压或访问网页。
+
+映射基于保留的原始身份执行一次。A→B、B→C两条规则不能因多次经过回调而把A悄悄变成C；不支持链式时明确单次解析，支持链式则必须定义循环检测和深度上限。
+
+8.6 保存、准备、生效与回滚
+
+Desired：用户已保存的新规则。
+Prepared：目标素材、类/配置与依赖已验证，可应用。
+Active：当前会话或视图实际使用的规则快照。
+
+页面分别显示三者，不能在save成功后把Active直接设成新版本。新项目的默认操作为“保存并准备”；prepare完成后按安全点发布，必要时由GameAdapter执行已核验的刷新动作。刷新请求成功发出也不代表模型已重建，要有后续视图代数/加载完成证据。
+
+战斗内变更默认留待下一场；本场从预加载开始固定BattleBinding，所有资源请求及完成回调携带同一bindingId。背包换亚比使用viewGeneration；旧异步结果迟到时释放其租约，不覆盖新模型。
+
+恢复官方是撤销映射、发布新版本、在安全边界刷新所需视图。只改一个URL路由而不处理既有ApplicationDomain/模型实例，不能保证当前画面立即恢复。
+
+编辑备注、调整列表顺序、修改单纯表现开关不触发模型下载/转换。缓存键依据实际内容依赖，不把整个settings JSON作为模型缓存key。
+
+8.7 真实数据与显示数据分离
+
+战斗助手、脚本目标和阵容请求保留服务器真实的个体/种族/技能/属性信息；外观服务输出displayModel。不得用展示目标ID覆盖用于服务端动作的真实宠物ID。
+
+如果profile只能通过改写AS3收到的显示对象实现，保留原对象的事实快照或明确的原始身份旁路，仅改约定显示字段。诊断中分别列originalValue与presentedValue，便于解释“看起来是另一只亚比，但真实信息未变”。
+
+9. 资源替换与 H5/Spine 扩展
+==========================
+
+9.1 在原生资源加载处接入
+
+ResourceResolver接在现有Ruffle navigator/fetch资源链。WebView的网页请求拦截只能观察网页自己的资源，不能自动接管原生Ruffle下载。
+
+Resolver保留originalUrl、effectiveUrl、baseUrl、实际内容hash、来源、命中规则、规则版本、加载上下文和资源租约。替换本地字节时仍保留游戏用于相对路径、域和缓存判断的逻辑URL，避免把所有URL改成磁盘路径导致依赖解析变化。
+
+准备阶段完成IO、校验和转换，发布不可变ResourceSnapshot；Player请求时做快速匹配。命中未准备资源时按明确策略异步等待或回退官方，不能在渲染帧内同步下载/转换，也不能把不同版本的分片混装。
+
+9.2 普通SWF资源替换
+
+需要跨素材ID替换资源时，核对调用方期待的导出类、SymbolClass、ABC包名/配置、动作编号、朝向和分片。只将URL中的A替为B，可能得到B的类名而无法满足A的加载契约。
+
+把一个模型的所需资源定义为bundle，由profile给出requiredPieces，不把固定“六片”写成所有模型通用条件。完整准备并验证后再发布；一片损坏或缺类则保持旧Active并报告原因。
+
+资源适配器可以将目标资源导出调整为调用方期待的契约，但必须解析结构后重建并回读，不能对整个二进制做等长/不等长字符串替换。调整字节资源与调用flaId改变素材选择是两种能力，按实际游戏入口选择，避免重复替换。
+
+9.3 MyPro 的H5路径已经确认的部分
+
+H5PetModel开关控制后续资源路由。样本在请求旧petmovie、战斗bitmap模型和特定头像资源时尝试H5替代；失败则继续原请求，不承诺任意亚比都有对应H5素材。[M6]
+
+已恢复源规则：
+展示模型：https://aola.100bt.com/h5/peticon/newbreath/petmovie{id}/petmovie{id}.json 和 .atlas。
+战斗模型：https://aola.100bt.com/h5/petfightassets/spine/pet{id}/pet{id}.json 和 .atlas。
+图集页名从atlas读取，相对该模型目录取得；不能假定只有一个固定名称PNG。
+
+MyPro将JSON、atlas及图像页打包进自定义bundle，再构造含BinaryData、DoABC、SymbolClass及旧资源接口的兼容SWF。核心识别AOLA_SPINE_H5_V1与战斗类AOLA_SPINE_F1标记，进入专门解析路径。仅在网页中显示Spine不能替代这条游戏内模型集成。[M6]
+
+本次没有完整恢复战斗bundle逐字段格式及所有最终绘制入口；不要把一个Graphics扩展方法名描述为所有模型唯一必经入口。新项目可设计自己的版本化bundle和原生renderer，不应照猜测复制私有格式。
+
+9.4 新H5模块的实施合同
+
+先对当前核心登记h5Spine capability。没有原生骨骼/网格支持时，此功能为未实现，不得通过普通checkbox假装开启。
+
+模块需完成：资源目录映射、准确版本解析、atlas多页/旋转/裁边/PMA、骨骼/IK/mesh/权重/变形/绘制顺序、动画选择、旧SWF导出兼容、碰撞/布局与生命周期接口、背景准备及官方回退。
+
+Spine JSON的主次版本与runtime匹配。用户上传过的pet6106(1).json实际为3.7.89，含1_1/1_2/1_4/1_6及2_1/2_2/2_4/2_6；这只能作为一份已确认样本，不能推定所有模型均同版本或同动作。后视方向按profile选择实际存在的2_*，不能把水平镜像算作后视实现。[M8][S10]
+
+预览器与游戏内模型适配分别验收：预览能播放不能证明兼容SWF已让游戏正确创建、切换和回收模型。H5开关默认作用后续加载；即时热替换需另外实现明确的模型重建流程。
+
+9.5 FSR与分辨率
+
+MyPro的AmdFsr对应游戏纹理的EASU/RCAS后处理，分辨率菜单控制内部渲染像素预算；H5PetModel改变模型资源来源。新项目把这三项设置分开，各自报告是否实际生效。[M6]
+
+既有核心已具备相应优化时复用原实现。没有时，作为后续独立任务；先量测新增pass和纹理内存，不能把FSR当作解决AS3、同步下载、GC或背包切换卡顿的通用措施。
+
+10. 消息文件、URL/CLS 捕获与本地面板
+==================================
+
+10.1 四种记录不能混用
+
+记录 | 来源 | 关键字段与用途
+ResourceRequest | navigator与resolver | 原/最终URL、来源、状态、规则、hash、大小、缓存
+TransportChunk | 自有socket后端，按需开启 | 连接ID、方向、字节块；没有解码前不标完整消息
+BusinessMessage | 已解码消息/发送语义边界 | id、cmd、param、方向、来源、上下文、阶段
+PanelInvocation | 游戏实际面板入口 | url、cls、参数、调用ID、会话与执行结果
+
+ResourceRequest中没有CLS不应靠文件名猜。PanelInvocation可以没有新的ResourceRequest。相同URL的缓存命中、同URL不同类调用，都应留下各自的面板调用记录。
+
+URL/CLS观察点应位于实际Panel_Helper.loadResAndShow或该版本同义入口。记录失败不能阻止原方法执行；加载失败时补记失败阶段，避免只记录“点击过”。MyPro的huodong活动调用可作动作桥参考，但不能由此声称样本已有完整的URL/CLS采集界面。
+
+10.2 导出合同
+
+消息记录采用版本化JSONL；脚本文件使用独立格式；资源导出包包含manifest及实际依赖。三类文件的导入入口分别处理，不能把任意日志当脚本执行。
+
+记录至少包含schemaVersion、streamId、seq、timestamp、sessionId、source、kind、direction、id/cmd及payload，必要时加入battleId、request/dispatchId、原始值与展示值。采集截断、脱敏或队列缺口必须显式标记，不称为完整可重放文件。
+
+开始导出时固定筛选条件和序号范围，后台流式写临时文件，完成后原子发布；采集继续进行。大blob用hash引用并随导出包保存，不能导出仅指向临时缓存的路径。处理取消、磁盘满和写失败，成功通知只在文件提交完成后发出。
+
+页面支持方向/cmd/来源/时间筛选、单条完整内容、分页/虚拟列表、选中复制、导出范围、暂停显示与清空视图。原生记录区与DOM列表都设字节和条目上限，记录overflow生成Gap事件和计数。业务状态合并与日志展示使用不同队列和丢弃策略。
+
+10.3 本地资源包与游戏面板
+
+本地包manifest至少描述packageId/version、适用gameProfile、逻辑URL映射、每份资源hash/类型、dependencies、entryUrl、entryClass、允许的参数格式。导入时验证包路径、依赖、SWF结构和必要导出类，不只看扩展名。
+
+用户选择“打开面板”后：宿主解析包及入口，准备所有已知依赖，取得会话绑定，再通过GameAdapter.openPanel(url,cls,args)调用游戏原入口。SWF由原生Ruffle执行；WebView只展示包目录和进度。
+
+本地HTML工具页和本地SWF游戏面板是两类资源。前者由WebView加载，后者由Ruffle加载。前端构建资源协议和游戏resolver可共享存储，但必须分别保持内容类型、逻辑URL和能力边界。
+
+10.4 验收重点
+
+同一url连续打开两次可只发生一次网络fetch，却必须有两次PanelInvocation。打开不同cls时保持配对正确。缺依赖或缺类有明确失败原因。采集中导出固定范围后可只读重新打开，序号、来源和Gap保持一致；不会在导入过程中发出游戏请求。
+
+11. 对战助手、阵容、活动与表现设置
+================================
+
+11.1 对战助手的数据流
+
+MyPro页面接收updateFightHelper与resetFightHelper。已确认的数据包含Label、MaxBaseAbility和PetInfos数组；六个展示格使用ImageURL、IsDead、Name、HP、Character、Power、Skills。网页只是展示宿主送来的内容；不能据此声称网页自己从游戏内存推导能力值。[M1][M4]
+
+新项目由Rust BattleStateStore按sessionId/battleId/side/个体标识维护唯一战斗状态，生成视图快照。属性页、技能页、装备页、六卡概览共用该状态，不能各自解析同一消息维护互相矛盾的副本。
+
+每个可显示字段记录value、availability、source、updatedSeq；明确区分未下发、有效零值、显式清空和过期。技能PP/CD、装备、魂卡、晶钥等只有在已验证数据源真实提供时展示；不能把静态图鉴最大值当当前对战事实。
+
+完整阵容快照与部分增量具有不同语义：部分增量缺字段表示保留，而非归零；完整快照如何删除旧成员由profile声明。个体唯一键与槽位分开，换宠或相同种族多只宠物不会互相覆盖。形态目标ID不参与真实战斗身份匹配。
+
+原始消息先进入业务归并，再做UI限频。若业务观察事件发生缺口，标记状态Stale并尝试获取新快照；不能继续把不完整数据标成实时。单纯UI订阅掉帧时取最新快照即可，不重放所有旧DOM更新。
+
+11.2 阵容与亚比模块
+
+MyPro“亚比”导航主要是稀有亚比挑战/捕捉入口，和游戏newpetpackage.swf背包不是同一模块。已核实页面通过evolveHuangyan、oldyabiBattle、xiyouyabiBattle三类IPC路由；不能把它描述成完整的亚比属性编辑器。[M4]
+
+新项目将条目做成版本化目录：展示ID、名称、图标、动作类型、前置条件、适用profile。按钮只提交recipeId和参数；Rust解析成既有任务IR。目录来源和业务配方分开，不根据名称猜测游戏命令。
+
+阵容预设区分真实个体、顺序、装配与展示备注。capture读取当前游戏事实；save保存预设；apply才启动变更任务。导入预设不自动换阵容。执行前核对当前账号拥有的个体与条件，部分失败逐步显示，不用固定延时后统一宣称成功。
+
+打开背包使用已有游戏入口；不因为Web面板重构就重写游戏背包，也不以网页图标懒加载宣称解决了AS3背包的2—3秒切换问题。背包原有优化继续独立保留并回归测试。
+
+11.3 活动、剧情、小游戏
+
+MyPro的LoadTaskList、LoadGameList、LoadActivList已有本地缓存读取，活动还存在内嵌后备；不能将“重新加载列表”直接理解为每次实时联网。老活动条目通常是url/cls入口；剧情和小游戏可能被编译为业务动作序列。[M5]
+
+新CatalogService提供来源、版本、更新时间、条目类型、参数schema及可用状态。OpenPanel类条目走面板桥；ScriptRecipe类条目走统一调度器。列表过期或缺配方只影响该条目，界面仍能使用其他功能。
+
+11.4 表现开关
+
+屏蔽出招、伤害文本、背景切换、神兵、登场/击败、模型透明、隐藏整场画面应是独立具名策略。按profile在真正的表现入口判断，保持必须执行的游戏状态推进、回调和事件顺序。
+
+隐藏画布不等于停止AS3、计时器或模型加载；跳过动画也不能简单删除完成回调。开关应用返回明确的revision和适用范围：立即影响新表现、下次模型创建生效或下场战斗生效。
+
+对MyPro那些点击后立即写“已完成”的UI，新项目使用真实操作状态替代。一个“修复卡顿”按钮只有在已知问题与操作入口都核实后才实现，不能只调用通用GC或清缓存并宣称修复。
+
+12. 前端组织、持久化与交付方式
+============================
+
+12.1 建议页面
+
+页面 | 主要显示 | 实际服务
+总览 | 会话、能力、任务、性能摘要 | SessionService与Metrics
+工坊 | 采集、编辑、校验、运行、停止 | CaptureService与ScriptScheduler
+模型/形态 | 规则、目标、作用范围、准备/生效状态、恢复 | MorphService与ResourceService
+本地资源 | 包目录、依赖、路由解释、面板入口 | AssetCatalog与PanelService
+洞悉 | 战斗概览、属性/技能/装备、来源说明 | BattleStateStore
+阵容/亚比/活动 | 目录、预设、动作进度 | CatalogService与统一任务系统
+设置/诊断 | 具名策略、日志、错误、版本、预算 | SettingsStore与Diagnostics
+
+前端拆成组件与typed bridge，不复制MyPro的整份单文件HTML作为长期业务中心。渲染列表时对捕获内容使用文本绑定，不让日志和资源名进入innerHTML执行。
+
+已存在的原生egui顶栏可以保留控制播放、分辨率和诊断；后续是否迁到Web按体验决定。两个UI入口修改同一SettingsStore，并接收同一settings.changed，不各自缓存互不一致的布尔值。
+
+12.2 持久化
+
+配置包含schemaVersion；写临时文件后原子替换，保留可恢复上个版本。导入先完成整个文件的schema/范围校验和迁移，显示结果后一次提交，不逐条覆盖一半再报错。
+
+建议逻辑集合：settings、morph_rules、lineup_presets、script_recipes、asset_manifest、recordings。可以采用若干JSON文件或当前已有数据库；第一版不要为了架构图引入外部数据库服务。
+
+头像、模型和派生SWF按内容hash/转换器版本管理缓存。源文件、变换结果与运行中租约分开；删除缓存不能删除用户导入的原始文件。模型素材失败记录有明确的重试/失效机制，不能永久把临时网络失败记成资产不存在。
+
+会话凭据使用现有专用保存路径和适合平台的凭据能力，不混入普通日志、脚本模板或导出包。用户输入的业务参数在日志里是数据，不是可执行脚本代码。
+
+12.3 打包
+
+构建生成前端静态资源，宿主通过受控本地协议或资源装载器提供；release包不依赖vite dev server。开发环境可用HMR，但接入范围与release本地内容策略明确分离。[S8][S9]
+
+Windows安装/便携启动检查WebView2 runtime是否可用，说明部署方式；失败时给可定位的环境错误。WebView2有浏览器进程与内存开销，不承诺整个客户端只有一个OS进程或固定几十MB占用。
+
+本文不要求添加自动更新、账号体系、在线工坊商店或远端服务。这些不属于首版功能闭环。
+
+13. 避免新增功能破坏已有性能
+==========================
+
+13.1 首先记录原始基线
+
+在用户实际电脑上，以同一个核心commit、同一图形设置和可重复场景记录：启动到可交互时间、帧时间P50/P95/P99、主线程长任务、换亚比冷/暖缓存时延、30/60分钟进程及WebView进程内存、GPU资源量、关闭耗时。比较新增壳前后，不只看FPS瞬时数字。
+
+不要同时更换winit/wgpu版本、改变内部渲染分辨率和添加面板后，把总体变化归因于前端框架。集成的首要目标是能力扩展和回归可控，并非宣称Wry天然让Ruffle更快。
+
+13.2 限额与背压
+
+以下为建议的初始配置，不是MyPro测得的参数；P0/P1按数据调整：
+
+对象 | 起点 | 溢出/更新策略
+游戏命令队列 | 最多512个普通命令 | 返回Busy；取消/停止走独立可到达通道
+资源准备 | 同时1—2个重转换任务 | 同一内容请求合并；取消可放弃提交
+UI遥测 | 约100ms一批，按字节限额 | 合并可重建状态，保留最新快照
+采集内存 | 同时约束条数和总字节数 | 丢弃日志时生成Gap，游戏处理继续
+列表DOM | 只挂载可见窗口及缓冲区 | 后端游标分页，避免无限append
+模型缓存 | CPU/GPU分别按字节预算 | 无活动租约且GPU使用结束后回收
+
+以上并非保证任意1MiB消息或高频数据都适合经Web IPC。大payload在Rust保存并按ID按需查询；批次序列化也计入开销。错误与操作结果不可仅因遥测合并而静默丢失。
+
+采集可以关闭，但真实战斗状态归并有独立策略；UI关闭后取消订阅与动画，不继续后台重排不可见的几千行。游戏主循环只消费有限工作预算，不能在一帧排空无限资源完成队列。
+
+13.3 模型切换与长期运行
+
+将耗时拆成解析详情、准备资源、创建AS3实例、构建网格/纹理、首次绘制、销毁旧对象等阶段。出现2—3秒停顿时按阶段定位，不在前端无条件加延时掩盖。
+
+暖缓存切换不重新转换同一模型。旧模型退出时注销计时器/事件、撤销订阅、取消可取消任务、清理背景/粒子引用；资源缓存按租约和预算保留可复用数据。不能每次关面板就全局清空Ruffle缓存或强制完整GC。
+
+核心本来拥有的纹理池、SWF去重和资源生命周期政策继续作为唯一底层实现。新功能不另起无预算的“预加载所有亚比”缓存，也不跨所有视图持有AVM强引用。
+
+14. 退出与错误恢复
+==================
+
+正常关闭分阶段推进，主窗口消息泵保持响应：
+
+阶段 | 工作 | 完成证据
+Closing | 拒绝新业务任务、推进会话/页面失效标识 | 新请求返回Closing/Unavailable
+Cancel | 停脚本与等待器、取消后台提交、注销UI订阅 | 任务数与pending可解释地下降
+StopRuntime | 在Player所有者停止游戏、音频、网络及渲染提交 | 不再访问将被销毁的surface/句柄
+Flush | 后台提交配置与必要日志，设时间预算 | 完成或明确记录未完成原因
+Release | 按依赖释放GPU目标与runtime，再在UI线程销毁WebView/窗口 | 资源与窗口生命周期闭合
+
+网络reader要能通过关闭/取消实际唤醒，任务停止不是只改一个bool却仍永远等待read。音频和后台任务有明确拥有者与停止信号。不要在WebView回调或UI线程阻塞等待整个线程池、GPU或无deadline的任务。
+
+关闭超时记录具体阶段和任务，不把“界面几秒无响应”当正常退出反馈。同进程内无法安全地强杀任意持有Rust/AVM对象的线程；只有明确设计的独立进程才有进程终止边界，本阶段不为此默认重构为多进程。
+
+失败恢复按能力隔离：资源包损坏保持上一Active；未知游戏profile禁用扩展；前端崩溃可重新加载并取快照；游戏会话失败则失效全部相关任务并由用户重启会话。不要以UI自动重载为理由重复发送尚未确认结果的操作。
+
+15. 目录建议与阶段计划
+======================
+
+15.1 逻辑目录
+
+目录 | 责任
+app/src/host | 窗口、layout、WebView、IPC路由、生命周期
+app/src/runtime_adapter | 当前核心接入、Player所有权、事件/命令桥
+app/src/game_adapter | 游戏版本profile、SWF/AVM桥、字段与动作映射
+app/src/features/workshop | parser、IR、scheduler、等待与取消
+app/src/features/morph | 规则、resolver、准备/激活、视图代数
+app/src/features/battle | 唯一状态归并、字段来源、视图快照
+app/src/features/resources | 资源包、catalog、resolver、转换和租约
+app/src/features/capture | 四类观察、记录、查询、导出
+app/src/features/catalogs | 亚比/活动/配方与阵容服务
+contracts | IPC schema、DTO、错误、能力与事件定义
+ui/src/bridge | typed调用、订阅、页面代数、错误处理
+ui/src/pages、components | 面板与可复用控件
+profiles、fixtures、tests | 版本资料、合法样本、合同/集成验证
+docs/architecture、docs/tasks、docs/acceptance | 决策、任务账本与证据
+
+目录是逻辑分工，先用现有workspace的模块组织即可。只有编译边界或复用确有需要时再拆crate，不机械创建几十个空项目。核心fork保持原位置和锁定commit。
+
+15.2 阶段与准入门槛
+
+P0 盘点与冻结基线
+读取当前README、主文档、Cargo.lock及核心入口；确认窗口、渲染、navigator、ExternalInterface、线程和关闭方式。列出现有优化和扩展能力；记录官方播放基线。输出architecture-map、core-integration-contract、capability-matrix，明确未取得的SWF/profile/素材。
+
+P1 原生内嵌与最小面板
+接入Wry/WebView2与原生游戏区域；实现snapshot、暂停/恢复、窗口布局和关闭。保留现有播放路径。门槛：输入、IME、DPI、缩放、resize、最小化、WebView重载和退出实机通过；不能只展示静态截图。
+
+P2 游戏桥与只读观察
+建立一个已验证game profile；接通四类记录中实际需要的业务消息、资源请求、面板URL/CLS；实现消息导出和本地包目录/面板打开。门槛：来源可核验、缓存命中调用可见、观察不改变游戏行为、导出往返正确。
+
+P3 工坊与模型规则两条并行线
+工坊：版本化parser、统一IR、任务/等待/取消、当前游戏连接的动作入口。
+模型：legacy规则导入、具名新规则、skin/f与flaId等已核验入口、Desired/Prepared/Active、生效/恢复及视图代数。
+二者依赖P2的合同和profile，分别交真实端到端闭环；不能用纯mock页面标生产完成。
+
+P4 对战助手及目录/阵容
+真实BattleStateStore、字段来源、页面快照、亚比/活动目录、阵容capture/apply。已有可信数据源的功能先做，协议或素材缺口仅标相应能力；不编造业务配方补齐按钮。
+
+P5 稳定性与交付
+关闭所有扩展时对照原播放；开启采集、面板、脚本和模型切换做30/60分钟回归，收敛预算、过期任务及退出。完成安装/便携依赖说明、操作文档和功能账本。
+
+P6 可选H5/Spine与渲染增强
+若现有核心缺少此能力，再分别实施模型资源准备/旧接口适配/原生渲染、FSR与像素预算。它们不能阻塞P1—P5的主要产品闭环。
+
+15.3 多Agent分工
+
+Agent | 唯一负责范围 | 依赖与交付
+总Agent | 合同、架构决策、集成、文档和最终验收 | 冻结DTO/profile接口，维护任务与能力账本
+Host Agent | host与runtime_adapter | P0后先交P1；不改业务配方
+Bridge Agent | game_adapter与观察入口 | 给出SWF/方法签名、原行为及测试证据
+Workshop Agent | parser/IR/scheduler | 按固定GameCommand接口消费桥，不持有Player
+Morph/Assets Agent | 形态与资源准备 | 规则版本、素材契约、加载/回滚证据
+UI Agent | typed bridge与功能页面 | 真快照/任务状态，组件/列表/订阅清理
+Battle/Capture Agent | 状态归并、记录与导出 | 共享事件合同，不新增第二套网络入口
+
+并发数量依环境资源安排，不要求同时启动所有Agent。同一文件只设一个owner；共享合同变动先由总Agent合并，再通知依赖方。每个阶段合并一个可运行切片，验收完成后再扩范围。
+
+16. 验收矩阵与交付证据
+======================
+
+编号 | 场景 | 必须看到的结果
+V01 | 同窗游戏与Web面板 | 原生SWF持续播放，切标签不新建Player
+V02 | 中文输入/焦点/跨屏DPI | 输入只给当前区域，命中坐标准确，无粘键
+V03 | 缩放/最小化/恢复 | 无零尺寸配置、旧Surface引用或异常重建循环
+V04 | WebView重载且旧请求迟到 | 新bridgeGeneration不接旧pending；游戏会话保持
+V05 | 重登/战斗结束后旧任务回写 | 上下文校验拒绝，界面不混入旧会话
+V06 | 普通发送与采集 | 游戏动作只发生一次，日志采集不阻断
+V07 | 脚本/手动/游戏发送覆盖 | 来源可区分、无重复记录；范围不足有明确声明
+V08 | 同cmd多个等待 | 无协议关联时串行化，不误认其他请求响应
+V09 | 脚本延时/取消/退出页面 | UI消息泵继续，取消撤销等待器与后续步骤
+V10 | 同URL缓存两次面板调用 | 两条URL/CLS记录，fetch次数独立
+V11 | 导出期间继续采集 | 范围固定、Gap和blob保真、失败可见、导入不执行
+V12 | 同个体切换不同外观 | 真实个体/种族/战斗属性不被展示目标覆盖
+V13 | skin存在/缺失的背包样本 | 正确选skin或f，未命中保持原样
+V14 | 战斗主体与头像及敌方选项 | profile内语义分别验证，不仅检查checkbox状态
+V15 | 海报pcp异常/缺spski | 依据profile解析，失败不破坏原pcp
+V16 | A→B→C快速切换及迟到资源 | 旧generation不覆盖新视图，无意外链式映射
+V17 | 战中保存规则/一片素材损坏 | 本场binding稳定，未准备完整不激活
+V18 | 只改备注或表现设置 | 模型下载/转换次数为零
+V19 | 对战部分增量/零值/清空 | 不混淆未知、0、清空；状态缺口标Stale
+V20 | 30/60分钟采集与反复开关面板 | 队列、DOM、订阅、资源有界；给出对照数据
+V21 | 关闭时网络/转换仍在等待 | 主窗口保持响应，阶段耗时可定位，句柄寿命正确
+V22 | 未识别SWF或损坏资源包 | 相应扩展不可用，官方播放仍可继续
+
+测试只覆盖实际实现及具体风险：parser/规则/reducer用确定样本验证；桥用小SWF与已核验游戏profile；窗口、GPU、DPI与退出必须Windows实机验证。不能把Node解析成功当成WebView/GPU实机验收，也不能把静态反汇编当作性能测量。
+
+项目交付至少包含：可复现构建与锁文件、已实现能力账本、核心优化保留说明、桥/profile证据、窗口与功能集成记录、长时间/退出对照、已知缺口和用户操作说明。
+
+17. 可直接交给执行总 Agent 的任务说明
+====================================
+
+请在用户当前已完善的原生Ruffle项目上实施本指南。先读取项目README及doc主文档，再按需阅读专项文档。本文目标是Rust原生宿主 + Wry/WebView2功能面板，不沿用先前C#方案。
+
+第一步执行P0：确认真实核心commit、依赖、窗口/线程、render/navigator/ExternalInterface和退出方式；记录已有优化与官方播放基线。本文的建议接口不是现成API，不得凭示例名称编造已有实现。按现有结构最小适配，保持锁文件兼容。
+
+第二步冻结Command/Event/Capability与GameProfile合同。游戏Player保持单一所有者；WebView在UI线程；后台任务处理IO和资源准备。增加sessionId、bridgeGeneration、battleId、viewGeneration、rulesRevision等所需上下文，防止旧结果污染新状态。
+
+第三步完成P1原生游戏子区域 + Web工具面板。验证真实SWF、输入/中文IME/DPI/resize/重载/关闭；不把游戏逐帧转PNG或base64送网页，不为了Web UI将既有核心改成WASM。
+
+第四步完成P2只读观察与资源闭环。区分资源URL、字节块、业务对象、URL+CLS调用；消息采集覆盖范围明确；日志导出固定范围、支持Gap与只读导入。本地游戏面板由Ruffle和GameAdapter打开。
+
+第五步可并行推进工坊与形态：工坊文本/内置配方统一编译IR，由Rust调度；形态按本指南的真实显示键实现，区分背包skin/f、战斗flaId/isFace、头像和pcp中的海报配置。保留原始游戏身份。规则保存、准备、生效有各自状态与回滚，不因配置变化全量清缓存。
+
+第六步完善对战助手与阵容/目录。只展示真实数据源支持的字段，未知保持未知；按钮状态来源于实际执行和结果。H5/Spine与FSR按独立能力后续实现，不假装只复制开关即可支持。
+
+请按第15节分配模块owner并并行处理独立工作，由总Agent负责共享合同、集成、文档和验收。每项交付注明：实际修改文件、能力和生效边界、使用的真实样本/测试、已测性能变化、未完成依赖。常规可逆实现持续推进；缺个别profile/素材时标记该能力缺口并继续其他工作，不用mock按钮替代完成。
+
+完成标准是第16节中适用于当前阶段的用例通过，并保留官方播放回归与长时间/退出证据。结束时交付可运行项目和更新后的文档，不只提交空接口或计划。
+
+18. 证据、来源与本次限制
+======================
+
+18.1 样本身份
+
+MyPro v1.0.1.exe：38,113,280字节。
+SHA-256：c15066170707be57ff4e2b124435817f401d46ec446f773a4ae5a51fdc208a68。
+原生VA以该PE首选ImageBase 0x140000000为基准；raw是EXE文件偏移，SWF方法偏移是解压后SWF偏移，三者不能互换。
+
+本次只读取样本、已提取资源和反汇编，核查官方接口并编写文档。没有运行MyPro或登录游戏，没有实施目标项目，没有测量性能，也没有审阅用户当前已完善核心的实际仓库。后续Agent须在P0取得当前源码并完成P1实机验收。
+
+18.2 本地证据索引
+
+以下相对路径以本次分析资料目录为根，便于随资料交给Agent；仅有本指南也可依正文完成设计，但不能凭不存在的材料宣称已复核原代码。
+
+[M1] analysis_mypro_doc/frontend_evidence.txt
+支撑：技术组合、版本路径、手写DOM、原生与Web分工。关键raw：0x1481549自述；0x1484a18 wry/webview2；0x14ae5a1 HTML。
+原HTML：analysis_mypro101/host/panel_1.0.1_14ae5a1.html。
+HTML SHA-256：f93d5c326fc858ba576091e5251b93237e14db33d31060c5ef7cb2fce98fed32。
+
+[M2] analysis_mypro101/script_host/ipc_bootstrap.js；analysis_mypro_doc/frontend_evidence.txt
+支撑：reqId/channel/args，__aolaResolve/__aolaDispatch。启动脚本raw 0x14fd716；Wry冻结桥raw 0x15018d0；回传格式raw 0x1484e40/0x1484e77；原生dispatcher VA 0x1401e9f30。
+
+[M3] outputs/MyPro_1.0.1_script_implementation_analysis.txt；analysis_mypro101/script_ui/native_findings.txt；analysis_mypro101/script_swf/native_intercept_findings.txt
+支撑：parser VA 0x140184730、scheduler 0x140028b80、周期推进0x14002a430；send1/sendAndCallBack、on_send/onSyncResult、日志上限和非阻断语义。
+
+[M4] analysis_mypro101/pet_implementation/ui_findings.txt；outputs/MyPro_1.0.1_scripts_and_yabi_catalog.txt
+支撑：形态五字段、阵容IPC、亚比页含义、洞悉字段、具名控件与settings下标。
+
+[M5] analysis_mypro101/script_catalog/other_tabs_findings.txt
+支撑：本地目录缓存、老活动url/cls与huodong、剧情/小游戏规范化。未获得的在线目录和当前有效性不作保证。
+
+[M6] outputs/MyPro_1.0.1_super_resolution_analysis.txt；analysis_mypro101/super_resolution/pet_model_findings.txt
+支撑：H5PetModel、AmdFsr、原生分辨率三条路径，H5资源和兼容SWF，自定义bundle及回退。源码路径字符串不等于完整源码交付。
+
+[M7] analysis_mypro_doc/workshop_evidence.txt及同目录新增反汇编
+关键定位：saveSkinJSON分支0x1401ec549；映射保存0x1400217f0；统一持久化0x1401cd420；1212刷新0x140027080；pmview分发0x1401a81be→0x1401a936d→0x14001ea20→0x140182e50；海报pcp改写0x140186f40。
+战斗证据：内嵌petfightnew.swf ABC0 m5160 MCPetContainer.init，解压SWF偏移0x5fd140；头像m50 PetHeadIconHandler.setIcon，偏移0x5a45e7。见fla_id_swf.asm.txt。
+本轮复核补充了saveSkinJSON仍可能发起游戏刷新，修正“规则保存只是落盘、从不发包”的过度概括。
+
+[M8] 用户上传pet6106(1).json；analysis_h5_6106/pet6106_structure_inspection.json
+支撑：该样本3.7.89与实际8个动画。原文件SHA-256：65f390ac3450d5388f59ac15062cdc3d0b60fcf60bcc9e5b414f6234fae0d7f2。
+
+18.3 官方参考（2026-11-25核查；实施时以锁定版本为准）
+
+[S1] Wry WebViewBuilder：子WebView、边界、IPC、自定义资源协议
+https://docs.rs/wry/latest/wry/struct.WebViewBuilder.html
+
+[S2] Wry WebView：set_bounds坐标/DPI、evaluate_script、focus及线程约束
+https://docs.rs/wry/latest/wry/struct.WebView.html
+
+[S3] Winit WindowAttributes：with_parent_window与Windows子窗口
+https://docs.rs/winit/latest/winit/window/struct.WindowAttributes.html
+
+[S4] Microsoft WebView2线程模型：STA、消息泵、线程访问与重入/阻塞约束
+https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/threading-model
+
+[S5] Ruffle官方桌面Player组装入口；master不是用户fork版本证明
+https://github.com/ruffle-rs/ruffle/blob/master/desktop/src/player.rs
+
+[S6] wgpu Surface：创建、重配、非零尺寸与旧帧引用
+https://docs.rs/wgpu/latest/wgpu/struct.Surface.html
+
+[S7] Tauri Window：add_child属于WebView API及相关限制
+https://docs.rs/tauri/latest/tauri/window/struct.Window.html
+
+[S8] Vue官方TypeScript支持与项目组织
+https://vuejs.org/guide/typescript/overview.html
+
+[S9] Vite静态构建：dist产物与开发/预览服务器的区别
+https://vite.dev/guide/static-deploy.html
+
+[S10] Spine版本匹配
+https://esotericsoftware.com/spine-versioning
+
+18.4 尚需实施阶段核实
+
+当前核心的实际嵌入API和线程约束；目标游戏SWF的当前签名/桥入口；海报pcp子格式全部异常情况；H5战斗bundle/原生渲染扩展的所选实现；本地素材导出契约；Windows实机输入/DPI与GPU兼容；当前活动配方与协议有效性。
+
+这些缺口均应写入能力账本及对应阶段任务，不阻止已具备资料的窗口、桥、工坊、规则管理和观察功能先完成。
+
+

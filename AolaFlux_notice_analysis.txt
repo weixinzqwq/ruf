@@ -1,0 +1,1677 @@
+奥拉Flux v1.0.0：messagesendservice.swf 公告屏蔽实现详解
+分析日期：2026-11-22
+性质：静态反汇编分析；没有执行 EXE、连接游戏或进行帧率/内存实测。
+
+分析对象
+- 上传文件：奥拉Flux v1.0.0.exe
+- SHA-256：4a7cd5526e6099880bb11dca1f09cff0d71079e88d4e6fcab52a0da86f951639
+- 内嵌主 PE 在原 EXE 的文件偏移：0x4595b
+- 主 PE ImageBase：0x140000000
+- 公告模块资源路径：overrides/aola.100bt.com/play/messagesend/messagesendservice.swf
+- 该 SWF 为未压缩 FWS，长度 308856 字节，原 EXE 文件偏移 0x17fb9d8。
+- 提取 SWF 与原 EXE 对应字节区间已核对相同。
+- 本文 SWF 偏移均指方法字节码起始位置，不是原 ActionScript 源码行号。
+- “伪代码”是依据指令重建的等价/简化表达，不是作者源码。
+- 宿主 VA 与 SWF 文件偏移是不同地址空间，不可直接混用。
+
+核心结论
+aolaHideNotice 由本程序原生宿主实现。SWF 在多个时机调用这个接口，读取当前“屏蔽年费播报 / 全服公告”设置；真正提前返回、跳过对象创建、清空队列的动作发生在 SWF 的 ActionScript 逻辑中。
+查到 6 个调用点、5 种通道名。所有通道读取同一个 hide_year_vip 布尔值，通道名只用于跟踪/诊断，并不是五个独立开关。
+该机制减少一部分公告处理、对象分配、文本布局和动画调度。它不等于停止整个公告服务，不保证关闭正在显示的公告，也不是在网络层阻断服务器消息。
+
+[N1] 宿主接口、设置映射与默认值
+
+调用示例：
+    ExternalInterface.call("aolaHideNotice", "random")
+
+ExternalInterface.call 是 ActionScript 向 SWF 容器暴露函数发起调用并取得返回值的接口。在本样本中，容器是原生 Ruffle 宿主。
+
+宿主等价伪代码：
+    aolaHideNotice(args):
+        category = args[0] 是字符串 ? args[0] : "default"
+        对 category 做通道跟踪和诊断记录
+        return Boolean(hide_year_vip 的全局镜像值)
+
+UI 标签：
+    屏蔽年费播报 / 全服公告
+
+设置链：
+    UI toggle("hide_year_vip", ...)
+    -> 设置对象偏移 +0x25e
+    -> 应用设置函数
+    -> 全局字节 VA 0x142c00318
+    -> aolaHideNotice 返回 Boolean
+
+宿主证据：
+- ExternalInterface 调度函数 VA 0x140377090。
+- VA 0x14037750c 精确匹配 14 字节函数名 aolaHideNotice，转入 0x1403781db。
+- 0x1403781db 起处理首个参数，非字符串或缺省时使用 "default"。
+- 参数参与带锁的集合/诊断跟踪，未参与 random/honor/title/broadcast/coming 的独立策略选择。
+- 所有返回路径汇合 0x140378cdc，读取全局 0x142c00318，返回 Boolean 类型。
+- 应用设置函数 0x1402e2420：
+  0x1402e2515 读取 settings+0x25e；
+  0x1402e251c 写入全局 0x142c00318。
+- UI 处理函数 0x1402554f0 匹配 hide_year_vip 后，
+  0x140257924 写入 settings+0x25e，0x140258475 调用应用设置。
+- hide_sincere_word 是另一设置，位于 settings+0x25d，全局为 0x142c0032d；
+  aolaHideNotice 不读取它。
+- 此宿主处理分支没有按战斗状态决定屏蔽结果的判断。
+
+诊断文案：
+    播报补丁已生效：通道 [<category>] 向宿主确认，当前开关 = <boolean>
+
+默认值证据：
+- 原生设置初始化函数 0x140f9aa80 中，设置对象基址为栈+0x138。
+- 0x140f9aecb 清零栈+0x393..0x396，覆盖 hide_year_vip 字段所在的栈+0x396。
+- 因此原生初始默认值为 false。
+- 后续读取 aola-settings.json；解析器接受 hide_year_vip 或 hideYearVip，
+  在 0x140f9f3d7 写入同一设置字段。
+- 没有保存设置时默认不屏蔽；保存值可覆盖默认。
+- 静态样本不能揭示用户当前运行时的实际设置。
+
+[N2] 六个调用点
+
+类 MessageRandomShow：
+1. 方法 59 initSystemdMsg
+   SWF 0x49584；原 EXE 0x1844f5c；通道 random。
+   在读取公告池、创建/启动随机公告定时器之前检查。
+
+2. 方法 61 onSystemMsgComes
+   SWF 0x4961b；原 EXE 0x1844ff3；通道 random。
+   已有定时器回调中再次检查；屏蔽时调用 sTimer.start() 后返回。
+
+类 MessageSendService：
+3. 方法 77 onHonorMsgDispatch
+   SWF 0x49bbb；原 EXE 0x1845593；通道 honor。
+   在读取事件参数、组装名称链接和构造 MessageInfo 前检查。
+
+4. 方法 78 onTitleHandle
+   SWF 0x4a3bf；原 EXE 0x1845d97；通道 title。
+   在读事件正文、构造 type=16 的消息并入队前检查。
+
+5. 方法 79 onReturnBroadcast
+   SWF 0x4a41f；原 EXE 0x1845df7；通道 broadcast。
+   在处理回归玩家人数及构造 type=47 的广播前检查。
+
+6. 方法 85 messageComing
+   SWF 0x4a5c2；原 EXE 0x1845f9a；通道 coming。
+   待显示队列非空时检查；屏蔽则 messages.length=0 并返回。
+
+[N3] 随机公告：初始化拦截与运行中拦截不同
+
+方法 59 的伪代码：
+    function initSystemdMsg():void {
+        if (ExternalInterface.call("aolaHideNotice", "random") == true) {
+            return;
+        }
+
+        msgArr = MessageMetadata.instance.getMsgArray();
+        msgLen = msgArr.length;
+        sTimer = new Timer(TIME_SLOT * 1000, 0);
+        sTimer.addEventListener(TimerEvent.TIMER, onSystemMsgComes);
+        sTimer.start();
+        showTimer = new Timer(AUTO_CLOSE_TIME, 0);
+    }
+
+方法 68 静态初始化设置 TIME_SLOT=180，AUTO_CLOSE_TIME=5000。
+因此，未屏蔽时，这里创建的随机触发定时器请求间隔为 180 秒；
+showTimer 请求间隔为 5 秒。repeatCount=0 表示持续重复，显示结束流程会停止 showTimer。
+
+如果这次初始化进入时开关就是 true：
+- 不读取随机公告数组；
+- 不创建这里的 sTimer；
+- 不绑定和启动 sTimer；
+- 不创建这里的 showTimer。
+这个结论只覆盖 MessageRandomShow 这条初始化路径。
+
+若此前已正常初始化、后来才开启屏蔽，方法 61 开头为：
+    if (ExternalInterface.call("aolaHideNotice", "random") == true) {
+        sTimer.start();
+        return;
+    }
+
+这里确实是 start()，没有 stop()、reset() 或 dispose()。
+因此已建立的随机触发定时器仍可继续存在；后续触发时，公告正文和显示对象创建被跳过。
+这不等于销毁定时器，也不直接销毁当前已显示的随机公告。
+
+未屏蔽时，方法 61 后续会停止 sTimer，获取随机文案，按需构造 SystemMsg、SystemTxt，
+设置 htmlText、cacheAsBitmap、尺寸位置，加入显示容器，并绑定/启动 showTimer。
+方法 64 onShowTimer 调用方法 63 removeMsgHandle；后者停止 showTimer、移除监听器，
+stopAndRemove(sysTxt/sysMsg)、将两者置空，并重新启动 sTimer。
+屏蔽分支没有直接调用这一套移除逻辑。
+
+[N4] 事件入口：在消息生产前返回
+
+三个事件入口首先判断同一布尔开关。
+
+onHonorMsgDispatch：
+- 入口屏蔽判断位于 event.params 业务处理之前。
+- 被屏蔽时，后续参数解析、消息文案/链接拼接、MessageInfo 构造和入队不发生。
+- honor 是处理器通道名，不能仅凭此词推断只影响某一种荣誉公告。
+
+onTitleHandle 的等价伪代码：
+    if (ExternalInterface.call("aolaHideNotice", "title") == true) {
+        return;
+    }
+
+    var text:String = event.params.str;
+    var info:MessageInfo = new MessageInfo();
+    info.type = 16;
+    info.name = "";
+    info.content = 0;
+    info.boxBody = text;
+    messages.push(info);
+
+onReturnBroadcast：
+- 开关判断在读取 event.params.tn 和构造门槛数组之前。
+- 正常路径使用人数门槛匹配；命中后创建 type=47 的 MessageInfo。
+- 文案以“本期重逢有礼回归玩家已达”开头。
+- 同一个 info 被 messages.push(info) 连续调用三次，即三条排队引用；
+  不是创建三个不同的 MessageInfo。
+- 屏蔽时，连这些门槛处理、消息构造和三次入队都省去。
+- broadcast 对应这个回归广播处理器，不能由名称扩展为“所有网络广播都被过滤”。
+
+这些处理器处理的是已到达本地业务层的事件。
+aolaHideNotice 分支没有阻止 Socket 接收数据，也没有修改服务器奖励或活动状态。
+
+[N5] 队列出口：丢弃待显示消息
+
+方法 85 开头的等价伪代码：
+    if (messages.length > 0 &&
+        ExternalInterface.call("aolaHideNotice", "coming") == true) {
+        messages.length = 0;
+        return;
+    }
+
+关键顺序：
+1. 先看队列是否非空。空队列时短路，不调用此处宿主接口。
+2. 非空且屏蔽时，一次清空整个 messages 数组。
+3. 清空后立即返回，后续消息取出和 messageImageGenerate 不执行。
+4. 这段检查在 messageShowing、switchShow、任务完成状态和冷却状态检查之前。
+
+未屏蔽时，正常路径还检查：
+    !messageShowing
+    messages.length > 0
+    !switchShow
+    finishNew()
+    !interalDoing
+
+随后设置 switchShow=true，messages.shift() 取出一条为 messageInfoNeed，
+经过当前用户名相关检查后调用 messageImageGenerate()。
+
+finishNew() 的名字容易误解：
+方法 60 和 86 实际查询任务服务 isUserTaskFinish(150)，不是清理或结束公告的函数。
+
+为何除了入口判断还需要队列判断：
+- 开启屏蔽之前可能已有消息排队；
+- 本模块还有 pushMessage 等其他入队路径；
+- 在入口之后、显示之前开关状态也可能改变。
+从结构上看，coming 检查用于覆盖仍留在同一待显示队列中的消息。
+这是对执行顺序的分析，不能当作已经验证作者设计意图。
+
+清空的含义：
+- 已排队但尚未取出的公告被丢弃，不会在关闭屏蔽后自动补播。
+- 清掉的是这个数组所持有的元素引用。
+- 并非强制立即执行 GC，也不证明对象的其他引用已经消失。
+- 不清空正在使用的 messageInfoNeed，不直接移除当前显示对象。
+- 当 messageComing 因场景/战斗生命周期未被调用时，清理不会凭空即时发生；
+  它是在下一次该消费者实际运行且检测到开关时执行。
+
+[N6] “跳过图像创建”具体省去了什么
+
+方法 88 messageImageGenerate，SWF 字节码偏移 0x4a740，
+原 EXE 0x1846118，长度 1063 字节。
+
+更准确的名称是“跳过公告显示对象、文本布局和相关定时器的创建”。
+本方法没有发现直接 new BitmapData 的指令；不能把它描述成已经证明的位图像素缓冲分配优化。
+
+方法正常执行会：
+- 将 messageShowing 设为 true；
+- 按消息类型选择 MessageBox5、MessageBox3、MessageBox4 等特殊公告容器，
+  或创建 MessageBox1、TxtMessage、mcCloseView；
+- 填写 TextField.htmlText；
+- 用 gotoAndStop 选择相应背景/状态；
+- 计算文字宽度、背景尺寸及 x/y 坐标；
+- 绑定按钮点击、文本链接等事件监听；
+- 将对象 addChild 到 LayerManager 的基础控制层；
+- 常规滚动分支创建 moveTimer = new Timer(5)，绑定 onCountDown 并启动；
+- 根据消息类型创建 2000、5000 或 10000 毫秒的结束定时器，绑定 ended 并启动。
+
+这些 Timer 的数字是请求的延时。5ms 不等于已测得每秒精确执行 200 次。
+AS3 Timer 文档说明实际事件时间受到帧率和运行环境影响；本样本的实际 Ruffle 调度频率没有实测。
+
+从字节码执行顺序可推导的收益：
+- 避免被跳过的消息对象/显示对象构造；
+- 避免对应富文本解析、文本测量、位置计算；
+- 避免将这些公告对象加入显示列表；
+- 避免对应每条公告的移动与结束定时器、事件监听；
+- 减少这些对象本会触发的后续渲染与回收工作。
+不能仅凭这些事实量化 FPS 增幅、内存下降或 GPU 提升。
+
+[N7] 当前已显示的公告与仍存活的服务
+
+队列屏蔽分支没有做以下事情：
+- messageInfoNeed = null；
+- messageShowing = false；
+- stopAndRemove(messageBox/txtMessage/mcClose)；
+- 停止已有 moveTimer 或结束 timer；
+- 注销 messageComing 的帧事件监听。
+
+方法 91 onCountDown 自身不调用 aolaHideNotice，仍可更新公告位置。
+方法 92 ended 正常停止 moveTimer、移除对应监听，调用 onClick(null)，
+复位 switchShow，重置/启动 interalTimer 并设置 interalDoing=true。
+方法 101 onClick 才会移除显示对象，并清空 messageBox、mcClose、txtMessage、messageInfoNeed。
+
+因此，对于在屏蔽前已创建并正在显示的公告，屏蔽分支本身不会立刻让它消失。
+它可继续沿原来的结束/点击关闭路径退出。其他模块可能有额外操作，但本次没有证据证明有主动强制清屏。
+
+整个 MessageSendService 也没有被关闭：
+- 方法 107 构造器仍创建 messages、MessageReader、curPosition 和 10 秒 interalTimer。
+- 方法 70 init 仍绑定 socket、公示/称号、场景、战斗和冷却事件。
+- 场景加载/卸载、战斗开始/结束会影响 messageComing 的 ENTER_FRAME 注册；
+  屏蔽分支没有替代这套生命周期。
+
+示例：
+    当前屏幕上为 A；待显示数组中有 B、C、D。
+    用户开启屏蔽后，下一次 messageComing 检查到 true：
+        B、C、D 从队列丢弃；
+        A 没有因此被主动移除；
+        后续走受保护入口的新公告 E 会在构造前返回。
+    用户关闭屏蔽：
+        未来的新公告可重新走正常流程，但仍受显示互斥、任务门槛和冷却约束；
+        B、C、D 不会自动补播。
+
+随机公告恢复的限制：
+若首次 initSystemdMsg 因屏蔽而提前返回，其定时器从未创建。
+把宿主布尔值改回 false 本身不会自动造出一个不存在的 Timer。
+在该 SWF 中没有看到“关闭屏蔽 -> 自动重新调用 initSystemdMsg”的路径。
+若另有模块重新初始化服务，随机公告可能恢复；仅凭当前证据不能承诺恢复方式，
+也不能直接断言这是已复现的产品缺陷。
+
+[N8] 优化范围与不可推出的结论
+
+能够确认：
+- 自定义宿主布尔接口和游戏 SWF 逻辑相互配合。
+- 存在初始化、消息生产入口、显示队列出口等多个拦截位置。
+- 屏蔽可以避免相应公告的部分 CPU、分配和显示工作。
+- 所有五类参数共用 hide_year_vip，默认 false，可由保存配置覆盖。
+- 该逻辑属于对这条公告业务路径的定制减负。
+
+不能由本证据直接推出：
+- 停止所有 Timer；
+- 停止整个消息服务；
+- 所有弹窗、聊天、剧情、奖励提示都被屏蔽；
+- 当前已显示公告马上销毁；
+- 清队列等于立刻释放所有相关内存；
+- 服务器不再向客户端发送公告；
+- 修改了战斗数值、活动奖励或全服状态；
+- 将 Ruffle 渲染器整体替换为更快算法；
+- 任意确定幅度的 FPS/内存/功耗改善。
+
+[N9] 公共接口语义参考
+
+ActionScript 3.0 ExternalInterface：
+https://airsdk.dev/reference/actionscript/3.0/flash/external/ExternalInterface.html
+
+ActionScript 3.0 Timer：
+https://airsdk.dev/reference/actionscript/3.0/flash/utils/Timer.html
+
+上述文档用于解释标准接口语义。
+本样本的专有设置映射、调用点、队列及显示生命周期结论来自其原生代码和 SWF 字节码，
+不是从通用 Ruffle 或 ActionScript 文档推测而来。
+
+附录说明
+下方保存与结论直接相关的方法字节码摘录；每个指令前的偏移为方法内相对偏移。
+方法 77 和 88 较长，附录仅保留关键部分，并明确标注截取。
+
+
+
+METHOD 59 | SWF 0x49584 | EXE 0x1844f5c
+Names: ['mmo.MessageSend:MessageRandomShow/initSystemdMsg', 'mmo.MessageSend::MessageRandomShow/initSystemdMsg']
+0000: getlocal_0 
+0001: pushscope 
+0002: getlex #373 flash.external::ExternalInterface
+0005: pushstring #1126 'aolaHideNotice'
+0008: pushstring #215 'random'
+000b: callproperty #372 call, 2
+000f: pushtrue 
+0010: ifne +1 -> 0015
+0014: returnvoid 
+0015: getlocal_0 
+0016: getlex #7 mmo.MessageSend::MessageMetadata
+0018: getproperty #142 instance
+001b: callproperty #61 getMsgArray, 0
+001e: setproperty #358 mmo.MessageSend:MessageRandomShow::msgArr
+0021: getlocal_0 
+0022: getlocal_0 
+0023: getproperty #358 mmo.MessageSend:MessageRandomShow::msgArr
+0026: getproperty #147 length
+0029: setproperty #357 mmo.MessageSend:MessageRandomShow::msgLen
+002c: getlocal_0 
+002d: findpropstrict #34 flash.utils::Timer
+002f: getlex #138 TIME_SLOT
+0032: pushshort 1000
+0035: multiply 
+0036: pushbyte 0
+0038: constructprop #34 flash.utils::Timer, 2
+003b: setproperty #353 mmo.MessageSend:MessageRandomShow::sTimer
+003e: getlocal_0 
+003f: getproperty #353 mmo.MessageSend:MessageRandomShow::sTimer
+0042: getlex #5 flash.events::TimerEvent
+0044: getproperty #148 TIMER
+0047: getlocal_0 
+0048: getproperty #365 mmo.MessageSend:MessageRandomShow::onSystemMsgComes
+004b: callpropvoid #149 addEventListener, 2
+004f: getlocal_0 
+0050: getproperty #353 mmo.MessageSend:MessageRandomShow::sTimer
+0053: callpropvoid #150 start, 0
+0057: getlocal_0 
+0058: findpropstrict #34 flash.utils::Timer
+005a: getlex #139 AUTO_CLOSE_TIME
+005d: pushbyte 0
+005f: constructprop #34 flash.utils::Timer, 2
+0062: setproperty #354 mmo.MessageSend:MessageRandomShow::showTimer
+0065: returnvoid 
+
+
+METHOD 61 | SWF 0x4961b | EXE 0x1844ff3
+Names: ['mmo.MessageSend:MessageRandomShow/private/onSystemMsgComes', 'mmo.MessageSend::MessageRandomShow/mmo.MessageSend:MessageRandomShow::onSystemMsgComes']
+0000: getlocal_0 
+0001: pushscope 
+0002: debug 1, 1127, 0, 0
+0008: debug 1, 1128, 1, 87
+000e: debug 1, 1129, 2, 96
+0014: debug 1, 1130, 3, 98
+001a: getlex #373 flash.external::ExternalInterface
+001d: pushstring #1126 'aolaHideNotice'
+0020: pushstring #215 'random'
+0023: callproperty #372 call, 2
+0027: pushtrue 
+0028: ifne +9 -> 0035
+002c: getlocal_0 
+002d: getproperty #353 mmo.MessageSend:MessageRandomShow::sTimer
+0030: callpropvoid #150 start, 0
+0034: returnvoid 
+0035: getlex #82 mmo.MessageSend::MessageSendService
+0037: getproperty #143 switchShow
+003a: dup 
+003b: iffalse +7 -> 0046
+003f: pop 
+0040: getlocal_0 
+0041: callproperty #364 mmo.MessageSend:MessageRandomShow::finishNew, 0
+0045: not 
+0046: iffalse +9 -> 0053
+004a: getlocal_0 
+004b: getproperty #353 mmo.MessageSend:MessageRandomShow::sTimer
+004e: callpropvoid #150 start, 0
+0052: returnvoid 
+0053: getlex #82 mmo.MessageSend::MessageSendService
+0055: pushtrue 
+0056: setproperty #143 switchShow
+0059: getlex #154 mmo.play.scene::SceneManager
+005c: callproperty #374 getInstance, 0
+0060: getproperty #375 loadedSceneInfo
+0063: coerce #157 mmo.play.scene::SceneInfo
+0066: setlocal_2 
+0067: getlocal_2 
+0068: pushnull 
+0069: ifne +1 -> 006e
+006d: returnvoid 
+006e: getlocal_2 
+006f: getproperty #376 sceneName
+0072: pushstring #188 'game'
+0075: callproperty #377 indexOf, 1
+0079: pushbyte 255
+007b: ifeq +1 -> 0080
+007f: returnvoid 
+0080: getlocal_2 
+0081: getproperty #378 scene
+0084: coerce #161 mmo.play.scene::SceneBase
+0087: setlocal_3 
+0088: getlocal_0 
+0089: getproperty #353 mmo.MessageSend:MessageRandomShow::sTimer
+008c: callpropvoid #162 stop, 0
+0090: getlocal_0 
+0091: callproperty #366 mmo.MessageSend:MessageRandomShow::getRandomMsg, 0
+0095: coerce_s 
+0096: setlocal 4
+0098: getlocal_0 
+0099: getproperty #355 mmo.MessageSend:MessageRandomShow::sysMsg
+009c: pushnull 
+009d: ifne +83 -> 00f4
+00a1: getlocal_0 
+00a2: findpropstrict #131 mmo.MessageSend::SystemMsg
+00a5: constructprop #131 mmo.MessageSend::SystemMsg, 0
+00a9: setproperty #355 mmo.MessageSend:MessageRandomShow::sysMsg
+00ac: getlocal_0 
+00ad: getproperty #355 mmo.MessageSend:MessageRandomShow::sysMsg
+00b0: pushfalse 
+00b1: setproperty #163 mouseEnabled
+00b4: getlocal_0 
+00b5: getproperty #355 mmo.MessageSend:MessageRandomShow::sysMsg
+00b8: getlex #137 STAGE_WIDTH
+00bb: getlocal_0 
+00bc: getproperty #355 mmo.MessageSend:MessageRandomShow::sysMsg
+00bf: getproperty #164 width
+00c2: subtract 
+00c3: pushbyte 2
+00c5: divide 
+00c6: setproperty #165 x
+00c9: getlocal_0 
+00ca: getproperty #355 mmo.MessageSend:MessageRandomShow::sysMsg
+00cd: pushbyte 98
+00cf: setproperty #166 y
+00d2: getlocal_0 
+00d3: getlocal_0 
+00d4: getproperty #355 mmo.MessageSend:MessageRandomShow::sysMsg
+00d7: getproperty #164 width
+00da: setproperty #362 mmo.MessageSend:MessageRandomShow::backgroudWidth
+00dd: getlocal_0 
+00de: getproperty #355 mmo.MessageSend:MessageRandomShow::sysMsg
+00e1: pushstring #156 'btnClose'
+00e4: getproperty #380 []
+00e7: getlex #6 flash.events::MouseEvent
+00e9: getproperty #168 CLICK
+00ec: getlocal_0 
+00ed: getproperty #369 mmo.MessageSend:MessageRandomShow::onClick
+00f0: callpropvoid #379 addEventListener, 2
+00f4: getlocal_0 
+00f5: getproperty #356 mmo.MessageSend:MessageRandomShow::sysTxt
+00f8: pushnull 
+00f9: ifne +19 -> 0110
+00fd: getlocal_0 
+00fe: findpropstrict #133 mmo.MessageSend::SystemTxt
+0101: constructprop #133 mmo.MessageSend::SystemTxt, 0
+0105: setproperty #356 mmo.MessageSend:MessageRandomShow::sysTxt
+0108: getlocal_0 
+0109: getproperty #356 mmo.MessageSend:MessageRandomShow::sysTxt
+010c: pushfalse 
+010d: setproperty #163 mouseEnabled
+0110: getlocal_0 
+0111: getproperty #356 mmo.MessageSend:MessageRandomShow::sysTxt
+0114: pushbyte 20
+0116: setproperty #165 x
+0119: getlocal_0 
+011a: getproperty #356 mmo.MessageSend:MessageRandomShow::sysTxt
+011d: getlocal_0 
+011e: getproperty #355 mmo.MessageSend:MessageRandomShow::sysMsg
+0121: getproperty #170 height
+0124: pushbyte 4
+0126: divide 
+0127: setproperty #166 y
+012a: getlocal_0 
+012b: getproperty #356 mmo.MessageSend:MessageRandomShow::sysTxt
+012e: getproperty #381 txt
+0131: pushstring #1 ''
+0133: setproperty #382 text
+0136: getlocal_0 
+0137: getproperty #356 mmo.MessageSend:MessageRandomShow::sysTxt
+013a: getproperty #381 txt
+013d: getlex #173 flash.text::TextFieldAutoSize
+0140: getproperty #174 CENTER
+0143: setproperty #383 autoSize
+0146: getlocal_0 
+0147: getproperty #356 mmo.MessageSend:MessageRandomShow::sysTxt
+014a: getproperty #381 txt
+014d: pushfalse 
+014e: setproperty #384 wordWrap
+0151: getlocal_0 
+0152: getproperty #356 mmo.MessageSend:MessageRandomShow::sysTxt
+0155: getproperty #381 txt
+0158: getlocal 4
+015a: setproperty #385 htmlText
+015d: getlocal_0 
+015e: getproperty #356 mmo.MessageSend:MessageRandomShow::sysTxt
+0161: pushtrue 
+0162: setproperty #178 cacheAsBitmap
+0165: getlocal_0 
+0166: getlocal_0 
+0167: getproperty #356 mmo.MessageSend:MessageRandomShow::sysTxt
+016a: getproperty #164 width
+016d: setproperty #363 mmo.MessageSend:MessageRandomShow::rollWidth
+0170: getlocal_0 
+0171: getproperty #355 mmo.MessageSend:MessageRandomShow::sysMsg
+0174: getlocal_0 
+0175: getproperty #356 mmo.MessageSend:MessageRandomShow::sysTxt
+0178: callpropvoid #179 addChild, 1
+017c: getlocal_3 
+017d: pushnull 
+017e: ifne +1 -> 0183
+0182: returnvoid 
+0183: getlocal_3 
+0184: getlex #180 mmo.play.bigscene::BigSceneBase
+0187: istypelate 
+0188: iffalse +19 -> 019f
+018c: getlex #181 mmo.loader.layer::LayerManager
+018f: callproperty #386 getBaseControl, 0
+0193: getlocal_0 
+0194: getproperty #355 mmo.MessageSend:MessageRandomShow::sysMsg
+0197: callpropvoid #387 addChild, 1
+019b: jump +24 -> 01b7
+019f: getlocal_3 
+01a0: getproperty #388 foreGround
+01a3: pushnull 
+01a4: ifeq +15 -> 01b7
+01a8: getlex #181 mmo.loader.layer::LayerManager
+01ab: callproperty #386 getBaseControl, 0
+01af: getlocal_0 
+01b0: getproperty #355 mmo.MessageSend:MessageRandomShow::sysMsg
+01b3: callpropvoid #387 addChild, 1
+01b7: getlocal_0 
+01b8: getproperty #354 mmo.MessageSend:MessageRandomShow::showTimer
+01bb: getlex #5 flash.events::TimerEvent
+01bd: getproperty #148 TIMER
+01c0: getlocal_0 
+01c1: getproperty #368 mmo.MessageSend:MessageRandomShow::onShowTimer
+01c4: callpropvoid #149 addEventListener, 2
+01c8: getlocal_0 
+01c9: getproperty #354 mmo.MessageSend:MessageRandomShow::showTimer
+01cc: callpropvoid #150 start, 0
+01d0: returnvoid 
+
+
+METHOD 63 | SWF 0x49865 | EXE 0x184523d
+Names: ['mmo.MessageSend:MessageRandomShow/private/removeMsgHandle', 'mmo.MessageSend::MessageRandomShow/mmo.MessageSend:MessageRandomShow::removeMsgHandle']
+0000: getlocal_0 
+0001: pushscope 
+0002: getlocal_0 
+0003: getproperty #354 mmo.MessageSend:MessageRandomShow::showTimer
+0006: callpropvoid #162 stop, 0
+000a: getlocal_0 
+000b: getproperty #354 mmo.MessageSend:MessageRandomShow::showTimer
+000e: getlex #5 flash.events::TimerEvent
+0010: getproperty #148 TIMER
+0013: getlocal_0 
+0014: getproperty #368 mmo.MessageSend:MessageRandomShow::onShowTimer
+0017: callpropvoid #186 removeEventListener, 2
+001b: getlex #187 mmo.common::DisplayUtil
+001e: getlocal_0 
+001f: getproperty #356 mmo.MessageSend:MessageRandomShow::sysTxt
+0022: callpropvoid #389 stopAndRemove, 1
+0026: getlex #187 mmo.common::DisplayUtil
+0029: getlocal_0 
+002a: getproperty #355 mmo.MessageSend:MessageRandomShow::sysMsg
+002d: callpropvoid #389 stopAndRemove, 1
+0031: getlocal_0 
+0032: pushnull 
+0033: setproperty #355 mmo.MessageSend:MessageRandomShow::sysMsg
+0036: getlocal_0 
+0037: pushnull 
+0038: setproperty #356 mmo.MessageSend:MessageRandomShow::sysTxt
+003b: getlex #82 mmo.MessageSend::MessageSendService
+003d: pushfalse 
+003e: setproperty #143 switchShow
+0041: getlocal_0 
+0042: getproperty #353 mmo.MessageSend:MessageRandomShow::sTimer
+0045: callpropvoid #150 start, 0
+0049: returnvoid 
+
+
+METHOD 64 | SWF 0x498b7 | EXE 0x184528f
+Names: ['mmo.MessageSend:MessageRandomShow/private/onShowTimer', 'mmo.MessageSend::MessageRandomShow/mmo.MessageSend:MessageRandomShow::onShowTimer']
+0000: getlocal_0 
+0001: pushscope 
+0002: debug 1, 1127, 0, 0
+0008: getlocal_0 
+0009: callpropvoid #367 mmo.MessageSend:MessageRandomShow::removeMsgHandle, 0
+000d: returnvoid 
+
+
+METHOD 68 | SWF 0x4996b | EXE 0x1845343
+Names: ['', 'mmo.MessageSend::MessageRandomShow/cinit']
+0000: getlocal_0 
+0001: pushscope 
+0002: findproperty #137 STAGE_WIDTH
+0005: pushshort 960
+0008: initproperty #137 STAGE_WIDTH
+000b: findproperty #138 TIME_SLOT
+000e: pushshort 180
+0011: initproperty #138 TIME_SLOT
+0014: findproperty #139 AUTO_CLOSE_TIME
+0017: pushshort 5000
+001a: initproperty #139 AUTO_CLOSE_TIME
+001d: returnvoid 
+
+
+METHOD 70 | SWF 0x499c5 | EXE 0x184539d
+Names: ['mmo.MessageSend:MessageSendService/init', 'mmo.MessageSend::MessageSendService/init']
+0000: getlocal_0 
+0001: pushscope 
+0002: getlex #214 mmo.framework.comm::SocketClient
+0005: getproperty #436 instance
+0008: getlex #82 mmo.MessageSend::MessageSendService
+000a: getproperty #435 mmo.MessageSend:MessageSendService::cmdHonorMsgDispatch
+000d: getlocal_0 
+000e: getproperty #411 mmo.MessageSend:MessageSendService::onHonorMsgDispatch
+0011: callpropvoid #437 addEventListener, 2
+0015: getlex #214 mmo.framework.comm::SocketClient
+0018: getproperty #436 instance
+001b: pushstring #929 'DCE191108_11'
+001e: getlocal_0 
+001f: getproperty #406 mmo.MessageSend:MessageSendService::onDelWithTypes
+0022: callpropvoid #437 addEventListener, 2
+0026: getlex #214 mmo.framework.comm::SocketClient
+0029: getproperty #436 instance
+002c: pushstring #930 'RTA250627_broadcast'
+002f: getlocal_0 
+0030: getproperty #413 mmo.MessageSend:MessageSendService::onReturnBroadcast
+0033: callpropvoid #437 addEventListener, 2
+0037: getlex #215 mmo.interfaces.title::TitleEventDispatcher
+003a: callproperty #438 getInstance, 0
+003e: getlex #13 mmo.interfaces.title::TitleEvent
+0040: getproperty #439 ON_GREAT_TITLE
+0043: getlocal_0 
+0044: getproperty #412 mmo.MessageSend:MessageSendService::onTitleHandle
+0047: callpropvoid #437 addEventListener, 2
+004b: getlex #154 mmo.play.scene::SceneManager
+004e: callproperty #438 getInstance, 0
+0052: getlex #14 mmo.play.scene::SceneManagerEvent
+0054: getproperty #440 SCENE_INITED
+0057: getlocal_0 
+0058: getproperty #416 mmo.MessageSend:MessageSendService::onSceneInit
+005b: callpropvoid #437 addEventListener, 2
+005f: getlex #154 mmo.play.scene::SceneManager
+0062: callproperty #438 getInstance, 0
+0066: getlex #14 mmo.play.scene::SceneManagerEvent
+0068: getproperty #441 UNLOAD_SCENE
+006b: getlocal_0 
+006c: getproperty #415 mmo.MessageSend:MessageSendService::onSceneUnload
+006f: callpropvoid #437 addEventListener, 2
+0073: getlex #219 mmo.common.eventdispatcher::CommonEventDispatcher
+0076: getproperty #436 instance
+0079: getlex #15 mmo.interfaces.pet.fight::PetFightEvent
+007b: getproperty #442 FIGHT_START
+007e: getlocal_0 
+007f: getproperty #417 mmo.MessageSend:MessageSendService::onFightStart
+0082: callpropvoid #437 addEventListener, 2
+0086: getlex #219 mmo.common.eventdispatcher::CommonEventDispatcher
+0089: getproperty #436 instance
+008c: getlex #15 mmo.interfaces.pet.fight::PetFightEvent
+008e: getproperty #443 FIGHT_END
+0091: getlocal_0 
+0092: getproperty #418 mmo.MessageSend:MessageSendService::onFightEnd
+0095: callpropvoid #437 addEventListener, 2
+0099: getlex #214 mmo.framework.comm::SocketClient
+009c: getproperty #436 instance
+009f: pushstring #939 'FMZ251128_luck'
+00a2: getlocal_0 
+00a3: getproperty #407 mmo.MessageSend:MessageSendService::onMZZD
+00a6: callpropvoid #437 addEventListener, 2
+00aa: getlex #214 mmo.framework.comm::SocketClient
+00ad: getproperty #436 instance
+00b0: pushstring #940 'AFWJ251205_luck'
+00b3: getlocal_0 
+00b4: getproperty #408 mmo.MessageSend:MessageSendService::onToy
+00b7: callpropvoid #437 addEventListener, 2
+00bb: getlex #214 mmo.framework.comm::SocketClient
+00be: getproperty #436 instance
+00c1: pushstring #941 'AFMB251114_luck'
+00c4: getlocal_0 
+00c5: getproperty #409 mmo.MessageSend:MessageSendService::onTreasureContest
+00c8: callpropvoid #437 addEventListener, 2
+00cc: getlocal_0 
+00cd: getproperty #404 mmo.MessageSend:MessageSendService::interalTimer
+00d0: getlex #5 flash.events::TimerEvent
+00d2: getproperty #222 TIMER_COMPLETE
+00d5: getlocal_0 
+00d6: getproperty #410 mmo.MessageSend:MessageSendService::onComplete
+00d9: callpropvoid #149 addEventListener, 2
+00dd: findpropstrict #223 dispatchEvent
+00e0: findpropstrict #224 mmo.interfaces::InitServiceEvent
+00e3: getlex #224 mmo.interfaces::InitServiceEvent
+00e6: getproperty #444 onInited
+00e9: newobject 0
+00eb: constructprop #224 mmo.interfaces::InitServiceEvent, 2
+00ef: callpropvoid #223 dispatchEvent, 1
+00f3: returnvoid 
+
+
+METHOD 75 | SWF 0x49b5f | EXE 0x1845537
+Names: ['mmo.MessageSend:MessageSendService/pushMessage', 'mmo.MessageSend::MessageSendService/pushMessage']
+0000: getlocal_0 
+0001: pushscope 
+0002: debug 1, 1127, 0, 0
+0008: debug 1, 1128, 1, 135
+000f: getlocal_1 
+0010: getproperty #447 extInfo
+0013: coerce #8 Object
+0015: setlocal_2 
+0016: getlocal_2 
+0017: getlocal_1 
+0018: getproperty #449 messageSendType
+001b: setproperty #448 type
+001e: getlocal_2 
+001f: getlocal_1 
+0020: getproperty #451 messageBody
+0023: setproperty #450 body
+0026: getlocal_0 
+0027: findpropstrict #11 mmo.framework.comm::SocketClientEvent
+0029: pushstring #174 'honorMsgDispatch'
+002c: getlocal_2 
+002d: constructprop #11 mmo.framework.comm::SocketClientEvent, 2
+0030: callpropvoid #411 mmo.MessageSend:MessageSendService::onHonorMsgDispatch, 1
+0034: returnvoid 
+
+
+METHOD 77 | SWF 0x49bbb | EXE 0x1845593
+Names: ['mmo.MessageSend:MessageSendService/private/onHonorMsgDispatch', 'mmo.MessageSend::MessageSendService/mmo.MessageSend:MessageSendService::onHonorMsgDispatch']
+0000: getlocal_0 
+0001: pushscope 
+0002: debug 1, 1127, 0, 0
+0008: debug 1, 1128, 1, 165
+000f: debug 1, 1129, 2, 166
+0016: debug 1, 1130, 3, 167
+001d: debug 1, 1172, 4, 168
+0024: debug 1, 1173, 5, 172
+002b: debug 1, 1174, 6, 153
+0032: debug 1, 1175, 7, 154
+0039: debug 1, 1176, 8, 155
+0040: debug 1, 1177, 9, 156
+0047: debug 1, 1178, 10, 157
+004e: debug 1, 1179, 11, 158
+0055: debug 1, 1180, 12, 159
+005c: debug 1, 1181, 13, 160
+0063: debug 1, 1182, 14, 161
+006a: debug 1, 1183, 15, 162
+0071: debug 1, 1184, 16, 163
+0078: debug 1, 1185, 17, 164
+007f: getlex #373 flash.external::ExternalInterface
+0082: pushstring #1126 'aolaHideNotice'
+0085: pushstring #1189 'honor'
+0088: callproperty #372 call, 2
+008c: pushtrue 
+008d: ifne +1 -> 0092
+0091: returnvoid 
+0092: pushbyte 0
+0094: convert_i 
+0095: setlocal 7
+0097: pushnull 
+0098: coerce_s 
+0099: setlocal 8
+009b: pushnull 
+009c: coerce_s 
+009d: setlocal 9
+009f: pushnull 
+00a0: coerce #9 Array
+00a2: setlocal 10
+00a4: pushnull 
+00a5: coerce_s 
+00a6: setlocal 11
+00a8: pushnull 
+00a9: coerce_s 
+00aa: setlocal 12
+00ac: pushnull 
+00ad: coerce_s 
+00ae: setlocal 13
+00b0: pushnull 
+00b1: coerce #9 Array
+00b3: setlocal 14
+00b5: pushbyte 0
+00b7: convert_i 
+00b8: setlocal 15
+00ba: pushnull 
+00bb: coerce #9 Array
+00bd: setlocal 16
+00bf: pushnull 
+00c0: coerce_s 
+00c1: setlocal 17
+00c3: pushnull 
+00c4: coerce_s 
+00c5: setlocal 18
+00c7: getlocal_1 
+00c8: getproperty #446 params
+[省略后续消息内容和类型处理；入口屏蔽判断已完整保留]
+
+
+METHOD 78 | SWF 0x4a3bf | EXE 0x1845d97
+Names: ['mmo.MessageSend:MessageSendService/private/onTitleHandle', 'mmo.MessageSend::MessageSendService/mmo.MessageSend:MessageSendService::onTitleHandle']
+0000: getlocal_0 
+0001: pushscope 
+0002: debug 1, 1127, 0, 0
+0008: debug 1, 1128, 1, 336
+000f: debug 1, 1129, 2, 337
+0016: getlex #373 flash.external::ExternalInterface
+0019: pushstring #1126 'aolaHideNotice'
+001c: pushstring #1190 'title'
+001f: callproperty #372 call, 2
+0023: pushtrue 
+0024: ifne +1 -> 0029
+0028: returnvoid 
+0029: getlocal_1 
+002a: getproperty #446 params
+002d: getproperty #493 str
+0030: coerce_s 
+0031: setlocal_2 
+0032: findpropstrict #23 mmo.MessageSend::MessageInfo
+0034: constructprop #23 mmo.MessageSend::MessageInfo, 0
+0037: coerce #23 mmo.MessageSend::MessageInfo
+0039: setlocal_3 
+003a: getlocal_3 
+003b: pushbyte 16
+003d: setproperty #28 type
+003f: getlocal_3 
+0040: pushstring #1 ''
+0042: setproperty #29 name
+0044: getlocal_3 
+0045: pushbyte 0
+0047: setproperty #30 content
+0049: getlocal_3 
+004a: getlocal_2 
+004b: setproperty #31 boxBody
+004d: getlocal_0 
+004e: getproperty #392 mmo.MessageSend:MessageSendService::messages
+0051: getlocal_3 
+0052: callpropvoid #201 http://adobe.com/AS3/2006/builtin::push, 1
+0056: returnvoid 
+
+
+METHOD 79 | SWF 0x4a41f | EXE 0x1845df7
+Names: ['mmo.MessageSend:MessageSendService/private/onReturnBroadcast', 'mmo.MessageSend::MessageSendService/mmo.MessageSend:MessageSendService::onReturnBroadcast']
+0000: getlocal_0 
+0001: pushscope 
+0002: debug 1, 1127, 0, 0
+0008: debug 1, 1128, 1, 351
+000f: debug 1, 1129, 2, 352
+0016: debug 1, 1130, 3, 357
+001d: getlex #373 flash.external::ExternalInterface
+0020: pushstring #1126 'aolaHideNotice'
+0023: pushstring #1191 'broadcast'
+0026: callproperty #372 call, 2
+002a: pushtrue 
+002b: ifne +1 -> 0030
+002f: returnvoid 
+0030: getlocal_1 
+0031: getproperty #446 params
+0034: getproperty #494 tn
+0037: convert_i 
+0038: convert_i 
+0039: setlocal_2 
+003a: pushshort 2500
+003d: pushshort 5000
+0040: pushshort 10000
+0043: pushshort 16000
+0046: pushshort 22000
+004a: pushshort 28000
+004e: pushint 34000
+0050: pushint 40000
+0052: pushint 46000
+0054: pushint 60000
+0056: pushint 65000
+0058: pushint 66000
+005a: pushint 72000
+005c: pushint 78000
+005e: pushint 84000
+0060: pushint 90000
+0062: pushint 96000
+0064: pushint 102000
+0066: pushint 108000
+0068: pushint 114000
+006a: pushint 120000
+006c: pushint 126000
+006e: pushint 132000
+0070: pushint 138000
+0072: pushint 144000
+0074: pushint 150000
+0076: newarray 26
+0078: coerce #9 Array
+007a: setlocal_3 
+007b: getlocal_3 
+007c: getlocal_2 
+007d: callproperty #159 http://adobe.com/AS3/2006/builtin::indexOf, 1
+0081: pushbyte 0
+0083: ifnlt +1 -> 0088
+0087: returnvoid 
+0088: findpropstrict #23 mmo.MessageSend::MessageInfo
+008a: constructprop #23 mmo.MessageSend::MessageInfo, 0
+008d: coerce #23 mmo.MessageSend::MessageInfo
+008f: setlocal 4
+0091: getlocal 4
+0093: pushbyte 47
+0095: setproperty #28 type
+0097: getlocal 4
+0099: pushstring #1 ''
+009b: setproperty #29 name
+009d: getlocal 4
+009f: pushbyte 0
+00a1: setproperty #30 content
+00a3: getlocal 4
+00a5: pushstring #1029 '本期重逢有礼回归玩家已达'
+00a8: getlocal_2 
+00a9: add 
+00aa: pushstring #1030 '人，回归玩家为全服带来了不错的奖励，快来领取吧！<font color=\'#FFFF00\'><b><a href="event:hswtab1">【去领取】</a></b></font>'
+00ad: add 
+00ae: setproperty #31 boxBody
+00b0: getlocal_0 
+00b1: getproperty #392 mmo.MessageSend:MessageSendService::messages
+00b4: getlocal 4
+00b6: callpropvoid #201 http://adobe.com/AS3/2006/builtin::push, 1
+00ba: getlocal_0 
+00bb: getproperty #392 mmo.MessageSend:MessageSendService::messages
+00be: getlocal 4
+00c0: callpropvoid #201 http://adobe.com/AS3/2006/builtin::push, 1
+00c4: getlocal_0 
+00c5: getproperty #392 mmo.MessageSend:MessageSendService::messages
+00c8: getlocal 4
+00ca: callpropvoid #201 http://adobe.com/AS3/2006/builtin::push, 1
+00ce: returnvoid 
+
+
+METHOD 81 | SWF 0x4a53d | EXE 0x1845f15
+Names: ['mmo.MessageSend:MessageSendService/private/onSceneUnload', 'mmo.MessageSend::MessageSendService/mmo.MessageSend:MessageSendService::onSceneUnload']
+0000: getlocal_0 
+0001: pushscope 
+0002: debug 1, 1127, 0, 0
+0008: findpropstrict #186 removeEventListener
+000b: getlex #16 flash.events::Event
+000d: getproperty #279 ENTER_FRAME
+0010: getlocal_0 
+0011: getproperty #419 mmo.MessageSend:MessageSendService::messageComing
+0014: callpropvoid #186 removeEventListener, 2
+0018: returnvoid 
+
+
+METHOD 82 | SWF 0x4a55e | EXE 0x1845f36
+Names: ['mmo.MessageSend:MessageSendService/private/onSceneInit', 'mmo.MessageSend::MessageSendService/mmo.MessageSend:MessageSendService::onSceneInit']
+0000: getlocal_0 
+0001: pushscope 
+0002: debug 1, 1127, 0, 0
+0008: findpropstrict #149 addEventListener
+000b: getlex #16 flash.events::Event
+000d: getproperty #279 ENTER_FRAME
+0010: getlocal_0 
+0011: getproperty #419 mmo.MessageSend:MessageSendService::messageComing
+0014: callpropvoid #149 addEventListener, 2
+0018: returnvoid 
+
+
+METHOD 83 | SWF 0x4a57f | EXE 0x1845f57
+Names: ['mmo.MessageSend:MessageSendService/private/onFightStart', 'mmo.MessageSend::MessageSendService/mmo.MessageSend:MessageSendService::onFightStart']
+0000: getlocal_0 
+0001: pushscope 
+0002: debug 1, 1127, 0, 0
+0008: findpropstrict #186 removeEventListener
+000b: getlex #16 flash.events::Event
+000d: getproperty #279 ENTER_FRAME
+0010: getlocal_0 
+0011: getproperty #419 mmo.MessageSend:MessageSendService::messageComing
+0014: callpropvoid #186 removeEventListener, 2
+0018: returnvoid 
+
+
+METHOD 84 | SWF 0x4a5a0 | EXE 0x1845f78
+Names: ['mmo.MessageSend:MessageSendService/private/onFightEnd', 'mmo.MessageSend::MessageSendService/mmo.MessageSend:MessageSendService::onFightEnd']
+0000: getlocal_0 
+0001: pushscope 
+0002: debug 1, 1127, 0, 0
+0008: findpropstrict #149 addEventListener
+000b: getlex #16 flash.events::Event
+000d: getproperty #279 ENTER_FRAME
+0010: getlocal_0 
+0011: getproperty #419 mmo.MessageSend:MessageSendService::messageComing
+0014: callpropvoid #149 addEventListener, 2
+0018: returnvoid 
+
+
+METHOD 85 | SWF 0x4a5c2 | EXE 0x1845f9a
+Names: ['mmo.MessageSend:MessageSendService/private/messageComing', 'mmo.MessageSend::MessageSendService/mmo.MessageSend:MessageSendService::messageComing']
+0000: getlocal_0 
+0001: pushscope 
+0002: debug 1, 1127, 0, 0
+0008: debug 1, 1128, 1, 407
+000f: getlocal_0 
+0010: getproperty #392 mmo.MessageSend:MessageSendService::messages
+0013: getproperty #147 length
+0016: pushbyte 0
+0018: greaterthan 
+0019: dup 
+001a: iffalse +16 -> 002e
+001e: pop 
+001f: getlex #373 flash.external::ExternalInterface
+0022: pushstring #1126 'aolaHideNotice'
+0025: pushstring #1192 'coming'
+0028: callproperty #372 call, 2
+002c: pushtrue 
+002d: equals 
+002e: iffalse +10 -> 003c
+0032: getlocal_0 
+0033: getproperty #392 mmo.MessageSend:MessageSendService::messages
+0036: pushbyte 0
+0038: setproperty #147 length
+003b: returnvoid 
+003c: pushnull 
+003d: coerce_s 
+003e: setlocal_2 
+003f: getlocal_0 
+0040: getproperty #393 mmo.MessageSend:MessageSendService::messageShowing
+0043: not 
+0044: dup 
+0045: iffalse +11 -> 0054
+0049: pop 
+004a: getlocal_0 
+004b: getproperty #392 mmo.MessageSend:MessageSendService::messages
+004e: getproperty #147 length
+0051: pushbyte 0
+0053: greaterthan 
+0054: dup 
+0055: iffalse +5 -> 005e
+0059: pop 
+005a: getlex #143 switchShow
+005d: not 
+005e: dup 
+005f: iffalse +6 -> 0069
+0063: pop 
+0064: getlocal_0 
+0065: callproperty #420 mmo.MessageSend:MessageSendService::finishNew, 0
+0069: dup 
+006a: iffalse +6 -> 0074
+006e: pop 
+006f: getlocal_0 
+0070: getproperty #403 mmo.MessageSend:MessageSendService::interalDoing
+0073: not 
+0074: iffalse +72 -> 00c0
+0078: findproperty #143 switchShow
+007b: pushtrue 
+007c: setproperty #143 switchShow
+007f: getlocal_0 
+0080: getlocal_0 
+0081: getproperty #392 mmo.MessageSend:MessageSendService::messages
+0084: callproperty #280 http://adobe.com/AS3/2006/builtin::shift, 0
+0088: getlex #23 mmo.MessageSend::MessageInfo
+008a: astypelate 
+008b: setproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+008e: pushstring #957 '<a href="event:'
+0091: getlex #214 mmo.framework.comm::SocketClient
+0094: getproperty #436 instance
+0097: getproperty #495 myUserName
+009a: add 
+009b: pushstring #958 '">'
+009e: add 
+009f: getlex #214 mmo.framework.comm::SocketClient
+00a2: getproperty #436 instance
+00a5: getproperty #495 myUserName
+00a8: add 
+00a9: pushstring #960 '</a>'
+00ac: add 
+00ad: coerce_s 
+00ae: setlocal_2 
+00af: getlocal_2 
+00b0: getlocal_0 
+00b1: getproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+00b4: getproperty #29 name
+00b6: ifne +1 -> 00bb
+00ba: returnvoid 
+00bb: getlocal_0 
+00bc: callpropvoid #422 mmo.MessageSend:MessageSendService::messageImageGenerate, 0
+00c0: returnvoid 
+
+
+METHOD 86 | SWF 0x4a68b | EXE 0x1846063
+Names: ['mmo.MessageSend:MessageSendService/private/finishNew', 'mmo.MessageSend::MessageSendService/mmo.MessageSend:MessageSendService::finishNew']
+0000: getlocal_0 
+0001: pushscope 
+0002: pushnull 
+0003: getlocal_0 
+0004: getproperty #405 mmo.MessageSend:MessageSendService::taskService
+0007: ifne +16 -> 001b
+000b: getlocal_0 
+000c: getlex #151 mmo.interfaces::ServiceContainer
+000f: getlex #98 mmo.interfaces.task::ITaskService
+0011: callproperty #455 getService, 1
+0015: getlex #98 mmo.interfaces.task::ITaskService
+0017: astypelate 
+0018: setproperty #405 mmo.MessageSend:MessageSendService::taskService
+001b: getlocal_0 
+001c: getproperty #405 mmo.MessageSend:MessageSendService::taskService
+001f: pushshort 150
+0022: callproperty #496 isUserTaskFinish, 1
+0026: returnvalue 
+
+
+METHOD 88 | SWF 0x4a740 | EXE 0x1846118
+Names: ['mmo.MessageSend:MessageSendService/private/messageImageGenerate', 'mmo.MessageSend::MessageSendService/mmo.MessageSend:MessageSendService::messageImageGenerate']
+0000: getlocal_0 
+0001: pushscope 
+0002: debug 1, 1122, 0, 513
+0009: debug 1, 1128, 1, 443
+0010: debug 1, 1129, 2, 444
+0017: pushnull 
+0018: coerce #9 Array
+001a: setlocal_2 
+001b: pushnull 
+001c: coerce #8 Object
+001e: setlocal_3 
+001f: getlocal_0 
+0020: newobject 0
+0022: setproperty #400 mmo.MessageSend:MessageSendService::curPosition
+0025: getlocal_0 
+0026: pushtrue 
+0027: setproperty #393 mmo.MessageSend:MessageSendService::messageShowing
+002a: getlocal_0 
+002b: getproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+002e: getproperty #28 type
+0030: pushbyte 45
+0032: ifne +49 -> 0067
+0036: getlocal_0 
+0037: findpropstrict #81 mmo.MessageSend::MessageBox5
+0039: constructprop #81 mmo.MessageSend::MessageBox5, 0
+003c: setproperty #395 mmo.MessageSend:MessageSendService::messageBox
+003f: findpropstrict #75 flash.text::TextField
+0041: getlocal_0 
+0042: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+0045: getproperty #502 txtcontent
+0048: callproperty #75 flash.text::TextField, 1
+004b: getlocal_0 
+004c: getproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+004f: getproperty #31 boxBody
+0051: setproperty #501 htmlText
+0054: getlex #181 mmo.loader.layer::LayerManager
+0057: callproperty #503 getBaseControl, 0
+005b: getlocal_0 
+005c: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+005f: callpropvoid #504 addChild, 1
+0063: jump +804 -> 038b
+0067: getlocal_0 
+0068: getproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+006b: getproperty #28 type
+006d: pushbyte 13
+006f: equals 
+0070: dup 
+0071: iffalse +11 -> 0080
+0075: pop 
+0076: getlocal_0 
+0077: getproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+007a: getproperty #30 content
+007c: pushshort 280
+007f: equals 
+0080: iffalse +74 -> 00ce
+0084: getlocal_0 
+0085: findpropstrict #77 mmo.MessageSend::MessageBox3
+0087: constructprop #77 mmo.MessageSend::MessageBox3, 0
+008a: setproperty #395 mmo.MessageSend:MessageSendService::messageBox
+008d: findpropstrict #72 flash.display::SimpleButton
+008f: getlocal_0 
+0090: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+0093: getproperty #505 btnclose
+0096: callproperty #72 flash.display::SimpleButton, 1
+0099: getlex #6 flash.events::MouseEvent
+009b: getproperty #168 CLICK
+009e: getlocal_0 
+009f: getproperty #434 mmo.MessageSend:MessageSendService::onClick
+00a2: callpropvoid #437 addEventListener, 2
+00a6: findpropstrict #75 flash.text::TextField
+00a8: getlocal_0 
+00a9: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+00ac: getproperty #502 txtcontent
+00af: callproperty #75 flash.text::TextField, 1
+00b2: getlocal_0 
+00b3: getproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+00b6: getproperty #31 boxBody
+00b8: setproperty #501 htmlText
+00bb: getlex #181 mmo.loader.layer::LayerManager
+00be: callproperty #503 getBaseControl, 0
+00c2: getlocal_0 
+00c3: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+00c6: callpropvoid #504 addChild, 1
+00ca: jump +701 -> 038b
+00ce: getlocal_0 
+00cf: getproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+00d2: getproperty #28 type
+00d4: pushbyte 8
+00d6: ifne +74 -> 0124
+00da: getlocal_0 
+00db: findpropstrict #80 mmo.MessageSend::MessageBox4
+00dd: constructprop #80 mmo.MessageSend::MessageBox4, 0
+00e0: setproperty #395 mmo.MessageSend:MessageSendService::messageBox
+00e3: findpropstrict #75 flash.text::TextField
+00e5: getlocal_0 
+00e6: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+00e9: getproperty #506 txt
+00ec: callproperty #75 flash.text::TextField, 1
+00ef: getlex #18 flash.events::TextEvent
+00f1: getproperty #292 LINK
+00f4: getlocal_0 
+00f5: getproperty #426 mmo.MessageSend:MessageSendService::onLink
+00f8: callpropvoid #437 addEventListener, 2
+00fc: findpropstrict #75 flash.text::TextField
+00fe: getlocal_0 
+00ff: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+0102: getproperty #506 txt
+0105: callproperty #75 flash.text::TextField, 1
+0108: getlocal_0 
+0109: getproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+010c: getproperty #31 boxBody
+010e: setproperty #501 htmlText
+0111: getlex #181 mmo.loader.layer::LayerManager
+0114: callproperty #503 getBaseControl, 0
+0118: getlocal_0 
+0119: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+011c: callpropvoid #504 addChild, 1
+0120: jump +615 -> 038b
+0124: getlocal_0 
+0125: findpropstrict #67 mmo.MessageSend::MessageBox1
+0127: constructprop #67 mmo.MessageSend::MessageBox1, 0
+012a: setproperty #395 mmo.MessageSend:MessageSendService::messageBox
+012d: getlocal_0 
+012e: findpropstrict #135 mmo.MessageSend::TxtMessage
+0131: constructprop #135 mmo.MessageSend::TxtMessage, 0
+0135: setproperty #399 mmo.MessageSend:MessageSendService::txtMessage
+0138: getlocal_0 
+0139: getproperty #399 mmo.MessageSend:MessageSendService::txtMessage
+013c: getproperty #506 txt
+013f: getlex #18 flash.events::TextEvent
+0141: getproperty #292 LINK
+0144: getlocal_0 
+0145: getproperty #426 mmo.MessageSend:MessageSendService::onLink
+0148: callpropvoid #437 addEventListener, 2
+014c: getlocal_0 
+014d: getproperty #399 mmo.MessageSend:MessageSendService::txtMessage
+0150: getproperty #506 txt
+0153: getlocal_0 
+0154: getproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+0157: getproperty #31 boxBody
+0159: setproperty #501 htmlText
+015c: getlocal_0 
+015d: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+0160: getproperty #507 position
+0163: getlocal_0 
+0164: callproperty #423 mmo.MessageSend:MessageSendService::getBackGroundIndex, 0
+0168: callpropvoid #508 gotoAndStop, 1
+016c: getlocal_0 
+016d: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+0170: getproperty #507 position
+0173: getproperty #509 icon
+0176: getlocal_0 
+0177: getproperty #399 mmo.MessageSend:MessageSendService::txtMessage
+017a: getproperty #506 txt
+017d: getproperty #511 length
+0180: pushbyte 12
+0182: multiply 
+0183: pushbyte 100
+0185: add 
+0186: setproperty #510 width
+[省略部分布局和监听器代码]
+0332: getlocal_0 
+0333: getproperty #434 mmo.MessageSend:MessageSendService::onClick
+0336: callpropvoid #149 addEventListener, 2
+033a: getlex #181 mmo.loader.layer::LayerManager
+033d: callproperty #503 getBaseControl, 0
+0341: getlocal_0 
+0342: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+0345: callpropvoid #504 addChild, 1
+0349: getlex #181 mmo.loader.layer::LayerManager
+034c: callproperty #503 getBaseControl, 0
+0350: getlocal_0 
+0351: getproperty #399 mmo.MessageSend:MessageSendService::txtMessage
+0354: callpropvoid #504 addChild, 1
+0358: getlex #181 mmo.loader.layer::LayerManager
+035b: callproperty #503 getBaseControl, 0
+035f: getlocal_0 
+0360: getproperty #398 mmo.MessageSend:MessageSendService::mcClose
+0363: callpropvoid #504 addChild, 1
+0367: getlocal_0 
+0368: findpropstrict #34 flash.utils::Timer
+036a: pushbyte 5
+036c: constructprop #34 flash.utils::Timer, 1
+036f: setproperty #401 mmo.MessageSend:MessageSendService::moveTimer
+0372: getlocal_0 
+0373: getproperty #401 mmo.MessageSend:MessageSendService::moveTimer
+0376: getlex #5 flash.events::TimerEvent
+0378: getproperty #148 TIMER
+037b: getlocal_0 
+037c: getproperty #424 mmo.MessageSend:MessageSendService::onCountDown
+037f: callpropvoid #149 addEventListener, 2
+0383: getlocal_0 
+0384: getproperty #401 mmo.MessageSend:MessageSendService::moveTimer
+0387: callpropvoid #150 start, 0
+038b: pushbyte 0
+038d: convert_i 
+038e: setlocal_1 
+038f: getlocal_0 
+0390: getproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+0393: getproperty #28 type
+0395: pushbyte 8
+0397: ifne +9 -> 03a4
+039b: pushshort 2000
+039e: convert_i 
+039f: setlocal_1 
+03a0: jump +93 -> 0401
+03a4: getlocal_0 
+03a5: getproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+03a8: getproperty #28 type
+03aa: pushbyte 19
+03ac: ifne +55 -> 03e7
+03b0: getlocal_0 
+03b1: getproperty #399 mmo.MessageSend:MessageSendService::txtMessage
+03b4: getlocal_0 
+03b5: getproperty #399 mmo.MessageSend:MessageSendService::txtMessage
+03b8: pushfalse 
+03b9: dup 
+03ba: setlocal 4
+03bc: setproperty #163 mouseEnabled
+03bf: getlocal 4
+03c1: kill 4
+03c3: setproperty #302 mouseChildren
+03c6: getlocal_0 
+03c7: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+03ca: pushtrue 
+03cb: setproperty #308 buttonMode
+03ce: getlocal_0 
+03cf: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+03d2: getlex #6 flash.events::MouseEvent
+03d4: getproperty #168 CLICK
+03d7: getlocal_0 
+03d8: getproperty #118 mmo.MessageSend::onClickType19
+03da: callpropvoid #149 addEventListener, 2
+03de: pushshort 10000
+03e1: convert_i 
+03e2: setlocal_1 
+03e3: jump +26 -> 0401
+03e7: getlocal_0 
+03e8: getproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+03eb: getproperty #28 type
+03ed: pushbyte 46
+03ef: ifne +9 -> 03fc
+03f3: pushshort 10000
+03f6: convert_i 
+03f7: setlocal_1 
+03f8: jump +5 -> 0401
+03fc: pushshort 5000
+03ff: convert_i 
+0400: setlocal_1 
+0401: getlocal_0 
+0402: findpropstrict #34 flash.utils::Timer
+0404: getlocal_1 
+0405: pushbyte 1
+0407: constructprop #34 flash.utils::Timer, 2
+040a: setproperty #394 mmo.MessageSend:MessageSendService::timer
+040d: getlocal_0 
+040e: getproperty #394 mmo.MessageSend:MessageSendService::timer
+0411: getlex #5 flash.events::TimerEvent
+0413: getproperty #148 TIMER
+0416: getlocal_0 
+0417: getproperty #425 mmo.MessageSend:MessageSendService::ended
+041a: callpropvoid #149 addEventListener, 2
+041e: getlocal_0 
+041f: getproperty #394 mmo.MessageSend:MessageSendService::timer
+0422: callpropvoid #150 start, 0
+0426: returnvoid 
+
+
+METHOD 91 | SWF 0x4adaa | EXE 0x1846782
+Names: ['mmo.MessageSend:MessageSendService/private/onCountDown', 'mmo.MessageSend::MessageSendService/mmo.MessageSend:MessageSendService::onCountDown']
+0000: getlocal_0 
+0001: pushscope 
+0002: debug 1, 1127, 0, 0
+0008: debug 1, 1128, 1, 600
+000f: pushbyte 20
+0011: convert_i 
+0012: setlocal_2 
+0013: getlocal_0 
+0014: getproperty #400 mmo.MessageSend:MessageSendService::curPosition
+0017: pushstring #1048 'messageBoxX'
+001a: callproperty #315 http://adobe.com/AS3/2006/builtin::hasOwnProperty, 1
+001e: dup 
+001f: convert_b 
+0020: iffalse +16 -> 0034
+0024: pop 
+0025: getlocal_0 
+0026: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+0029: getproperty #165 x
+002c: getlocal_0 
+002d: getproperty #400 mmo.MessageSend:MessageSendService::curPosition
+0030: getproperty #514 messageBoxX
+0033: greaterthan 
+0034: iffalse +16 -> 0048
+0038: getlocal_0 
+0039: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+003c: getlocal_0 
+003d: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+0040: getproperty #165 x
+0043: getlocal_2 
+0044: subtract 
+0045: setproperty #165 x
+0048: getlocal_0 
+0049: getproperty #400 mmo.MessageSend:MessageSendService::curPosition
+004c: pushstring #1049 'txtMessageX'
+004f: callproperty #315 http://adobe.com/AS3/2006/builtin::hasOwnProperty, 1
+0053: dup 
+0054: convert_b 
+0055: iffalse +16 -> 0069
+0059: pop 
+005a: getlocal_0 
+005b: getproperty #399 mmo.MessageSend:MessageSendService::txtMessage
+005e: getproperty #165 x
+0061: getlocal_0 
+0062: getproperty #400 mmo.MessageSend:MessageSendService::curPosition
+0065: getproperty #515 txtMessageX
+0068: greaterthan 
+0069: iffalse +16 -> 007d
+006d: getlocal_0 
+006e: getproperty #399 mmo.MessageSend:MessageSendService::txtMessage
+0071: getlocal_0 
+0072: getproperty #399 mmo.MessageSend:MessageSendService::txtMessage
+0075: getproperty #165 x
+0078: getlocal_2 
+0079: subtract 
+007a: setproperty #165 x
+007d: getlocal_0 
+007e: getproperty #400 mmo.MessageSend:MessageSendService::curPosition
+0081: pushstring #1050 'mcCloseX'
+0084: callproperty #315 http://adobe.com/AS3/2006/builtin::hasOwnProperty, 1
+0088: dup 
+0089: convert_b 
+008a: iffalse +16 -> 009e
+008e: pop 
+008f: getlocal_0 
+0090: getproperty #398 mmo.MessageSend:MessageSendService::mcClose
+0093: getproperty #165 x
+0096: getlocal_0 
+0097: getproperty #400 mmo.MessageSend:MessageSendService::curPosition
+009a: getproperty #516 mcCloseX
+009d: greaterthan 
+009e: iffalse +16 -> 00b2
+00a2: getlocal_0 
+00a3: getproperty #398 mmo.MessageSend:MessageSendService::mcClose
+00a6: getlocal_0 
+00a7: getproperty #398 mmo.MessageSend:MessageSendService::mcClose
+00aa: getproperty #165 x
+00ad: getlocal_2 
+00ae: subtract 
+00af: setproperty #165 x
+00b2: returnvoid 
+
+
+METHOD 92 | SWF 0x4ae66 | EXE 0x184683e
+Names: ['mmo.MessageSend:MessageSendService/private/ended', 'mmo.MessageSend::MessageSendService/mmo.MessageSend:MessageSendService::ended']
+0000: getlocal_0 
+0001: pushscope 
+0002: debug 1, 1127, 0, 0
+0008: getlocal_0 
+0009: getproperty #401 mmo.MessageSend:MessageSendService::moveTimer
+000c: pushnull 
+000d: ifeq +25 -> 002a
+0011: getlocal_0 
+0012: getproperty #401 mmo.MessageSend:MessageSendService::moveTimer
+0015: callpropvoid #162 stop, 0
+0019: getlocal_0 
+001a: getproperty #401 mmo.MessageSend:MessageSendService::moveTimer
+001d: getlex #5 flash.events::TimerEvent
+001f: getproperty #148 TIMER
+0022: getlocal_0 
+0023: getproperty #424 mmo.MessageSend:MessageSendService::onCountDown
+0026: callpropvoid #186 removeEventListener, 2
+002a: getlocal_0 
+002b: getproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+002e: getproperty #28 type
+0030: pushbyte 13
+0032: equals 
+0033: dup 
+0034: iffalse +11 -> 0043
+0038: pop 
+0039: getlocal_0 
+003a: getproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+003d: getproperty #30 content
+003f: pushshort 280
+0042: equals 
+0043: iffalse +29 -> 0064
+0047: findpropstrict #72 flash.display::SimpleButton
+0049: getlocal_0 
+004a: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+004d: getproperty #505 btnclose
+0050: callproperty #72 flash.display::SimpleButton, 1
+0053: getlex #6 flash.events::MouseEvent
+0055: getproperty #168 CLICK
+0058: getlocal_0 
+0059: getproperty #434 mmo.MessageSend:MessageSendService::onClick
+005c: callpropvoid #521 removeEventListener, 2
+0060: jump +161 -> 0105
+0064: getlocal_0 
+0065: getproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+0068: getproperty #28 type
+006a: pushbyte 8
+006c: ifne +29 -> 008d
+0070: findpropstrict #75 flash.text::TextField
+0072: getlocal_0 
+0073: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+0076: getproperty #506 txt
+0079: callproperty #75 flash.text::TextField, 1
+007c: getlex #18 flash.events::TextEvent
+007e: getproperty #292 LINK
+0081: getlocal_0 
+0082: getproperty #426 mmo.MessageSend:MessageSendService::onLink
+0085: callpropvoid #521 removeEventListener, 2
+0089: jump +120 -> 0105
+008d: getlocal_0 
+008e: getproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+0091: getproperty #28 type
+0093: pushbyte 19
+0095: ifne +20 -> 00ad
+0099: getlocal_0 
+009a: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+009d: getlex #6 flash.events::MouseEvent
+009f: getproperty #168 CLICK
+00a2: getlocal_0 
+00a3: getproperty #118 mmo.MessageSend::onClickType19
+00a5: callpropvoid #186 removeEventListener, 2
+00a9: jump +88 -> 0105
+00ad: findpropstrict #75 flash.text::TextField
+00af: getlocal_0 
+00b0: getproperty #399 mmo.MessageSend:MessageSendService::txtMessage
+00b3: getproperty #506 txt
+00b6: callproperty #75 flash.text::TextField, 1
+00b9: getlex #18 flash.events::TextEvent
+00bb: getproperty #292 LINK
+00be: getlocal_0 
+00bf: getproperty #426 mmo.MessageSend:MessageSendService::onLink
+00c2: callpropvoid #521 removeEventListener, 2
+00c6: getlex #7 mmo.MessageSend::MessageMetadata
+00c8: getproperty #142 instance
+00cb: getlocal_0 
+00cc: getproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+00cf: getproperty #28 type
+00d1: getlocal_0 
+00d2: getproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+00d5: getproperty #30 content
+00d7: callproperty #56 getTransmitInfoByType, 2
+00da: pushnull 
+00db: ifeq +21 -> 00f4
+00df: getlocal_0 
+00e0: getproperty #398 mmo.MessageSend:MessageSendService::mcClose
+00e3: getlex #6 flash.events::MouseEvent
+00e5: getproperty #168 CLICK
+00e8: getlocal_0 
+00e9: getproperty #421 mmo.MessageSend:MessageSendService::onClickGoListener
+00ec: callpropvoid #186 removeEventListener, 2
+00f0: jump +17 -> 0105
+00f4: getlocal_0 
+00f5: getproperty #398 mmo.MessageSend:MessageSendService::mcClose
+00f8: getlex #6 flash.events::MouseEvent
+00fa: getproperty #168 CLICK
+00fd: getlocal_0 
+00fe: getproperty #434 mmo.MessageSend:MessageSendService::onClick
+0101: callpropvoid #186 removeEventListener, 2
+0105: getlocal_0 
+0106: pushnull 
+0107: callpropvoid #434 mmo.MessageSend:MessageSendService::onClick, 1
+010b: findproperty #143 switchShow
+010e: pushfalse 
+010f: setproperty #143 switchShow
+0112: getlocal_0 
+0113: getproperty #404 mmo.MessageSend:MessageSendService::interalTimer
+0116: callpropvoid #316 reset, 0
+011a: getlocal_0 
+011b: getproperty #404 mmo.MessageSend:MessageSendService::interalTimer
+011e: callpropvoid #150 start, 0
+0122: getlocal_0 
+0123: pushtrue 
+0124: setproperty #403 mmo.MessageSend:MessageSendService::interalDoing
+0127: returnvoid 
+
+
+METHOD 101 | SWF 0x4b472 | EXE 0x1846e4a
+Names: ['mmo.MessageSend:MessageSendService/private/onClick', 'mmo.MessageSend::MessageSendService/mmo.MessageSend:MessageSendService::onClick']
+0000: getlocal_0 
+0001: pushscope 
+0002: debug 1, 1127, 0, 0
+0008: getlocal_0 
+0009: getproperty #394 mmo.MessageSend:MessageSendService::timer
+000c: getlex #5 flash.events::TimerEvent
+000e: getproperty #148 TIMER
+0011: getlocal_0 
+0012: getproperty #425 mmo.MessageSend:MessageSendService::ended
+0015: callpropvoid #186 removeEventListener, 2
+0019: getlocal_0 
+001a: pushfalse 
+001b: setproperty #393 mmo.MessageSend:MessageSendService::messageShowing
+001e: getlex #187 mmo.common::DisplayUtil
+0021: getlocal_0 
+0022: getproperty #395 mmo.MessageSend:MessageSendService::messageBox
+0025: callpropvoid #535 stopAndRemove, 1
+0029: getlex #187 mmo.common::DisplayUtil
+002c: getlocal_0 
+002d: getproperty #398 mmo.MessageSend:MessageSendService::mcClose
+0030: callpropvoid #535 stopAndRemove, 1
+0034: getlex #187 mmo.common::DisplayUtil
+0037: getlocal_0 
+0038: getproperty #399 mmo.MessageSend:MessageSendService::txtMessage
+003b: callpropvoid #535 stopAndRemove, 1
+003f: getlocal_0 
+0040: pushnull 
+0041: setproperty #395 mmo.MessageSend:MessageSendService::messageBox
+0044: getlocal_0 
+0045: pushnull 
+0046: setproperty #398 mmo.MessageSend:MessageSendService::mcClose
+0049: getlocal_0 
+004a: pushnull 
+004b: setproperty #399 mmo.MessageSend:MessageSendService::txtMessage
+004e: getlocal_0 
+004f: pushnull 
+0050: setproperty #397 mmo.MessageSend:MessageSendService::messageInfoNeed
+0053: returnvoid 
+
+
+METHOD 107 | SWF 0x4b4ce | EXE 0x1846ea6
+Names: ['mmo.MessageSend:MessageSendService/MessageSendService', 'mmo.MessageSend::MessageSendService/init']
+0000: getlocal_0 
+0001: pushscope 
+0002: getlocal_0 
+0003: newarray 0
+0005: setproperty #392 mmo.MessageSend:MessageSendService::messages
+0008: getlocal_0 
+0009: findpropstrict #62 mmo.MessageSend::MessageReader
+000b: constructprop #62 mmo.MessageSend::MessageReader, 0
+000e: setproperty #396 mmo.MessageSend:MessageSendService::mr
+0011: getlocal_0 
+0012: newobject 0
+0014: setproperty #400 mmo.MessageSend:MessageSendService::curPosition
+0017: getlocal_0 
+0018: findpropstrict #34 flash.utils::Timer
+001a: pushbyte 10
+001c: pushshort 1000
+001f: multiply 
+0020: pushbyte 1
+0022: constructprop #34 flash.utils::Timer, 2
+0025: setproperty #404 mmo.MessageSend:MessageSendService::interalTimer
+0028: getlocal_0 
+0029: constructsuper 0
+002b: returnvoid 

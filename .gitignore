@@ -1,0 +1,17 @@
+# Source and maintenance documents are kept; personal data and generated files stay local.
+/build/
+/dist/
+/toolchain/
+/deps/
+/resources/
+/doc/evidence/
+/doc/archive/
+**/aola-data*/
+**/aola-launcher-data/
+/src/*/engine/target/
+/src/*/native-core/target/
+**/__pycache__/
+**/*.pyc
+/src/*/engine/vendor/*
+!/src/*/engine/vendor/wgpu-hal-30.0.1/
+!/src/*/engine/vendor/wgpu-core-30.0.1/

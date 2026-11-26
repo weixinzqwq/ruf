@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>奥奇宿主离线验收</title>
+<style>
+body{margin:24px;font:16px/1.6 "Segoe UI","Microsoft YaHei",sans-serif;color:#172235;background:#f4f6fa}main{max-width:880px;margin:auto}section{padding:18px;margin:16px 0;background:white;border:1px solid #dce2ec;border-radius:12px}h1{font-size:24px}h2{font-size:18px}button,input,textarea{font:inherit;padding:8px;margin:4px;border:1px solid #bbc8dc;border-radius:6px}button{cursor:pointer;background:#edf3ff}input{width:65%}textarea{box-sizing:border-box;width:100%;height:90px}pre{white-space:pre-wrap;word-break:break-word;background:#eef1f6;padding:12px;max-height:260px;overflow:auto}.status{color:#735016}.ok{color:#087044}.scroll{height:160px;overflow:auto;border:1px solid #bbc8dc;padding:12px}.spacer{height:500px;background:linear-gradient(#f5f8ff,#d9e4f5)}a{margin-right:20px}
+</style>
+<main>
+<h1>奥奇宿主离线验收</h1>
+<p>此页面只使用本地内容。它不访问游戏网站，也不需要账号。</p>
+<section><h2>真实浏览器桥接</h2><p id="bridge" class="status">正在检查 WebView2…</p><button id="object">发送对象并等待原生回传</button><button id="string">发送字符串并等待原生回传</button><p id="reply">尚未收到原生回传。</p><p id="run">尚未执行原生脚本。</p></section>
+<section><h2>键盘与中文输入</h2><label>测试文本 <input id="text" autocomplete="off" placeholder="请输入：奥奇恢复 abc 123"></label><textarea id="multiline" aria-label="多行输入" placeholder="在这里测试中文输入法、换行、复制和粘贴"></textarea><p id="inputState">输入长度：0；组合输入：未开始</p><button id="report">记录输入结果</button></section>
+<section><h2>滚轮与焦点</h2><div id="scroll" class="scroll" tabindex="0"><p>将鼠标置于这里，滚动到末尾。</p><div class="spacer"></div><strong id="bottom">已到达本地滚动区域末尾。</strong></div><p id="scrollState">滚动位置：0</p></section>
+<section><h2>导航事件</h2><a href="?navigation=allowed">本地允许导航</a><a href="?navigation=cancel">本地取消导航</a><a href="__aoqi_fixture_missing__.html">本地加载失败</a><p>“取消导航”需宿主的同步策略拒绝 navigation=cancel；拒绝后页面地址应保持不变。</p></section>
+<section><h2>事件记录</h2><pre id="log"></pre></section>
+</main>
+<script>
+(()=>{
+'use strict';
+const $=id=>document.getElementById(id),events=[];
+let sequence=0,composing=false;
+const log=(kind,data)=>{events.push({kind,data});$('log').textContent=events.map(e=>e.kind+' '+JSON.stringify(e.data)).join('\n');$('log').scrollTop=$('log').scrollHeight;};
+const bridge=window.chrome&&window.chrome.webview;
+const send=value=>{if(!bridge){log('bridge-unavailable',value);return false;}bridge.postMessage(value);log('sent',value);return true;};
+const inputState=()=>{$('inputState').textContent='输入长度：'+$('text').value.length+'；组合输入：'+(composing?'进行中':'未进行');};
+$('text').addEventListener('compositionstart',()=>{composing=true;inputState();});
+$('text').addEventListener('compositionend',()=>{composing=false;inputState();});
+$('text').addEventListener('input',inputState);
+$('scroll').addEventListener('scroll',()=>{$('scrollState').textContent='滚动位置：'+$('scroll').scrollTop;});
+$('object').onclick=()=>send({type:'fixture.echo',sequence:++sequence,text:$('text').value,wireType:'object'});
+$('string').onclick=()=>send(JSON.stringify({type:'fixture.echo',sequence:++sequence,text:$('text').value,wireType:'string'}));
+$('report').onclick=()=>send({type:'fixture.input',text:$('text').value,multiline:$('multiline').value,composing,scrollTop:$('scroll').scrollTop});
+window.aoqiFixture={
+ snapshot:()=>({title:document.title,url:location.href,text:$('text').value,multiline:$('multiline').value,scrollTop:$('scroll').scrollTop,events:events.slice()}),
+ markRun:value=>{$('run').textContent='已执行原生脚本：'+String(value);$('run').className='ok';send({type:'fixture.run',value});},
+ send
+};
+if(bridge){
+ $('bridge').textContent='已连接真实 chrome.webview 消息接口。';$('bridge').className='ok';
+ bridge.addEventListener('message',event=>{log('received',event.data);$('reply').textContent='已收到原生回传（'+typeof event.data+'）：'+JSON.stringify(event.data);$('reply').className='ok';});
+ send({type:'fixture.ready',url:location.href,title:document.title});
+ send(JSON.stringify({type:'fixture.ready',wireType:'string'}));
+}else{$('bridge').textContent='未连接 WebView2；普通浏览器预览不能证明原生桥接通过。';}
+})();
+</script>
+</html>

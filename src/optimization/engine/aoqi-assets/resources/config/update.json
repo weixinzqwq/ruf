@@ -1,0 +1,21 @@
+{
+  "product": "aoqi",
+  "platform": "windows",
+  "channel": "stable",
+  "keys": {
+    "k2026a": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEI9CjWIZcs3GORDV/hUykgpZ3Xf5bInkfa3GMceINs7KmsByiFcaYriaEudXcXG29yL+9RwsiClEBCTuDFYWqCw=="
+  },
+  "mirrors": [
+    "https://air-aoqi-version.oss-cn-guangzhou.aliyuncs.com/update/v1/",
+    "https://cdn.jsdelivr.net/gh/aahowe/aoqi-update@master/update/v1/",
+    "https://gcore.jsdelivr.net/gh/aahowe/aoqi-update@master/update/v1/",
+    "https://quantil.jsdelivr.net/gh/aahowe/aoqi-update@master/update/v1/",
+    "https://fastly.jsdelivr.net/gh/aahowe/aoqi-update@master/update/v1/",
+    "https://aahowe.github.io/aoqi-update/update/v1/",
+    "https://raw.githubusercontent.com/aahowe/aoqi-update/master/update/v1/"
+  ],
+  "fallbackQQGroup": "324225578",
+  "statsMirror": "https://air-aoqi-version.oss-cn-guangzhou.aliyuncs.com/update/v1/",
+  "allowHTTP": false,
+  "releaseEnabled": true
+}
