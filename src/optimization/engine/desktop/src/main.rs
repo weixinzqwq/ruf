@@ -269,6 +269,7 @@ fn main() -> Result<(), Error> {
         aola_host::record("host","starting");
         return App::new(preferences).and_then(|(mut app,event_loop)| {
             let result = event_loop.run_app(&mut app).context("Event loop failure");
+            mypro_features::network::finish();
             aola_close_phases::record("event-loop-tail", "end", None);
             {
                 let _phase = aola_close_phases::phase("app-drop");
@@ -315,6 +316,8 @@ fn main() -> Result<(), Error> {
     let result = App::new(preferences).and_then(|(mut app, event_loop)| {
         event_loop.run_app(&mut app).context("Event loop failure")
     });
+    #[cfg(windows)]
+    mypro_features::network::finish();
 
     #[cfg(windows)]
     if let Err(error) = &result {

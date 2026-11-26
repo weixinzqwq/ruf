@@ -4,6 +4,7 @@ mod aola_lifecycle;
 mod aola_swf_capture;
 mod aola_skin_recipe;
 mod aola_display_patch;
+mod aola_game_ui;
 mod aola_backpack_edits;
 mod aola_battle_edits;
 mod aola_notice_edits;
@@ -23,6 +24,7 @@ use ruffle_core::backend::navigator::{
 use ruffle_core::indexmap::IndexMap;
 use ruffle_core::loader::Error;
 use ruffle_core::socket::{ConnectionState, SocketAction, SocketHandle};
+use ruffle_core::socket_tap::{self, SocketDirection};
 use std::collections::HashSet;
 use std::fs::File;
 use std::future::Future;
@@ -98,6 +100,7 @@ pub struct ExternalNavigatorBackend<F: FutureSpawner<Error>, I: NavigatorInterfa
     aola_pet_patch: Option<aola_pet_patch::PetPatch>,
     aola_lifecycle: Option<aola_lifecycle::Trial>,
     display_patches: Vec<Arc<aola_display_patch::DisplayPatch>>,
+    aola_game_ui: Option<PathBuf>,
 }
 
 impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F, I> {
@@ -167,6 +170,7 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
             aola_pet_patch: None,
             aola_lifecycle: None,
             display_patches: Vec::new(),
+            aola_game_ui: None,
         }
     }
 
@@ -207,6 +211,11 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
         } else {
             BATTLE.audit("config", "invalid-reference");
         }
+        self
+    }
+
+    pub fn with_aola_game_ui(mut self, bundle: PathBuf) -> Self {
+        self.aola_game_ui = Some(bundle);
         self
     }
 
@@ -306,6 +315,13 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
         };
 
         ruffle_core::mypro_observer::observe("resource", processed_url.as_str(), "");
+        let game_ui = self.aola_game_ui.as_ref().and_then(|root| {
+            aola_game_ui::Asset::requested(&request, &processed_url)
+                .map(|asset| aola_game_ui::Selection {root:root.clone(),url:processed_url.to_string(),asset})
+        });
+        if let Some(aola_game_ui::Selection { root, url, asset:aola_game_ui::Asset::Skin(id) }) = game_ui.as_ref() {
+            return aola_game_ui::leaf(root,*id,url.clone());
+        }
         if let Some(patch) = &self.aola_pet_patch {
             if aola_pet_patch::PetPatch::accepts(&request, &processed_url) {
                 let response: Box<dyn SuccessResponse> = Box::new(Response {
@@ -471,6 +487,9 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
                 fetch.await.inspect_err(|_| trial.reject(resource, &version, "fetch", "fetch-failed"))
             });
         }
+        if let Some(selection) = game_ui {
+            return Box::pin(async move { Ok(selection.wrap(fetch.await?)) });
+        }
         fetch
     }
 
@@ -517,6 +536,7 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
         let is_allowed = self.socket_allowed.contains(&addr);
         let socket_mode = self.socket_mode;
         let interface = self.interface.clone();
+        let tap_session = socket_tap::current_session();
 
         let future = Box::pin(async move {
             match (is_allowed, socket_mode) {
@@ -573,12 +593,15 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
                 }
             };
 
+            let connection = socket_tap::Connection::connected(tap_session, handle, host2, port);
+            let tap = connection.as_ref();
             let sender = sender;
             //NOTE: We clone the sender here as we cant share it between async tasks.
             let sender2 = sender.clone();
             let (mut read, mut write) = stream.split();
 
             let read = async move {
+                let mut offset = 0;
                 loop {
                     let mut buffer = [0; 4096];
 
@@ -590,6 +613,9 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
                         }
                         Ok(read) => {
                             let buffer = buffer.into_iter().take(read).collect::<Vec<_>>();
+                            if let Some(tap) = tap {
+                                tap.data(SocketDirection::Recv, &mut offset, &buffer);
+                            }
 
                             let action = SocketAction::Data(handle, buffer);
                             if !send_action(&sender, action).await {
@@ -602,6 +628,7 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
 
             let write = async move {
                 let mut pending_write = vec![];
+                let mut offset = 0;
 
                 loop {
                     let close_connection = loop {
@@ -627,6 +654,13 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
                                 return;
                             }
                             Ok(written) => {
+                                if let Some(tap) = tap {
+                                    tap.data(
+                                        SocketDirection::Send,
+                                        &mut offset,
+                                        &pending_write[..written],
+                                    );
+                                }
                                 let _ = pending_write.drain(..written);
                             }
                         }
@@ -654,6 +688,7 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
                _ = write => {},
             }
 
+            drop(connection);
             if let Err(e) = stream.shutdown().await {
                 tracing::warn!("Failed to shutdown write half of TcpStream: {e}");
             }
@@ -1246,6 +1281,114 @@ mod tests {
             Data(dummy_handle!(), "from server 2".as_bytes().to_vec()),
         );
         assert_eq!(read_server(&mut server_socket).await, "from client 2");
+    }
+
+    #[macro_rules_attribute::apply(async_test)]
+    async fn test_socket_tap_full_queue_preserves_io_and_offsets() {
+        use socket_tap::{SocketTapEvent, SocketTapKind};
+        use std::cell::RefCell;
+        use std::sync::mpsc::{SyncSender, sync_channel};
+
+        // These tests use single-thread Tokio runtimes; keep the synthetic sink local to this test.
+        thread_local! {
+            static SINK: RefCell<Option<SyncSender<SocketTapEvent>>> = const { RefCell::new(None) };
+        }
+        socket_tap::install(|event| {
+            SINK.with_borrow(|sink| {
+                if let Some(sink) = sink {
+                    let _ = sink.try_send(event);
+                }
+            });
+        });
+        let session = socket_tap::new_session();
+        let (sender, events) = sync_channel(1);
+        SINK.set(Some(sender));
+        let (accepted, addr) = start_test_server().await;
+        let (client_write, client_read) = connect_test_socket(addr, TIMEOUT, true);
+        let mut server = accepted.await.unwrap();
+        assert_next_socket_actions!(
+            client_read;
+            Connect(dummy_handle!(), ConnectionState::Connected),
+        );
+
+        // Connected occupies the only queue slot throughout this two-way exchange.
+        write_server(&mut server, "a").await;
+        assert_next_socket_actions!(client_read; Data(dummy_handle!(), vec![b'a']),);
+        let sent = vec![42; 9000];
+        client_write.send(sent.clone()).await.unwrap();
+        let mut received = vec![0; sent.len()];
+        server
+            .read_exact(&mut received)
+            .or(async_timeout!())
+            .await
+            .unwrap();
+        assert_eq!(received, sent);
+
+        let connected = events.try_recv().unwrap();
+        assert_eq!(connected.session, session);
+        assert_eq!(
+            connected.kind,
+            SocketTapKind::Connected {
+                host: addr.ip().to_string(),
+                port: addr.port(),
+            }
+        );
+        let next = || {
+            let event = events.try_recv().unwrap();
+            assert_eq!((event.session, event.handle), (session, connected.handle));
+            assert!(std::sync::Arc::ptr_eq(&event.lifetime, &connected.lifetime));
+            event.kind
+        };
+        write_client(&client_write, "x").await;
+        assert_eq!(read_server(&mut server).or(async_timeout!()).await, "x");
+        assert_eq!(
+            next(),
+            SocketTapKind::Data {
+                direction: SocketDirection::Send,
+                offset: sent.len() as u64,
+                bytes: vec![b'x'],
+            }
+        );
+        write_server(&mut server, "y").await;
+        assert_next_socket_actions!(client_read; Data(dummy_handle!(), vec![b'y']),);
+        assert_eq!(
+            next(),
+            SocketTapKind::Data {
+                direction: SocketDirection::Recv,
+                offset: 1,
+                bytes: vec![b'y'],
+            }
+        );
+
+        // An old socket can still transfer bytes after its Player has been replaced.
+        let new_session = socket_tap::new_session();
+        write_server(&mut server, "z").await;
+        assert_next_socket_actions!(client_read; Data(dummy_handle!(), vec![b'z']),);
+        assert!(events.try_recv().is_err());
+        drop(client_write);
+        assert_eq!(read_server(&mut server).or(async_timeout!()).await, "");
+        assert_eq!(next(), SocketTapKind::Closed);
+        assert!(events.try_recv().is_err());
+
+        let (accepted, addr) = start_test_server().await;
+        let (_client_write, client_read) = connect_test_socket(addr, TIMEOUT, true);
+        let server = accepted.await.unwrap();
+        assert_next_socket_actions!(
+            client_read;
+            Connect(dummy_handle!(), ConnectionState::Connected),
+        );
+        let reopened = events.try_recv().unwrap();
+        assert_eq!((reopened.session, reopened.handle), (new_session, connected.handle));
+        assert!(!std::sync::Arc::ptr_eq(&reopened.lifetime, &connected.lifetime));
+        assert!(matches!(reopened.kind, SocketTapKind::Connected { .. }));
+        drop(server);
+        assert_next_socket_actions!(client_read; Close(dummy_handle!()),);
+        let closed = events.try_recv().unwrap();
+        assert_eq!((closed.session, closed.handle), (new_session, reopened.handle));
+        assert!(std::sync::Arc::ptr_eq(&closed.lifetime, &reopened.lifetime));
+        assert_eq!(closed.kind, SocketTapKind::Closed);
+        assert!(events.try_recv().is_err());
+        SINK.take();
     }
 
     #[macro_rules_attribute::apply(async_test)]

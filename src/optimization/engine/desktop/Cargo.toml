@@ -17,7 +17,7 @@ cpal = { workspace = true }
 egui = { workspace = true }
 egui_extras = { workspace = true, default-features = false, features = ["image"] }
 egui-wgpu = { workspace = true, features = ["winit"] }
-image = { workspace = true, features = ["png"] }
+image = { workspace = true, features = ["png", "jpeg"] }
 egui-winit = { workspace = true }
 fontdb = "0.23"
 ruffle_core = { path = "../core", features = ["audio", "clap", "mp3", "aac", "nellymoser", "default_compatibility_rules", "egui"] }
@@ -56,7 +56,9 @@ memmap2.workspace = true
 walkdir.workspace = true
 async-task = "4.7.1"
 aoqi-assets = { path = "../aoqi-assets" }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+roxmltree = "0.20.0"
 base64 = "0.22.1"
 sha2 = { workspace = true }
 

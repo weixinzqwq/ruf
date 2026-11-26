@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('optimization','launcher')][string]$Component='optimization',
+    [ValidateSet('optimization')][string]$Component='optimization',
     [ValidateSet('metadata','check','test','build','swf-build','swf-test','swf-loopback','pet-switch-build','flux-build')][string]$Action='metadata',
     [string]$OutputDirectory='',
     [string]$RoundtripDirectory='',
@@ -26,7 +26,6 @@ if ($BattleTexturePool -and $Action -ne 'flux-build') { throw '-BattleTexturePoo
 if ($PetSwitchTiming -and $Action -ne 'flux-build') { throw '-PetSwitchTiming requires -Action flux-build.' }
 if ($BattleGlowReuse -and $Action -ne 'flux-build') { throw '-BattleGlowReuse requires -Action flux-build.' }
 if ($MyProTools -and $Action -ne 'flux-build') { throw '-MyProTools requires -Action flux-build.' }
-if (($taskSwfAction -or $Action -in @('pet-switch-build','flux-build')) -and $Component -ne 'optimization') { throw 'These experiments require -Component optimization.' }
 if ($RoundtripDirectory -and !$taskSwfAction) { throw '-RoundtripDirectory requires an SWF action.' }
 if ($Action -in @('swf-test','swf-loopback') -and $OutputDirectory) { throw '-OutputDirectory selects a new distribution for swf-build.' }
 if ($Action -in @('swf-build','pet-switch-build','flux-build')) {
@@ -84,17 +83,17 @@ try {
                 if($LASTEXITCODE -ne 0){throw 'Offline dependency resolution failed'}
             }
             'test' {
-                if($Component -eq 'optimization') {
-                    foreach($taskMode in @('0','1')) {
-                        $env:AOLA_SUBTREE_SCRIPT_SLEEP=$taskMode
-                        foreach($taskFilter in @('aola_','stage3_stopped_tree')) {
-                            & "$taskRust\cargo.exe" test @taskCommon --release -p ruffle_core --lib $taskFilter -- --nocapture
-                            if($LASTEXITCODE -ne 0){throw "Core test failed: $taskFilter mode=$taskMode"}
-                        }
+                foreach($taskMode in @('0','1')) {
+                    $env:AOLA_SUBTREE_SCRIPT_SLEEP=$taskMode
+                    foreach($taskFilter in @('aola_','stage3_stopped_tree')) {
+                        & "$taskRust\cargo.exe" test @taskCommon --release -p ruffle_core --lib $taskFilter -- --nocapture
+                        if($LASTEXITCODE -ne 0){throw "Core test failed: $taskFilter mode=$taskMode"}
                     }
                 }
-                & "$taskRust\cargo.exe" test @taskCommon @taskDesktop --bin ruffle_desktop aola_ -- --test-threads=1
+                & "$taskRust\cargo.exe" test @taskCommon @taskDesktop --bin ruffle_desktop -- --test-threads=1
                 if($LASTEXITCODE -ne 0){throw 'Desktop regression failed'}
+                & "$taskRust\cargo.exe" test @taskCommon --release -p ruffle_frontend_utils --features navigator --lib test_socket_tap_full_queue_preserves_io_and_offsets -- --test-threads=1
+                if($LASTEXITCODE -ne 0){throw 'Socket tap loopback regression failed'}
             }
             { $_ -in @('swf-build','pet-switch-build','flux-build') } {
                 & "$taskRust\cargo.exe" build @taskCommon @taskDesktop
@@ -151,8 +150,8 @@ try {
     } finally { Pop-Location }
     if($Action -eq 'build') {
         New-Item -ItemType Directory -Path $OutputDirectory | Out-Null
-        $taskTemplate=if($Component -eq 'launcher'){'aola-launcher-20261107-release'}else{'aola-subtree-scripts-test-20261109'}
-        $taskExe=if($Component -eq 'launcher'){'aola-launcher.exe'}else{'aola-native-test.exe'}
+        $taskTemplate='aola-subtree-scripts-test-20261109'
+        $taskExe='aola-native-test.exe'
         Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'release\ruffle_desktop.exe') -Destination (Join-Path $OutputDirectory $taskExe)
         Get-ChildItem -LiteralPath (Join-Path $taskRoot "dist\$taskTemplate") -Filter '*.cmd' | Copy-Item -Destination $OutputDirectory
         Copy-Item -LiteralPath (Join-Path $taskEngine 'LICENSE.md') -Destination (Join-Path $OutputDirectory 'RUFFLE-LICENSE.md')

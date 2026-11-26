@@ -20,7 +20,8 @@ def contract(baseline, candidate):
         old_kind, old_offset, old_payload, old_raw = base_tags[old]
         at = old_offset + 8
         if kind == 82 and payload[4:payload.index(0, 4)] in (
-            b"aola.tools.MyProBattleModel", b"aola/tools/MyProBackpackMorph"
+            b"aola.tools.MyProBattleModel", b"aola/tools/MyProBackpackMorph", b"aola.tools.MyProLineup",
+            b"aola.tools.MyProBattleEffects", b"aola.tools.MyProBattleBackground", b"aola.tools.MyProNativeAuto"
         ):
             changes.append((at, b"", raw))
             continue
@@ -45,14 +46,18 @@ def contract(baseline, candidate):
     return changes
 
 
-def verify_recipe(baseline, candidate, name, emit):
+def model_table(baseline, candidate):
     changes=contract(baseline,candidate)
     lines=["// Generated from the checked model overlay; offsets refer to the optimized FWS.",
            "#[rustfmt::skip]", "pub(super) const EDITS: &[(usize, usize, &[u8])] = &["]
     for position,before,after in changes:
         literal=",".join(str(b) for b in after)
         lines.append(f"    ({position}, {len(before)}, &[{literal}]),")
-    text="\n".join([*lines,"];", ""])
+    return "\n".join([*lines,"];", ""])
+
+
+def verify_recipe(baseline, candidate, name, emit):
+    text=model_table(baseline,candidate)
     path=RECIPES / f"aola_mypro_{name}.rs"
     if emit:
         path.write_text(text,encoding="ascii")

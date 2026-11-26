@@ -31,12 +31,30 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 const PANEL_HTML: &str = include_str!("mypro_panel/index.html");
+const BATTLE_ICONS: &[(&str, &[u8])] = include!(concat!(env!("OUT_DIR"), "/battle_icons.rs"));
 const PANEL_URL: &str = "mypro://localhost/index.html";
 // The locked Wry Windows backend maps the custom scheme to this local origin.
 const PANEL_ORIGIN_URL: &str = "http://mypro.localhost/index.html";
 const TOOLBAR_HEIGHT: f64 = 36.0;
 const MAX_REQUEST_BYTES: usize = 512 * 1024;
 const MAX_QUEUED_REQUESTS: usize = 16;
+
+fn panel_response(method: &wry::http::Method, path: &str) -> wry::http::Response<Cow<'static, [u8]>> {
+    let resource = if method == wry::http::Method::GET {
+        match path {
+            "/index.html" => Some(("text/html; charset=utf-8", PANEL_HTML.as_bytes())),
+            "/battle-assets/names.json" => Some(("application/json", &include_bytes!("../assets/battle-assistant/names.json")[..])),
+            _ => BATTLE_ICONS.binary_search_by(|(url, _)| url.cmp(&path)).ok()
+                .map(|i| ("image/png", BATTLE_ICONS[i].1)),
+        }
+    } else { None };
+    let (mime, bytes) = resource.unwrap_or(("text/plain", &[]));
+    wry::http::Response::builder()
+        .status(if resource.is_some() { 200 } else { 404 })
+        .header("Content-Type", mime)
+        .header("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-src 'none'")
+        .body(Cow::Borrowed(bytes)).unwrap()
+}
 
 pub fn enabled() -> bool {
     std::env::var_os("AOLA_MYPRO_TOOLS").as_deref() == Some(std::ffi::OsStr::new("1"))
@@ -94,7 +112,9 @@ pub struct ToolsHost {
     shown: bool,
     session: Option<Option<i64>>,
     event_sequence: u64,
+    background_revision: u32,
     services: ToolsService,
+    lineups: crate::mypro_features::lineups::Lineups,
     features: Features,
 }
 
@@ -230,7 +250,8 @@ impl ToolsHost {
         Ok(Self { input: None, web: None, context: WebContext::new(Some(root.join("mypro-webview"))),
             toolbar, panel_move, panel, parent, proxy, generation: Rc::new(Cell::new(0)), queued: Rc::new(Cell::new(0)),
             ready: 0, last_request: 0, visible: false, shown: false, session: None, event_sequence: 0,
-            services: ToolsService::new(root.clone()), features: Features::new(root) })
+            background_revision: 0, services: ToolsService::new(root.clone()),
+            lineups: crate::mypro_features::lineups::Lineups::new(root.join("mypro")), features: Features::new(root) })
     }
 
     fn ensure_web(&mut self) -> anyhow::Result<()> {
@@ -241,13 +262,7 @@ impl ToolsHost {
         let pending = self.queued.clone();
         let proxy = self.proxy.clone();
         let web = WebViewBuilder::new_with_web_context(&mut self.context)
-            .with_custom_protocol("mypro".into(), |_, req| {
-                let document = req.method() == wry::http::Method::GET && req.uri().path() == "/index.html";
-                wry::http::Response::builder().status(if document {200} else {404})
-                    .header("Content-Type","text/html; charset=utf-8")
-                    .header("Content-Security-Policy","default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; frame-src 'none'")
-                    .body(Cow::Borrowed(if document { PANEL_HTML.as_bytes() } else { b"" })).unwrap()
-            })
+            .with_custom_protocol("mypro".into(), |_, req| panel_response(req.method(), req.uri().path()))
             .with_url(PANEL_URL)
             .with_visible(false)
             .with_focused(false)
@@ -399,6 +414,16 @@ impl ToolsHost {
 
     pub fn sync_session(&mut self, player: &PlayerController) {
         let current = player.session_id();
+        crate::mypro_features::game_ui::sync(player);
+        let revision = crate::mypro_features::background::revision();
+        if revision != self.background_revision {
+            if let Some(mut movie) = player.get() {
+                movie.try_call_internal_interface("aolaRefreshBattleBackground", []);
+                self.background_revision = revision;
+            }
+        }
+        if self.session != Some(current) { self.lineups.reset(); }
+        self.lineups.tick(player,crate::mypro_services::in_battle);
         if self.session == Some(current) { return; }
         self.session = Some(current);
         if let Some(input) = &mut self.input {
@@ -417,6 +442,7 @@ impl ToolsHost {
 
     pub fn stop(&mut self) {
         self.ready = 0;
+        self.lineups.reset();
         self.services.set_session("idle");
         self.features.set_session("idle");
     }
@@ -429,8 +455,9 @@ impl ToolsHost {
         let state = player.get().map(|p| (p.is_playing(), p.performance_stats().frames, p.frame_rate()));
         let playing = state.map(|s| s.0);
         let mut capabilities = json!({});
-        for name in ["session.pause","session.resume","panel.hide","panel.reload"] {
-            let available = !name.starts_with("session.") || playing.is_some();
+        for name in ["session.pause","session.resume","panel.hide","panel.reload","battle.auto.read","battle.auto.set",
+            "game.panels","game.panel.open","theme.read","theme.apply","workshop.readOwnBag","lineups.read","lineups.refresh","lineups.save","lineups.restore"] {
+            let available = matches!(name,"panel.hide"|"panel.reload"|"game.panels") || playing.is_some();
             capabilities[name] = json!({"available":available,"reason":if available {""} else {"游戏尚未载入"}});
         }
         for additional in [self.services.capabilities(), self.features.capabilities()] {
@@ -443,6 +470,22 @@ impl ToolsHost {
             "logicalFrames":state.map(|s| s.1),"targetFps":state.map(|s| s.2),
             "viewport":{"width":size.width,"height":size.height},"capabilities":capabilities,
             "coreBuild":concat!("Ruffle ",env!("CARGO_PKG_VERSION"))})
+    }
+
+    fn native_auto(player: &PlayerController, command: &str, payload: &Value) -> Result<Value, String> {
+        use ruffle_core::external::Value as Flash;
+        let (callback, arg) = if command == "battle.auto.set" {
+            let enabled = payload["enabled"].as_bool().ok_or("InvalidArguments: expected enabled")?;
+            ("setNativeAutoBattle", Some(Flash::Bool(enabled)))
+        } else { ("getNativeAutoBattle", None) };
+        if let Some(Flash::Object(result)) = player.get().and_then(|mut p| p.try_call_internal_interface(callback, arg)) {
+            if let Some(Flash::String(status)) = result.get("status") {
+                let enabled = match result.get("enabled") { Some(Flash::Bool(flag)) => Some(*flag), _ => None };
+                let changed = matches!(result.get("changed"), Some(Flash::Bool(true)));
+                return Ok(json!({"status":status,"enabled":enabled,"changed":changed}));
+            }
+        }
+        Ok(json!({"status":"unavailable","enabled":null,"changed":false}))
     }
 
     pub fn request(&mut self, generation: u64, body: &str, player: &PlayerController, game: &Window) {
@@ -469,6 +512,16 @@ impl ToolsHost {
                 json!({"playing":p.is_playing()})
             }).ok_or_else(|| "NotInGame".to_string()),
             "panel.hide" | "panel.reload" => Ok(json!({})),
+            "battle.auto.read" | "battle.auto.set" => Self::native_auto(player, req.command, req.payload),
+            "workshop.readOwnBag" => crate::mypro_features::workshop::validate(req.payload).and_then(|script| {
+                if script["canReadOwnBag"]!=true { return Err("InvalidArguments: 此文本没有单一的自身背包读取操作".into()); }
+                self.lineups.command("lineups.refresh",&json!({}),player,crate::mypro_services::in_battle())
+                    .unwrap_or_else(||Err("UnsupportedCapability".into()))
+            }),
+            name @ ("game.panels" | "game.panel.open" | "theme.read" | "theme.apply") =>
+                crate::mypro_features::game_ui::command(player,name,req.payload).unwrap_or_else(|| Err("UnsupportedCapability".into())),
+            name @ ("lineups.read" | "lineups.refresh" | "lineups.save" | "lineups.restore") =>
+                self.lineups.command(name,req.payload,player,crate::mypro_services::in_battle()).unwrap_or_else(|| Err("UnsupportedCapability".into())),
             name => self.services.command(name, req.payload)
                 .or_else(|| self.features.command(name, req.payload))
                 .unwrap_or_else(|| Err("UnsupportedCapability".into())),
@@ -497,6 +550,24 @@ impl ToolsHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mypro_panel_serves_only_embedded_battle_assets() {
+        use wry::http::{Method, StatusCode};
+
+        let png = panel_response(&Method::GET, "/battle-assets/equipment/10227.png");
+        assert_eq!(png.status(), StatusCode::OK);
+        assert_eq!(png.headers()["Content-Type"], "image/png");
+        assert!(png.body().starts_with(b"\x89PNG\r\n\x1a\n"));
+        let names = panel_response(&Method::GET, "/battle-assets/names.json");
+        assert_eq!(names.headers()["Content-Type"], "application/json");
+        let catalog: Value = serde_json::from_slice(names.body()).unwrap();
+        assert_eq!(catalog["equipment:10227"], "鹿鸣仙风王者战剑LV3");
+        for path in ["/battle-assets/pet/0.png", "/battle-assets/../index.html", "/unlisted"] {
+            assert_eq!(panel_response(&Method::GET, path).status(), StatusCode::NOT_FOUND);
+        }
+        assert_eq!(panel_response(&Method::POST, "/index.html").status(), StatusCode::NOT_FOUND);
+    }
 
     #[test]
     fn mypro_native_game_has_700_physical_pixels_below_dpi_scaled_toolbar() {

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use url::Url;
 
-mod mypro_battle { include!("aola_mypro_battle.rs"); }
+mod battle_profile { include!("aola_battle_profile.rs"); }
 mod mypro_supplied { include!("aola_mypro_supplied.rs"); }
 mod mypro_archived { include!("aola_mypro_archived.rs"); }
 
@@ -47,10 +47,10 @@ pub(super) static NOTICE: Recipe = Recipe {
 
 pub(super) static BATTLE: Recipe = Recipe {
     path: "/play/pet/petfightnew",
-    version: "261112849126071",
-    original_size: 5_377_898,
-    movie_size: 6_573_705,
-    edits: aola_battle_edits::EDITS,
+    version: battle_profile::VERSION,
+    original_size: battle_profile::PACKED,
+    movie_size: battle_profile::FWS,
+    edits: battle_profile::BASE_EDITS,
     resource: Resource::Battle,
 };
 
@@ -186,7 +186,7 @@ impl DisplayPatch {
             let base = self.recipe.build(self.original()?)?;
             if std::env::var("AOLA_MYPRO_TOOLS").as_deref() != Ok("1") { return Ok(base); }
             let (name, edits): (_, ModelEdits) = match self.recipe.resource {
-                Resource::Battle => ("mypro-model.swf", mypro_battle::EDITS),
+                Resource::Battle => ("mypro-model.swf", battle_profile::MODEL_EDITS),
                 Resource::SuppliedBackpack => ("supplied-mypro.swf", mypro_supplied::EDITS),
                 Resource::ArchivedBackpack => ("archived-mypro.swf", mypro_archived::EDITS),
                 Resource::Notice => return Ok(base),

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'">
 <title>功能面板</title>
 <style>
 :root {
@@ -64,6 +64,13 @@ details>summary{color:var(--blue);font-size:13px;font-weight:600}
 .record:hover,.record[aria-pressed=true]{background:var(--wash)}
 .record span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.record .meta{font-size:11px;color:var(--sub)}
 .list{max-height:38vh;overflow:auto;scrollbar-gutter:stable}
+.packet-row{padding:7px 2px;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
+.packet-row p{margin:3px 0;font-size:13px}
+.enemy-pet{border-top:1px solid var(--line);padding:12px 0}
+.enemy-pet h3,.enemy-pet p{margin:4px 0}
+.enemy-pet img{width:38px;height:38px;object-fit:contain;flex:none}
+.enemy-ability{display:inline-block;margin:3px 12px 3px 0;font-size:13px}
+#battle .btn[aria-pressed=true]{background:var(--wash);border-color:var(--blue);color:var(--blue)}
 .note{position:sticky;top:8px;z-index:1;margin:0 0 10px;padding:8px 10px;background:#fff3df;color:#73431c;border:1px solid #edcca0;border-radius:5px;font-size:12px;overflow-wrap:anywhere}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:32vh;overflow:auto;padding:9px;background:#f2f5fa;border-radius:4px;font:12px/1.6 "IBM Plex Mono",Consolas,monospace}
 .spaced>*+*{margin-top:9px}
@@ -101,7 +108,8 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:32vh;overflow:auto;pa
 <aside class="rail">
 <h1>功能面板</h1>
 <nav aria-label="功能导航">
-<button data-tab="overview" aria-current="page">概览</button><button data-tab="morph">形态</button><button data-tab="capture">采集</button><button data-tab="battle">战况</button><button data-tab="settings">表现</button>
+<button data-tab="overview" aria-current="page">概览</button><button data-tab="morph">形态</button><button data-tab="capture">采集</button><button data-tab="packets">抓包日志</button><button data-tab="battle">战况</button><button data-tab="settings">表现</button>
+<button data-tab="workshop">工坊</button><button data-tab="lineups">阵容</button>
 </nav>
 <div class="rail-footer"><button id="hide" class="hide-window" type="button" title="隐藏窗口后，可在游戏中按 F8 打开" disabled>隐藏窗口<kbd aria-hidden="true">F8</kbd></button></div>
 </aside>
@@ -134,15 +142,68 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:32vh;overflow:auto;pa
     <button class="btn" id="import" disabled>只读导入</button><p id="job" class="hint" role="status"></p>
   </details>
 </section>
+<section id="packets" hidden>
+  <article class="card spaced">
+    <h2>抓包日志</h2>
+    <div class="row"><label><input type="checkbox" id="packet-exportable"> 仅看可导出发送记录</label>
+      <label><input type="checkbox" id="packet-retain" disabled> 保留日志</label></div>
+    <p id="packet-status" class="hint" role="status"></p>
+    <div class="list" id="packet-rows" aria-label="收发记录"></div>
+    <div class="row"><button class="btn small" id="packet-newer" disabled>上一页</button><button class="btn small" id="packet-older" disabled>下一页</button><button class="btn small" id="packet-latest" disabled>最新</button></div>
+    <label class="field" id="packet-export-result" hidden>导出的发送文本<textarea id="packet-text" rows="3" readonly></textarea></label>
+  </article>
+</section>
 <section id="battle" hidden>
   <article class="card"><h2>战斗记录</h2><span id="battle-state" class="state">等待读取</span>
     <dl><div><dt>战斗编号</dt><dd id="battle-id">—</dd></div><div><dt>换宠次数</dt><dd id="switches">—</dd></div><div><dt>最近更新</dt><dd id="battle-time">—</dd></div><div><dt>数据来源</dt><dd id="battle-source">—</dd></div></dl>
   </article>
+  <article class="card spaced">
+    <div class="row between"><h2>敌方阵容</h2><div class="row">
+      <button class="btn small" id="battle-attributes" aria-pressed="true">属性</button>
+      <button class="btn small" id="battle-config" aria-pressed="false">配置</button></div></div>
+    <div id="enemy-pets">等待可识别的敌方阵容</div>
+  </article>
 </section>
 <section id="settings" hidden>
+  <article class="card"><h2>游戏主题</h2>
+    <label class="field">控制栏外观<select id="theme-choice"></select></label>
+    <button class="btn controls" id="theme-apply" disabled>切换主题</button>
+    <p class="hint" id="theme-status" role="status"></p>
+  </article>
   <article class="card">
     <h2>游戏表现</h2><p class="hint">设置在下一次对应内容出现时生效。</p>
     <div id="setting-options"></div><p class="hint" id="setting-status" role="status"></p>
+  </article>
+  <article class="card"><h2>战斗背景</h2>
+    <button id="background-choose" disabled>选择本地 JPEG</button> <button id="background-clear" disabled>恢复游戏背景</button>
+    <p class="hint" id="background-status" role="status"></p>
+  </article>
+  <article class="card"><h2>原生自动战斗</h2>
+    <label><input type="checkbox" id="native-auto" disabled> 使用游戏内的自动战斗</label>
+    <p class="hint" id="auto-status" role="status"></p>
+  </article>
+</section>
+<section id="workshop" hidden>
+  <article class="card"><h2>打开游戏面板</h2><div id="game-panels" class="row"></div><p class="hint" id="game-panel-status" role="status"></p></article>
+  <article class="card"><h2>脚本本地演练</h2>
+    <label class="field">文本序列<textarea id="workshop-text" rows="6" spellcheck="false" placeholder="#time = 0.5 | #wait"></textarea></label>
+    <p class="hint">用 | 分隔指令。#send 显示命令摘要，#time 推进模拟时钟，#wait 等待模拟退场。</p>
+    <div class="row"><button class="btn primary" id="workshop-run" disabled>开始演练</button><button class="btn" id="workshop-next" hidden>模拟战斗结束</button><button class="btn" id="workshop-stop" hidden>停止</button></div>
+    <p class="hint" role="status" id="workshop-status"></p><ol id="workshop-steps"></ol>
+    <div id="own-bag-action" hidden><button class="btn" id="own-bag-read">在游戏中读取自己的背包</button>
+    <p class="hint" id="own-bag-status" role="status"></p></div>
+  </article>
+</section>
+<section id="lineups" hidden>
+  <article class="card"><div class="row between"><h2>当前背包</h2><button id="lineup-read" class="btn">重新读取</button></div>
+    <ol id="lineup-pets"></ol><p id="lineup-status" class="hint" role="status"></p>
+    <label class="field">方案名称<input id="lineup-name" maxlength="64"></label>
+    <button class="btn controls" id="lineup-save" disabled>保存当前阵容</button>
+  </article>
+  <article class="card"><h2>恢复方案</h2>
+    <div class="filters"><label class="field">已保存的方案<select id="lineup-plans"></select></label>
+    <label class="field">恢复项目<select id="lineup-section"></select></label></div>
+    <button class="btn" id="lineup-restore" disabled>恢复选中项目</button>
   </article>
 </section>
 <section id="morph" hidden>
@@ -156,7 +217,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:32vh;overflow:auto;pa
     <div class="filters morph-targets">
       <label class="field">背包目标 ID<input id="m-backpackId" inputmode="numeric" maxlength="12"></label>
       <label class="field">战斗目标 ID<input id="m-fightId" inputmode="numeric" maxlength="12"></label>
-      <label class="field">海报目标 ID（仅保存）<input id="m-spskiId" inputmode="numeric" maxlength="12"></label>
+      <label class="field">海报目标 ID<input id="m-spskiId" inputmode="numeric" maxlength="12"></label>
     </div>
     <p class="hint">按外观素材 ID 匹配。目标留空时沿用官方素材。</p>
     <div class="row"><button id="morph-add" class="btn small" disabled>加入列表</button><button id="morph-remove" class="btn small" disabled>移除所选</button></div>
@@ -184,9 +245,10 @@ const $ = id => document.getElementById(id);
 const pending = new Map();
 let requestNo = 0, snapshot = null, activeTab = "overview", visible = true, epoch = 0;
 let page = null, after, previous = [], following = true, selected = null, captureQuery = 0, jobId = null;
+let packetAfter, packetNext, packetHistory=[], packetQuery=0, pendingRetention=null, sessionVersion=0, refreshAgain=false;
 const commandLabels = {
   "session.pause":"暂停播放","session.resume":"继续播放","capture.page":"采集记录","capture.configure":"采集开关",
-  "capture.export":"记录导出","capture.import":"只读导入","battle.snapshot":"战斗记录","settings.patch":"游戏表现",
+  "capture.export":"记录导出","capture.import":"只读导入","packets.page":"抓包日志","battle.snapshot":"战斗记录","settings.patch":"游戏表现",
   "workshop.validate":"工坊脚本","morph.rules.read":"形态规则","lineups.read":"阵容","assets.list":"本地资源"
 };
 const kinds = {resource:"资源请求",battle:"战斗",backpack:"背包",panel:"游戏面板"};
@@ -217,7 +279,10 @@ function command(name, payload = {}) {
 window.myproReceive = msg => {
   if (!msg || msg.bridgeGeneration !== window.myproGeneration || (msg.protocolVersion!=null && msg.protocolVersion!==1)) return;
   if(msg.kind==="event") {
-    if(msg.event==="session.changed") void refresh(true);
+    if(msg.event==="session.changed") {
+      ++sessionVersion; ++epoch; resetPackets(); resetBattle(); resetAuto(); resetWorkshop(); resetGameTools();
+      if (busy) refreshAgain=true; else void refresh(true);
+    }
     return;
   }
   if(msg.kind!=="response") return;
@@ -251,20 +316,224 @@ function showOverview() {
   for (const [id,name] of [["export","capture.export"],["import","capture.import"]]) setButton(id,!jobId && cap(name),s.capabilities?.[name]?.reason);
 }
 async function updateSession() {
+  const version=sessionVersion;
   const s=await command("app.snapshot");
+  if(version!==sessionVersion) return false;
   if (snapshot && snapshot.sessionId !== s.sessionId) {
+    resetPackets(); resetBattle();
     resetPage(); page=null; jobId=null; $("rows").replaceChildren(); $("job").textContent="";
     $("battle-state").textContent="等待读取"; ++epoch; ++morphRequest; ++settingsQuery;
   }
-  snapshot=s; showOverview();
+  snapshot=s; showOverview(); return true;
 }
 function timeLabel(value) {
   if (!Number.isFinite(value)) return "—";
   if (value >= 1e11) return new Date(value).toLocaleTimeString("zh-CN",{hour12:false});
   return (value/1000).toFixed(1)+" 秒";
 }
-const presentationOptions = {hideNotice:"隐藏公告",blockWanyu:"跳过万域之潮出招演出",hideTransformPortrait:"隐藏变身立绘",skipBattleBackdrop:"跳过战场背景切换"};
+const presentationOptions = {hideNotice:"隐藏公告",blockWanyu:"跳过万域之潮出招演出",hideTransformPortrait:"隐藏变身立绘",skipBattleBackdrop:"跳过战场背景切换",hideBattleDamage:"隐藏伤害浮字",hideBattleHealing:"隐藏治疗浮字",skipBattleAnimations:"跳过战斗演出"};
+let rehearsal=null, workshopVersion=0;
+let ownBagText=null, ownBagPending=false, ownBagCapture=null;
+function clearOwnBagAction() {
+  ownBagText=null; ownBagPending=false; ownBagCapture=null; $("own-bag-action").hidden=true; $("own-bag-status").textContent="";
+}
+function showOwnBagRead(result) {
+  ownBagPending=["loading","saving"].includes(result.stage);
+  $("own-bag-read").disabled=ownBagPending;
+  $("own-bag-status").textContent=ownBagPending ? "正在等待两次背包回读" :
+    result.stage==="ready" && result.current ? "已核对当前背包，共 "+result.current.pets.length+" 只亚比" :
+    result.message || "请在战外打开自己的背包";
+}
+$("workshop-text").oninput=clearOwnBagAction;
+$("own-bag-read").onclick=operation(async()=>{
+  const text=ownBagText,version=sessionVersion;
+  if(!text || text!==$("workshop-text").value) return;
+  $("own-bag-read").disabled=true;
+  try {
+    const result=await command("workshop.readOwnBag",{text});
+    if(text===ownBagText && version===sessionVersion){ownBagCapture=result.captureId;showOwnBagRead(result);}
+  } finally {if(!ownBagPending) $("own-bag-read").disabled=false;}
+});
+let lineupQuery=0, lineupState=null, lineupWriting=false;
+const lineupSections={order:"背包顺序",cards:"魂卡",artifacts:"魂器",keys:"晶钥"};
+function resetGameTools() {
+  ++lineupQuery; ++themeQuery; lineupWriting=false; lineupState=null; themeEditing=false;
+  clearOwnBagAction();
+  $("workshop-steps").replaceChildren();
+  $("game-panel-status").textContent=""; $("theme-status").textContent="";
+  $("lineup-name").value=""; showLineup(null);
+}
+function selectOptions(id, entries) {
+  const el=$(id), selected=el.value;
+  const signature=JSON.stringify(entries);
+  if(el.dataset.items===signature) return;
+  el.dataset.items=signature; el.replaceChildren(...entries.map(([value,title])=>new Option(title,value)));
+  if(entries.some(([value])=>value===selected)) el.value=selected;
+}
+function lineupButtons() {
+  const busy=lineupWriting || ["loading","saving","restoring"].includes(lineupState?.stage);
+  setButton("lineup-read",!busy && cap("lineups.refresh") && Boolean(lineupState?.current));
+  setButton("lineup-save",!busy && cap("lineups.save") && lineupState?.canSave===true && $("lineup-name").value.trim().length>0);
+  setButton("lineup-restore",!busy && cap("lineups.restore") && Boolean($("lineup-plans").value && $("lineup-section").value));
+}
+function showLineup(state) {
+  lineupState=state;
+  const pets=state?.current?.pets || [];
+  $("lineup-pets").replaceChildren(...pets.map(pet=>{
+    const row=document.createElement("li"); row.textContent=(pet.name || "亚比 "+pet.raceId)+" · 个体 "+pet.petId;
+    const fields=[["魂卡",pet.soulCards],["魂器",pet.soulArtifacts],["晶钥",pet.crystalKeys]];
+    const detail=document.createElement("p"); detail.className="hint";
+    detail.textContent=fields.map(([label,slots])=>{
+      if(!Array.isArray(slots)) return label+" 未提供";
+      return label+" "+(slots.map(slot=>slot?.configId ? slot.configId+"（个体 "+slot.instanceId+"）" : slot || "空").join(" / ") || "空");
+    }).join("　"); row.append(detail); return row;
+  }));
+  selectOptions("lineup-plans",(state?.plans || []).map(name=>[name,name]));
+  selectOptions("lineup-section",(state?.sections || []).filter(key=>Object.hasOwn(lineupSections,key)).map(key=>[key,lineupSections[key]]));
+  $("lineup-status").textContent=state?.message || (pets.length ? "当前背包共 "+pets.length+" 只亚比" : "请在游戏中打开背包");
+  lineupButtons();
+}
+async function readLineup() {
+  if(lineupWriting) return;
+  if(!cap("lineups.read")){showLineup(null);return;}
+  const id=++lineupQuery,version=sessionVersion,state=await command("lineups.read");
+  if(id===lineupQuery && version===sessionVersion) showLineup(state);
+}
+async function changeLineup(action,payload) {
+  const id=++lineupQuery,version=sessionVersion; lineupWriting=true; lineupButtons();
+  try {
+    const state=await command("lineups."+action,payload);
+    if(id===lineupQuery && version===sessionVersion) showLineup(state);
+  } finally {
+    if(id===lineupQuery && version===sessionVersion){lineupWriting=false;lineupButtons();}
+  }
+}
+$("lineup-read").onclick=operation(()=>changeLineup("refresh",{}));
+$("lineup-name").oninput=lineupButtons;
+$("lineup-save").onclick=operation(()=>changeLineup("save",{name:$("lineup-name").value.trim()}));
+$("lineup-restore").onclick=operation(()=>changeLineup("restore",{name:$("lineup-plans").value,section:$("lineup-section").value}));
+function resetWorkshop(message="") {
+  rehearsal=null; ++workshopVersion;
+  $("workshop-status").textContent=message; $("workshop-next").hidden=true; $("workshop-stop").hidden=true;
+  $("workshop-run").disabled=!cap("workshop.validate"); $("workshop-text").disabled=false;
+}
+function advanceWorkshop() {
+  while(rehearsal && rehearsal.at<rehearsal.steps.length) {
+    const step=rehearsal.steps[rehearsal.at++], row=document.createElement("li");
+    let detail;
+    if(step.kind==="wait") detail="等待模拟退场";
+    else if(step.kind==="delay"){rehearsal.seconds+=step.seconds; detail="经过 "+step.seconds+" 秒";}
+    else {
+      rehearsal.seconds=Math.max(rehearsal.seconds,rehearsal.nextMessage);
+      rehearsal.nextMessage=rehearsal.seconds+0.2;
+      detail=step.id+" / "+step.cmd+" · "+step.fields+" 个参数";
+    }
+    row.textContent="第 "+step.line+" 行 · "+Number(rehearsal.seconds.toFixed(3))+" 秒 · "+detail;
+    $("workshop-steps").append(row);
+    if(step.kind==="wait"){ $("workshop-next").hidden=false; $("workshop-status").textContent=detail; return; }
+  }
+  resetWorkshop("演练完成");
+}
+$("workshop-run").onclick=operation(async()=>{
+  clearOwnBagAction();
+  const id=++workshopVersion; $("workshop-steps").replaceChildren(); $("workshop-status").textContent="";
+  $("workshop-run").disabled=true; $("workshop-text").disabled=true;
+  try {
+    const result=await command("workshop.validate",{text:$("workshop-text").value});
+    if(id!==workshopVersion) return;
+    if(result.canReadOwnBag && cap("workshop.readOwnBag")) {
+      ownBagText=$("workshop-text").value; $("own-bag-action").hidden=false; $("own-bag-read").disabled=false;
+      $("own-bag-status").textContent="在战外打开自己的背包后可执行，游戏将读取两次以核对结果。";
+    }
+    rehearsal={steps:result.steps,at:0,seconds:0,nextMessage:0}; $("workshop-stop").hidden=false; advanceWorkshop();
+  } catch(e){if(id===workshopVersion) resetWorkshop(e.message);}
+});
+$("workshop-stop").onclick=()=>resetWorkshop("演练已停止");
+$("workshop-next").onclick=()=>{ if(rehearsal){$("workshop-next").hidden=true; advanceWorkshop();} };
+async function readGamePanels() {
+  $("workshop-run").disabled=$("workshop-text").disabled || !cap("workshop.validate");
+  const version=sessionVersion;
+  if(ownBagPending && cap("lineups.read")){
+    const text=ownBagText, result=await command("lineups.read");
+    if(version===sessionVersion && text===ownBagText) showOwnBagRead(ownBagCapture && result.captureId!==ownBagCapture ?
+      {stage:"unavailable",message:"本次背包读取已结束或切换"} : result);
+  }
+  if(!cap("game.panels")){$("game-panels").replaceChildren();delete $("game-panels").dataset.items;return;}
+  const {panels}=await command("game.panels");
+  if(version!==sessionVersion) return;
+  const container=$("game-panels");
+  const signature=JSON.stringify([cap("game.panel.open"),panels]);
+  if(signature===container.dataset.items) return;
+  container.dataset.items=signature;
+  container.replaceChildren(...panels.map(p=>{
+    const button=document.createElement("button"); button.className="btn"; button.textContent=p.name;
+    button.disabled=!cap("game.panel.open");
+    button.onclick=operation(async()=>{
+      const generation=sessionVersion; const result=await command("game.panel.open",{id:p.id});
+      if(generation===sessionVersion) $("game-panel-status").textContent=result.message ||
+        ({requested:"游戏已受理面板请求",blocked:"请在战斗结束后打开面板",failed:"游戏加载面板失败"}[result.status] || "等待游戏面板服务就绪");
+    });
+    return button;
+  }));
+}
+let themeQuery=0, themeEditing=false;
+for(let id=0;id<=10;id++) $("theme-choice").add(new Option(id===0?"游戏默认":"主题 "+id,String(id)));
+$("theme-choice").onchange=()=>{themeEditing=true;};
+function showTheme(state) {
+  if(!themeEditing && Number.isInteger(state.themeId)) $("theme-choice").value=String(state.themeId);
+  $("theme-apply").disabled=!cap("theme.apply");
+  const names={Applied:"已应用",WaitingBattleEnd:"待战斗结束后切换",Loading:"正在加载",NotReady:"等待游戏控制栏",Failed:"切换失败"};
+  $("theme-status").textContent=[names[state.status],state.message,
+    Number.isInteger(state.appliedThemeId) && state.appliedThemeId>0 ? "当前主题 "+state.appliedThemeId : ""].filter(Boolean).join(" · ");
+}
+async function readTheme() {
+  if(!cap("theme.read")){$("theme-apply").disabled=true;return;}
+  const id=++themeQuery,version=sessionVersion,state=await command("theme.read");
+  if(id===themeQuery && version===sessionVersion) showTheme(state);
+}
+$("theme-apply").onclick=operation(async()=>{
+  const id=++themeQuery,version=sessionVersion;
+  $("theme-apply").disabled=true;
+  try {
+    const state=await command("theme.apply",{themeId:Number($("theme-choice").value)});
+    if(id===themeQuery && version===sessionVersion){themeEditing=false;showTheme(state);}
+  } finally {if(version===sessionVersion) $("theme-apply").disabled=!cap("theme.apply");}
+});
 let presentation=null, writingSetting=false, settingsQuery=0;
+let backgroundQuery=0, autoQuery=0, autoWriting=false;
+function resetAuto() {
+  ++autoQuery; autoWriting=false;
+  $("native-auto").checked=false; $("native-auto").disabled=true;
+  $("auto-status").textContent="等待战斗提供自动按钮";
+}
+function showAuto(result) {
+  const available=["ready","applied"].includes(result?.status);
+  $("native-auto").checked=result?.enabled===true;
+  $("native-auto").disabled=!available || autoWriting || !cap("battle.auto.set");
+  $("auto-status").textContent=available ? (result.enabled ? "自动战斗已开启" : "自动战斗已关闭") :
+    result?.status==="blocked" ? "本场战斗限制手动切换" : "等待战斗提供自动按钮";
+}
+$("native-auto").onchange=operation(async()=>{
+  const id=++autoQuery; autoWriting=true; $("native-auto").disabled=true;
+  try {
+    const result=await command("battle.auto.set",{enabled:$("native-auto").checked});
+    if(id===autoQuery){autoWriting=false; showAuto(result);}
+  } finally {
+    if(id===autoQuery && autoWriting){resetAuto(); await readSettings();}
+  }
+});
+async function backgroundCommand(name) {
+  const id=++backgroundQuery;
+  if(name!=="read") {setButton("background-choose",false); setButton("background-clear",false);}
+  const result=await command("background."+name);
+  if(id!==backgroundQuery) return;
+  const waiting=["choosing","saving","loading"].includes(result.stage);
+  setButton("background-choose",!waiting && cap("background.choose"));
+  setButton("background-clear",!waiting && result.configured && cap("background.clear"));
+  $("background-status").textContent=result.error || ({choosing:"正在选择图片…",saving:"正在准备 960×560 背景…",loading:"正在读取背景…"}[result.stage]) ||
+    (result.configured ? "已使用自定义背景 · 960×560" : "使用游戏背景");
+}
+for(const name of ["choose","clear"]) $("background-"+name).onclick=operation(()=>backgroundCommand(name));
 for(const [key,title] of Object.entries(presentationOptions)) {
   const row=document.createElement("label");
   row.style.cssText="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--line)";
@@ -272,7 +541,9 @@ for(const [key,title] of Object.entries(presentationOptions)) {
   input.style.cssText="width:17px;height:17px;margin:0;accent-color:var(--green)";
   row.append(input,document.createTextNode(title)); $("setting-options").append(row);
   input.onchange=operation(async()=>{
-    const enabled=input.checked; writingSetting=true; ++settingsQuery; showSettings();
+    const enabled=input.checked;
+    presentation={...presentation,values:{...presentation.values,[key]:enabled}};
+    writingSetting=true; ++settingsQuery; showSettings();
     try {
       presentation=await command("settings.patch",{expectedRevision:presentation.revision,values:{[key]:enabled}});
     } catch(e) {
@@ -284,13 +555,20 @@ function showSettings() {
   const waiting=presentation?.stage==="saving" || writingSetting;
   for(const key of Object.keys(presentationOptions)) {
     const input=$("setting-"+key); input.checked=presentation?.values?.[key]===true;
-    input.disabled=!cap("settings.patch") || !presentation || waiting;
+    input.disabled=!cap("settings.patch") || !presentation || presentation.stage==="loading" || waiting;
   }
   const status=waiting ? "正在保存…" : presentation?.stage==="failed" ? presentation.error || "保存失败。" :
     presentation ? "设置版本 "+presentation.revision : snapshot?.capabilities?.["settings.read"]?.reason || "等待读取设置。";
   $("setting-status").textContent=status;
 }
 async function readSettings() {
+  const readAuto=async()=>{
+    if(autoWriting) return;
+    const id=++autoQuery, version=sessionVersion;
+    const result=cap("battle.auto.read") ? await command("battle.auto.read") : null;
+    if(id===autoQuery && version===sessionVersion) showAuto(result);
+  };
+  await Promise.all([readAuto(),cap("background.read") && backgroundCommand("read")]);
   if (!writingSetting && cap("settings.read")) {
     const id=++settingsQuery, result=await command("settings.read");
     if (id===settingsQuery) presentation=result;
@@ -436,6 +714,67 @@ $("morph-import").onclick=operation(async()=>{
   if(new Set(imported.map(r=>r.originalId)).size!==imported.length)throw new Error("导入列表含重复的原素材 ID。");
   draft.rules=imported;morphDirty=true;choices();$("morph-json").value="";
 });
+function resetPackets() {
+  ++packetQuery; packetAfter=undefined; packetNext=null; packetHistory=[]; pendingRetention=null;
+  $("packet-rows").replaceChildren(); $("packet-status").textContent="";
+  $("packet-export-result").hidden=true; $("packet-text").value="";
+  $("packet-retain").checked=false;
+  for (const id of ["packet-retain","packet-newer","packet-older","packet-latest"]) setButton(id,false);
+}
+async function readPackets() {
+  if(!cap("packets.page")) { $("packet-status").textContent="当前播放器未提供抓包记录"; return; }
+  const request=++packetQuery, view=epoch;
+  const data=await command("packets.page",{after:packetAfter,limit:25,exportableOnly:$("packet-exportable").checked});
+  if(request!==packetQuery || view!==epoch || activeTab!=="packets") return;
+  packetNext=data.nextAfter;
+  setButton("packet-older",packetNext!=null); setButton("packet-newer",packetHistory.length>0);
+  if(pendingRetention===data.retaining || data.logError) pendingRetention=null;
+  const saving=pendingRetention!==null || data.logPending;
+  setButton("packet-latest",packetAfter!=null); setButton("packet-retain",cap("packets.retain.set") && !saving);
+  $("packet-retain").checked=pendingRetention ?? data.retaining;
+  const status=[saving ? "正在更新日志状态…" : data.retaining ? "正在保留日志" : "仅在内存中查看"];
+  if(data.logFile) status.push(data.logFile);
+  if(data.droppedRows) status.push("已移出 "+data.droppedRows+" 条旧记录");
+  if(data.droppedChunks) status.push("观察队列丢弃 "+data.droppedChunks+" 段");
+  if(data.gaps) status.push("连接数据缺口 "+data.gaps+" 次");
+  if(data.gap) status.push("本页的部分记录已移出");
+  if(data.droppedLogRows) status.push("未写入日志 "+data.droppedLogRows+" 条");
+  if(data.logError) status.push(data.logError);
+  $("packet-status").textContent=status.join(" · ");
+  const nodes=data.rows.map(row=>{
+    const item=document.createElement("div"); item.className="packet-row";
+    const head=document.createElement("strong"); head.textContent=(row.direction==="send" ? "发送" : "接收")+" · "+(row.cmd || "未识别");
+    const meta=document.createElement("div"); meta.className="hint";
+    meta.textContent=timeLabel(row.timeMs)+" · #"+row.seq+" · "+row.length+" 字节 · 连接 "+row.socket;
+    const summary=document.createElement("p"); summary.textContent=row.summary;
+    item.append(head,meta,summary);
+    if(row.exportable && cap("packets.export")) {
+      const button=document.createElement("button"); button.className="btn small"; button.textContent="导出文本";
+      button.onclick=operation(async()=>{
+        const version=sessionVersion, session=snapshot?.sessionId;
+        const out=await command("packets.export",{seq:row.seq});
+        if(version!==sessionVersion || session!==snapshot?.sessionId || view!==epoch) return;
+        $("packet-text").value=out.text; $("packet-export-result").hidden=false;
+      });
+      item.append(button);
+    }
+    return item;
+  });
+  $("packet-rows").replaceChildren(...nodes);
+  if(!nodes.length) $("packet-rows").textContent=$("packet-exportable").checked ? "没有可导出的发送记录" : "等待当前游戏连接的收发记录";
+}
+$("packet-older").onclick=operation(async()=>{if(packetNext==null)return; setButton("packet-older",false);packetHistory.push(packetAfter);packetAfter=packetNext;await readPackets();});
+$("packet-newer").onclick=operation(async()=>{setButton("packet-newer",false);packetAfter=packetHistory.pop();await readPackets();});
+$("packet-latest").onclick=operation(async()=>{resetPackets();await readPackets();});
+$("packet-exportable").onchange=operation(async()=>{resetPackets();await readPackets();});
+$("packet-retain").onchange=operation(async()=>{
+  const requested=$("packet-retain").checked, version=sessionVersion;
+  setButton("packet-retain",false);
+  try {
+    await command("packets.retain.set",{enabled:requested});
+    if(version===sessionVersion) pendingRetention=requested;
+  } finally { if(activeTab==="packets") await readPackets(); }
+});
 function resetPage() {
   ++captureQuery; after=undefined; previous=[]; following=true; selected=null;
   $("detail").hidden=true; $("record-data").textContent="";
@@ -471,13 +810,94 @@ async function readCapture() {
   const data=await command("capture.page",{source:$("source").value,after,limit:40,kind:filter || undefined});
   if (key===captureQuery && activeTab==="capture") renderPage(data);
 }
+let battleView="attributes", enemyDetails=null, enemyRevision="", itemNames=null, namesRequest=null;
+const loadoutNames={"equipment":"装备","soul-card":"魂卡","soul-artifact":"魂器","crystal-key":"晶钥"};
+const groupStates={empty:"空",notProvided:"尚未收到",invalid:"无法解析"};
+function resetBattle() {
+  enemyDetails=null; enemyRevision=""; renderEnemy();
+  for(const id of ["battle-id","switches","battle-time","battle-source"]) $(id).textContent="—";
+  statusState("battle-state","等待战斗",false);
+}
+function battleText(tag,text,style) {
+  const node=document.createElement(tag); node.textContent=text;
+  if(style) node.className=style;
+  return node;
+}
+function battleImage(category,id) {
+  if(!/^[1-9][0-9]{0,15}$/.test(String(id))) return null;
+  const img=document.createElement("img"); img.alt=""; img.loading="lazy";
+  img.onerror=()=>img.hidden=true;
+  img.src="/battle-assets/"+category+"/"+id+".png"; return img;
+}
+function petAttributes(card,pet) {
+  card.append(battleText("p","HP "+(pet.currentHp ?? "—")+" / "+(pet.maximumHp ?? "—")));
+  const stats=document.createElement("div");
+  for(const ability of pet.abilities || []) {
+    const node=battleText("span",ability.name+" "+(ability.total ?? "—"),"enemy-ability");
+    if(Array.isArray(ability.segments)) node.title=ability.segments.join(" + ");
+    stats.append(node);
+  }
+  card.append(stats);
+  for(const skill of pet.skills || []) {
+    card.append(battleText("p",(skill.name || "技能 "+(skill.id ?? "—"))+" · PP "+(skill.pp ?? "—")+" · CD "+(skill.cd ?? "—")));
+  }
+}
+function petConfiguration(card,pet) {
+  for(const [category,label] of Object.entries(loadoutNames)) {
+    const group=pet.loadout?.[category], line=document.createElement("div"); line.className="row";
+    line.append(battleText("strong",label)); card.append(line);
+    if(group?.state!=="known" || !group.items?.length) { line.append(battleText("span",groupStates[group?.state] || "尚未收到","hint")); continue; }
+    for(const entry of group.items) {
+      if(entry.id===0) { line.append(battleText("span","空","hint")); continue; }
+      const icon=battleImage(category,entry.id); if(icon) line.append(icon);
+      const name=itemNames?.[category+":"+entry.id];
+      const text=battleText("span",(name ? name+" " : "")+"#"+entry.id);
+      if(entry.details) text.title=typeof entry.details==="string" ? entry.details : JSON.stringify(entry.details);
+      line.append(text);
+    }
+  }
+}
+function renderEnemy() {
+  const container=$("enemy-pets"), pets=enemyDetails?.enemy?.pets, cards=[];
+  for(const pet of pets || []) {
+    const card=document.createElement("div"); card.className="enemy-pet";
+    const heading=document.createElement("div"); heading.className="row";
+    const icon=battleImage("pet",pet.raceId); if(icon) heading.append(icon);
+    heading.append(battleText("h3",pet.nickname || pet.name || "亚比 "+(pet.raceId ?? "—")));
+    if(pet.nickname && pet.name && pet.nickname!==pet.name) heading.append(battleText("span",pet.name,"hint"));
+    if(pet.level!=null) heading.append(battleText("span","Lv."+pet.level,"hint"));
+    if(pet.slotId!=null) heading.append(battleText("span","槽位 "+pet.slotId,"hint"));
+    card.append(heading);
+    if(battleView==="attributes") petAttributes(card,pet); else petConfiguration(card,pet);
+    cards.push(card);
+  }
+  container.replaceChildren(...cards);
+  if(!cards.length) container.textContent=enemyDetails?.state==="ended" ? "战斗已结束" : "等待可识别的敌方阵容";
+}
+function setBattleView(view) {
+  battleView=view;
+  for(const id of ["attributes","config"]) $("battle-"+id).setAttribute("aria-pressed",String(id===view));
+  renderEnemy();
+  if(view==="config" && !namesRequest) {
+    namesRequest=fetch("/battle-assets/names.json").then(r=>r.ok ? r.json() : {}).then(names=>{
+      itemNames=names; if(activeTab==="battle" && battleView==="config") renderEnemy();
+    }).catch(()=>{namesRequest=null;});
+  }
+}
+$("battle-attributes").onclick=()=>setBattleView("attributes");
+$("battle-config").onclick=()=>setBattleView("config");
 async function readBattle() {
   if (!cap("battle.snapshot")) { statusState("battle-state","战况数据未就绪",false); return; }
+  const view=epoch, version=sessionVersion;
   const battle=await command("battle.snapshot");
+  if(view!==epoch || version!==sessionVersion || activeTab!=="battle") return;
+  const details=battle.details ?? null, revision=JSON.stringify(details);
+  if(revision!==enemyRevision) { enemyDetails=details; enemyRevision=revision; renderEnemy(); }
   const states={unknown:"等待战斗记录",active:"战斗进行中",ended:"战斗已结束"};
-  statusState("battle-state",states[battle.state] || "状态未知",battle.state==="active");
-  $("battle-id").textContent=battle.battleId ?? "—"; $("switches").textContent=battle.switches ?? "—";
-  $("battle-time").textContent=timeLabel(battle.updatedMs); $("battle-source").textContent=battle.source || "—";
+  const phase=details?.state==="active" || details?.state==="ended" ? details.state : battle.state;
+  statusState("battle-state",states[phase] || "状态未知",phase==="active");
+  $("battle-id").textContent=details?.battleUniqueId ?? battle.battleId ?? "—"; $("switches").textContent=battle.switches ?? "—";
+  $("battle-time").textContent=timeLabel(battle.updatedMs); $("battle-source").textContent=details?.lastCommand ? "接收 "+details.lastCommand : battle.source || "—";
 }
 async function pollJob() {
   if (!jobId) return;
@@ -516,20 +936,23 @@ async function refresh(manual=false) {
   if (busy || !visible || document.hidden || !window.myproGeneration) return;
   busy=true;
   try {
-    await updateSession(); const at=epoch;
+    if(!await updateSession()) return; const at=epoch;
     if (activeTab==="capture") { if (following || !page || manual) await readCapture(); if (at===epoch) await pollJob(); }
+    else if (activeTab==="packets") await readPackets();
     else if (activeTab==="battle") await readBattle();
-    else if (activeTab==="settings") await readSettings();
+    else if (activeTab==="settings") await Promise.all([readSettings(),readTheme()]);
+    else if (activeTab==="workshop") await readGamePanels();
+    else if (activeTab==="lineups") await readLineup();
     else if (activeTab==="morph") await readMorph();
   } catch(e) { if (visible) notify(e.message); }
-  finally { busy=false; }
+  finally { busy=false; if(refreshAgain) { refreshAgain=false; void refresh(true); } }
 }
 function activate(id) {
   if(activeTab!==id)window.scrollTo(0,0);
   activeTab=id; ++epoch;
   document.querySelectorAll("main>section").forEach(s=>s.hidden=s.id!==id);
   document.querySelectorAll("[data-tab]").forEach(b=>{if(b.dataset.tab===id)b.setAttribute("aria-current","page");else b.removeAttribute("aria-current");});
-  void refresh(true);
+  if(busy) refreshAgain=true; else void refresh(true);
 }
 document.querySelectorAll("[data-tab]").forEach(b=>b.onclick=()=>activate(b.dataset.tab));
 $("hide").onclick=operation(()=>command("panel.hide"));

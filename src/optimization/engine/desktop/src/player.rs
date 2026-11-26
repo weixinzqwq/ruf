@@ -255,6 +255,9 @@ impl ActivePlayer {
         if hide_notice || patch_battle {
             let exe = std::env::current_exe().ok();
             let root = exe.as_deref().and_then(std::path::Path::parent);
+            if live_display && let Some(root) = root {
+                navigator = navigator.with_aola_game_ui(root.join("swf-game-ui"));
+            }
             if live_display || hide_notice {
                 navigator = navigator.with_aola_notice(root.map(|r| r.join("swf-notice")).as_deref());
             }

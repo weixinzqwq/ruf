@@ -2828,13 +2828,21 @@ impl Player {
         name: &str,
         args: impl IntoIterator<Item = ExternalValue>,
     ) -> ExternalValue {
+        self.try_call_internal_interface(name, args).unwrap_or_else(|| {
+            tracing::warn!("Calling unknown internal interface: {}", name);
+            ExternalValue::Null
+        })
+    }
+
+    /// Call an optional host integration only while the movie has registered it.
+    pub fn try_call_internal_interface(
+        &mut self,
+        name: &str,
+        args: impl IntoIterator<Item = ExternalValue>,
+    ) -> Option<ExternalValue> {
         self.mutate_with_update_context(|context| {
-            if let Some(callback) = context.external_interface.get_callback(name) {
-                callback.call(context, name, args)
-            } else {
-                tracing::warn!("Calling unknown internal interface: {}", name);
-                ExternalValue::Null
-            }
+            context.external_interface.get_callback(name)
+                .map(|callback| callback.call(context, name, args))
         })
     }
 

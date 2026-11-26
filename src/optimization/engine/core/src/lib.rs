@@ -43,6 +43,7 @@ pub mod pixel_bender;
 mod player;
 mod prelude;
 pub mod socket;
+pub mod socket_tap;
 mod streams;
 pub mod string;
 mod system_properties;

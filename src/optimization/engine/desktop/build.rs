@@ -1,6 +1,9 @@
 use std::borrow::Cow;
 use std::env;
 use std::error::Error;
+use std::fmt::Write;
+use std::fs;
+use std::path::Path;
 use vergen::Emitter;
 use vergen::{Build, Cargo};
 use vergen_gitcl::Gitcl;
@@ -27,6 +30,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS not set");
     if target_os == "windows" {
         set_windows_resource()?;
+        embed_battle_icons()?;
     }
 
     println!("cargo:rerun-if-env-changed=CFG_RELEASE_CHANNEL");
@@ -60,6 +64,32 @@ fn get_channel() -> Cow<'static, str> {
     } else {
         Cow::Borrowed("local")
     }
+}
+
+fn embed_battle_icons() -> Result<(), Box<dyn Error>> {
+    let assets = Path::new("assets/battle-assistant");
+    println!("cargo:rerun-if-changed={}", assets.display());
+    let mut icons = Vec::new();
+    for category in ["pet", "equipment", "soul-card", "soul-artifact", "crystal-key"] {
+        for entry in fs::read_dir(assets.join(category))? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("png") {
+                let id = path.file_stem().and_then(|s| s.to_str()).ok_or("Invalid icon name")?;
+                if !id.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(format!("Invalid battle icon ID: {id}").into());
+                }
+                icons.push(format!("{category}/{id}.png"));
+            }
+        }
+    }
+    icons.sort_unstable();
+    let mut table = String::from("&[\n");
+    for icon in icons {
+        writeln!(table, r#"("/battle-assets/{icon}", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/battle-assistant/{icon}"))),"#)?;
+    }
+    table.push_str("]\n");
+    fs::write(Path::new(&env::var("OUT_DIR")?).join("battle_icons.rs"), table)?;
+    Ok(())
 }
 
 fn set_windows_resource() -> Result<(), Box<dyn Error>> {

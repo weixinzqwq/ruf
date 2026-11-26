@@ -10,6 +10,7 @@ Measures one normal close of the packaged Aola player after a game session.
 .NOTES
 Run without -Check when you intend to close the game. A timeout leaves it running.
 The result is displayed and saved in a new close-timing-*.json in aola-data\diagnostics.
+packetCapture reports retained packet/audit pairs for this process. -Check does not scan packet contents.
 The packaged copy targets the executable beside it. The source copy targets the long-run package.
 #>
 [CmdletBinding()]
@@ -50,6 +51,96 @@ function Find-SessionLog([string]$Prefix, [int]$TargetProcessId, [long]$StartUni
 
 function Test-NonnegativeInteger($Value) {
     return ($Value -is [long] -or $Value -is [int]) -and $Value -ge 0
+}
+
+function Read-CaptureSegment($Dir, $Suffix, $TargetProcessId, $StartUnixMs, $LastUnixMs, $Exited) {
+    $audit = Join-Path $Dir "aola-audit-$Suffix"
+    $packets = Join-Path $Dir "aola-recv-$Suffix"
+    $segment = [ordered]@{
+        status = 'unpaired'; auditFile = $null; packetFile = $null; packetBytes = $null
+        observedRows = $null; writtenRows = $null; actualRows = $null; reason = $null
+        droppedChunks = $null; gaps = $null; droppedLogRows = $null
+        disabledDirectionsAtStart = $null; disabledDirectionsAtEnd = $null
+    }
+    try {
+        if ([IO.File]::Exists($packets)) {
+            $segment.packetFile = [IO.Path]::GetFileName($packets)
+            $segment.packetBytes = (Get-Item -LiteralPath $packets).Length
+        }
+        if (-not [IO.File]::Exists($audit)) { return $segment }
+        $segment.auditFile = [IO.Path]::GetFileName($audit)
+        $first = Get-Content -LiteralPath $audit -Encoding UTF8 -TotalCount 1 | ConvertFrom-Json
+        if ($first.event -cne 'start' -or $first.processId -ne $TargetProcessId -or
+            $first.packetFile -cne [IO.Path]::GetFileName($packets)) { throw 'Invalid start' }
+        $utc = [DateTimeOffset]::Parse($first.timeUtc).ToUnixTimeMilliseconds()
+        if ($utc -lt $StartUnixMs -or $utc -gt $LastUnixMs) { return $null }
+        if (-not (Test-NonnegativeInteger $first.disabledDirections)) { throw 'Invalid disabledDirections' }
+        $segment.disabledDirectionsAtStart = $first.disabledDirections
+        $last = Get-Content -LiteralPath $audit -Encoding UTF8 -Tail 1 | ConvertFrom-Json
+        if ($last.event -cne 'end') {
+            if ($segment.packetFile) {
+                $segment.status = if ($Exited) { 'missing-end' } else { 'awaiting-end' }
+            }
+            return $segment
+        }
+        if ($last.processId -ne $TargetProcessId -or $last.epoch -ne $first.epoch -or
+            -not $last.PSObject.Properties['writeError'] -or -not (Test-NonnegativeInteger $last.writtenRows)) {
+            throw 'Invalid end'
+        }
+        if ($Exited -and ([DateTimeOffset]::Parse($last.timeUtc).ToUnixTimeMilliseconds() -gt $LastUnixMs)) {
+            throw 'End outside process lifetime'
+        }
+        $segment.writtenRows = $last.writtenRows
+        $segment.reason = $last.reason
+        if ($null -ne $last.writeError) { $segment.status = 'write-error'; return $segment }
+        if (-not $segment.packetFile) { return $segment }
+        foreach ($name in @('observedRows','droppedChunks','gaps','droppedLogRows')) {
+            if (-not (Test-NonnegativeInteger $first.$name) -or -not (Test-NonnegativeInteger $last.$name) -or
+                $last.$name -lt $first.$name) { throw 'Invalid counter' }
+            $segment[$name] = $last.$name - $first.$name
+        }
+        if (-not (Test-NonnegativeInteger $last.disabledDirections)) { throw 'Invalid disabledDirections' }
+        $segment.disabledDirectionsAtEnd = $last.disabledDirections
+        if ($Exited) {
+            # Count newline-delimited records without decoding or printing their payloads.
+            $reader = [IO.File]::OpenText($packets)
+            try {
+                $count = 0L
+                while ($null -ne $reader.ReadLine()) { $count++ }
+                $segment.actualRows = $count
+            } finally { $reader.Dispose() }
+        }
+        $segment.status = if ($segment.observedRows -ne ($segment.writtenRows + $segment.droppedLogRows) -or
+            ($Exited -and $segment.actualRows -ne $segment.writtenRows)) { 'count-mismatch' }
+        elseif ($segment.droppedChunks -or $segment.gaps -or $segment.droppedLogRows -or
+            $first.disabledDirections -or $last.disabledDirections) { 'capture-loss' }
+        elseif ($segment.writtenRows -eq 0) { 'empty' } else { 'recorded' }
+    } catch { $segment.status = 'unreadable' }
+    return $segment
+}
+
+function Get-PacketCapture([int]$TargetProcessId, [long]$StartUnixMs, [long]$LastUnixMs, [bool]$Exited) {
+    $dir = Join-Path $package 'aola-data\logs'
+    $result = [ordered]@{ status = 'not-found'; segments = @() }
+    if (-not [IO.Directory]::Exists($dir)) { return $result }
+    try {
+        $suffixes = foreach ($file in [IO.Directory]::EnumerateFiles($dir, "aola-*-$TargetProcessId.jsonl")) {
+            $name = [IO.Path]::GetFileName($file)
+            if ($name -notmatch "^aola-(?:audit|recv)-((\d{8}-\d{6}-\d{3})\d{6}-$TargetProcessId\.jsonl)$") { continue }
+            # The logger uses local time in both filenames and UTC in the audit header.
+            $stamp = [DateTimeOffset]::ParseExact($Matches[2], 'yyyyMMdd-HHmmss-fff',
+                [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeLocal)
+            $ms = $stamp.ToUnixTimeMilliseconds()
+            if ($ms -ge $StartUnixMs -and $ms -le $LastUnixMs) { $Matches[1] }
+        }
+        $result.segments = @(foreach ($suffix in ($suffixes | Sort-Object -Unique)) {
+            $segment = Read-CaptureSegment $dir $suffix $TargetProcessId $StartUnixMs $LastUnixMs $Exited
+            if ($null -ne $segment) { $segment }
+        })
+        if ($result.segments.Count -eq 1) { $result.status = $result.segments[0].status }
+        elseif ($result.segments.Count -gt 1) { $result.status = 'multiple-segments' }
+    } catch { $result.status = 'unreadable' }
+    return $result
 }
 
 function Get-WallElapsedMs($StartMs, $StopMs) {
@@ -311,7 +402,8 @@ try {
         return
     }
     if ($Check) {
-        [ordered]@{ status = 'ready'; processId = $game.Id; closePosted = $false } | ConvertTo-Json
+        $capture = Get-PacketCapture $game.Id $startedMs ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) $false
+        [ordered]@{ status = 'ready'; processId = $game.Id; closePosted = $false; packetCapture = $capture } | ConvertTo-Json -Depth 6
         return
     }
 
@@ -359,6 +451,7 @@ try {
         closePhasesStatus = $phases.status
         closePhasesFile = if ($phases.path) { 'aola-data\diagnostics\' + [IO.Path]::GetFileName($phases.path) } else { $null }
         phaseSummary = $phaseSummary
+        packetCapture = Get-PacketCapture $game.Id $startedMs $lastUnixMs ($null -ne $endMs)
         closeToFinalWallMs = Get-WallElapsedMs $postUnixMs $final.unixMs
         finalToProcessExitWallMs = Get-WallElapsedMs $final.unixMs $exitUnixMs
         finalToPhaseFinishWallMs = Get-WallElapsedMs $final.unixMs $phaseSummary.finishUnixMs

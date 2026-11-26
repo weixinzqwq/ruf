@@ -9,6 +9,7 @@ from pathlib import Path
 
 from capture_package import copy_licenses
 from pilot_resource import ROOT
+from patch_mypro_battle import active_version
 
 
 NOTICE_VERSION = "2026062579184482"
@@ -16,7 +17,7 @@ NOTICE_ORIGINAL = (
     ROOT / "resources/swf-reference/notice" / NOTICE_VERSION
     / f"messagesendservice~{NOTICE_VERSION}.swf"
 )
-BATTLE_VERSION = "261112849126071"
+BATTLE_VERSION = active_version()
 BATTLE_ORIGINAL = ROOT / "resources/original" / f"petfightnew~{BATTLE_VERSION}.swf"
 BACKPACK_VERSION = "2026111953323155"
 BACKPACK_ARCHIVED = ROOT / "resources/swf-reference/lifecycle" / BACKPACK_VERSION / f"newpetpackage~{BACKPACK_VERSION}.swf"
@@ -123,7 +124,10 @@ def package(output, executable, *, close_phases=False, orphan_goto=False, battle
                                      (b"AOLA_BATTLE_GLOW_REUSE", b"glowCacheRebuilds")):
             raise ValueError(f"Desktop executable lacks glow cache diagnostics: {executable}")
         if mypro_tools and any(image.find(marker) < 0 for marker in
-                               (b"AOLA_MYPRO_TOOLS", b"aolaMyProModelCandidate", b"morph.rules.replace")):
+                               (b"AOLA_MYPRO_TOOLS", b"aolaMyProModelCandidate", b"morph.rules.replace",
+                                b"aolaHideBattleDamage", b"aolaHideBattleHealing", b"aolaSkipBattleAnimations",
+                                b"aolaRefreshBattleBackground", b"setNativeAutoBattle", b"workshop.validate",
+                                b"onAolaOpenPanel", b"onAolaThemeApply", b"aolaLineupEditingAllowed")):
             raise ValueError(f"Desktop executable lacks the local tools and model rule support: {executable}")
         if battle_render:
             for marker in (b"AOLA_GOTO_TARGET_ONLY", b"AOLA_FUSE_GLOW", b"AOLA_ORDINARY_ORPHANS", b"AOLA_ORDINARY_BRANCH_PRUNE", b"AOLA_BATTLE_GC_CATCHUP"):
@@ -137,16 +141,19 @@ def package(output, executable, *, close_phases=False, orphan_goto=False, battle
             asset.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(original, asset)
         if mypro_tools:
+            from mypro_game_ui import build_bundle
+            build_bundle(staging / "swf-game-ui")
             profiles = (
                 ("battle", "patch_mypro_battle.py", ("swf-battle/mypro-model.swf",)),
                 ("backpack", "patch_mypro_backpack.py", ("swf-backpack/supplied-mypro.swf", "swf-backpack/archived-mypro.swf")),
             )
             for name, tool, outputs in profiles:
-                profile_dir = Path(work) / name
-                subprocess.run([sys.executable, Path(__file__).with_name(tool),
-                                "--output-dir", profile_dir], check=True)
-                for relative in outputs:
-                    shutil.copyfile(profile_dir / relative, staging / relative)
+                with tempfile.TemporaryDirectory(prefix="aola-swf-") as scratch:
+                    profile_dir = Path(scratch) / name
+                    subprocess.run([sys.executable, Path(__file__).with_name(tool),
+                                    "--output-dir", profile_dir], check=True)
+                    for relative in outputs:
+                        shutil.copyfile(profile_dir / relative, staging / relative)
         shutil.copyfile(executable, staging / "aola-native-test.exe")
         shutil.copyfile(ROOT / "src/tools/compare-long-run.py", staging / "compare-long-run.py")
         if close_phases:

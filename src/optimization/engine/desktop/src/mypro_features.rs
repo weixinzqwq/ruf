@@ -6,16 +6,27 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 pub mod morph;
+pub mod network;
+pub mod background;
+pub(crate) mod workshop;
+pub mod game_ui;
+pub mod lineups;
+mod battle_state;
+mod packet_log;
+mod protocol;
 
 pub fn battle_event(event:&str,id:u64) {
     match event {"battle-enter"=>morph::battle(true,id),"battle-exit"=>morph::battle(false,id),_=>{}}
 }
 
-const OPTIONS: [(&str, &str); 4] = [
+const OPTIONS: [(&str, &str); 7] = [
     ("hideNotice", "AOLA_HIDE_NOTICE"),
     ("blockWanyu", "AOLA_BLOCK_SKILL"),
     ("hideTransformPortrait", "AOLA_HIDE_TRANSFORM_PORTRAIT"),
     ("skipBattleBackdrop", "AOLA_SKIP_BATTLE_BACKDROP"),
+    ("hideBattleDamage", "AOLA_HIDE_BATTLE_DAMAGE"),
+    ("hideBattleHealing", "AOLA_HIDE_BATTLE_HEALING"),
+    ("skipBattleAnimations", "AOLA_SKIP_BATTLE_ANIMATIONS"),
 ];
 const INITIALIZED: u8 = 128;
 static DISPLAY: AtomicU8 = AtomicU8::new(0);
@@ -48,8 +59,10 @@ fn read_preferences(root: &Path, defaults: u8) -> Result<(u64,u8), String> {
     file.take(8193).read_to_end(&mut buf).map_err(|e|e.to_string())?;
     if buf.len()>8192 {return Err("Preferences too large".into());}
     let v:Value=serde_json::from_slice(&buf).map_err(|e|e.to_string())?;
-    if v["schemaVersion"]!=1 || v["values"].as_object().map(|m|m.len())!=Some(OPTIONS.len()) {return Err("Invalid preferences format".into());}
-    Ok((v["revision"].as_u64().ok_or("Invalid revision")?,edit(0,&v["values"])?))
+    let count=match v["schemaVersion"].as_u64() {Some(1)=>4,Some(2)=>OPTIONS.len(),_=>return Err("Invalid preferences format".into())};
+    let fields=v["values"].as_object().ok_or("Invalid preferences format")?;
+    if fields.len()!=count || !OPTIONS[..count].iter().all(|(key,_)|fields.contains_key(*key)) {return Err("Invalid preferences format".into());}
+    Ok((v["revision"].as_u64().ok_or("Invalid revision")?,edit(defaults,&v["values"])?))
 }
 
 fn save(root: &Path, revision:u64,bits:u8,defaults:u8) -> Result<(),String> {
@@ -62,7 +75,7 @@ fn save(root: &Path, revision:u64,bits:u8,defaults:u8) -> Result<(),String> {
     let path=root.join("display.json");
     let write=|| -> io::Result<()> {
         let mut f=fs::File::create(&tmp)?;
-        serde_json::to_writer_pretty(&mut f,&json!({"schemaVersion":1,"revision":revision+1,"values":values(bits)}))?;
+        serde_json::to_writer_pretty(&mut f,&json!({"schemaVersion":2,"revision":revision+1,"values":values(bits)}))?;
         f.write_all(b"\n")?; f.sync_all()?; drop(f);
         if path.exists() {fs::copy(&path,root.join("display.previous.json"))?;}
         fs::rename(&tmp,&path)
@@ -89,6 +102,7 @@ impl Features {
     pub fn new(root:PathBuf)->Self {
         let root=root.join("mypro");
         morph::init(root.clone());
+        background::init(&root);
         let defaults=OPTIONS.iter().enumerate().fold(0,|bits,(i,(_,env))|
             bits | (u8::from(std::env::var(env).as_deref()==Ok("1")) << i));
         DISPLAY.store(INITIALIZED|defaults,Ordering::Relaxed);
@@ -100,6 +114,8 @@ impl Features {
 
     pub fn capabilities(&self)->Value {
         json!({"settings.read":{"available":true,"reason":""},"settings.patch":{"available":true,"reason":""},
+            "workshop.validate":{"available":true,"reason":""},
+            "background.read":{"available":true},"background.choose":{"available":true},"background.clear":{"available":true},
             "morph.rules.read":{"available":true,"reason":""},"morph.rules.replace":{"available":true,"reason":""},
             "morph.restore":{"available":true,"reason":""}})
     }
@@ -109,7 +125,8 @@ impl Features {
         match name {
             "settings.read"=>Some(Ok(self.state.lock().unwrap().snapshot())),
             "settings.patch"=>Some(self.patch(payload)),
-            _=>morph::command(&self.root,name,payload),
+            "workshop.validate"=>Some(workshop::validate(payload)),
+            _=>background::command(name).or_else(||morph::command(&self.root,name,payload)),
         }
     }
     fn patch(&mut self,payload:&Value)->Result<Value,String> {
@@ -120,12 +137,14 @@ impl Features {
         if bits==s.bits {return Ok(s.snapshot());}
         let next_revision=s.revision.checked_add(1).ok_or("InvalidArguments: revision")?;
         let revision=s.revision; let root=self.root.clone(); let defaults=self.defaults; let state=self.state.clone();
-        s.stage="saving";let pending=s.snapshot();drop(s);
+        let previous=s.bits;
+        s.bits=bits; DISPLAY.store(INITIALIZED|bits,Ordering::Relaxed);
+        s.stage="saving";s.error=None;let pending=s.snapshot();drop(s);
         std::thread::spawn(move || {
             let result=save(&root,revision,bits,defaults).map(|()|(next_revision,bits));
             let latest=result.as_ref().err().filter(|e|e.starts_with("StaleContext")).and_then(|_|read_preferences(&root,defaults).ok());
             let mut s=state.lock().unwrap();
-            if let Some(snapshot)=latest {s.finish(Ok(snapshot));}
+            if result.is_err() {s.finish(Ok(latest.unwrap_or((revision,previous))));}
             s.finish(result);
         });
         Ok(pending)
@@ -141,6 +160,9 @@ mod tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         let bits=edit(4,&json!({"skipBattleBackdrop":true})).unwrap();
         assert_eq!(bits,12);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("display.json"),r#"{"schemaVersion":1,"revision":0,"values":{"hideNotice":false,"blockWanyu":false,"hideTransformPortrait":true,"skipBattleBackdrop":true}}"#).unwrap();
+        assert_eq!(read_preferences(&root,64).unwrap(),(0,76));
         assert!(edit(bits,&json!({"blockWanyu":1})).is_err());
         save(&root,0,bits,4).unwrap();
         assert_eq!(read_preferences(&root,4).unwrap(),(1,12));

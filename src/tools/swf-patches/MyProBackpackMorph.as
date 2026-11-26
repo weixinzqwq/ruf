@@ -1,5 +1,6 @@
 package aola.tools {
     import flash.display.BitmapData;
+    import flash.display.DisplayObject;
     import flash.display.Sprite;
     import flash.external.ExternalInterface;
     import flash.system.ApplicationDomain;
@@ -8,12 +9,126 @@ package aola.tools {
     import flash.utils.setTimeout;
     import flash.utils.clearTimeout;
     import flash.utils.getTimer;
+    import mmo.interfaces.IDataInitable;
 
     public final class MyProBackpackMorph {
         private static var active:Object;
         private static var cooldown:Dictionary = new Dictionary(true);
         private static var verified:Dictionary = new Dictionary(true);
         private static var reason:String;
+        private static var posterJob:Object;
+
+        public static function cancelPoster(layer:Sprite):void {
+            var job:Object = posterJob;
+            if (!job || job.layer !== layer) return;
+            posterJob = null;
+            clearTimeout(job.timer);
+            if (job.done != null) {
+                try { job.scheduler.cancel(job.url, job.done); } catch (ignored:Error) {}
+            }
+        }
+
+        public static function checkPoster(layer:Sprite,pdi:Object):void {
+            if (!posterJob || posterJob.layer !== layer) return;
+            if (!pdi || pdi.id != posterJob.pet || pdi.viewId != posterJob.source ||
+                pdi.specialSkinId != posterJob.skin || pdi.useDIYBgId != posterJob.diy) cancelPoster(layer);
+        }
+
+        // changeSkins calls this after drawing the official background. Only retire
+        // that background once every configured visual can actually be instantiated.
+        public static function poster(pdi:Object, service:Object, layer:Sprite, panel:Sprite, clear:Function):void {
+            if (!layer || !panel || !pdi || !ExternalInterface.available) return;
+            var job:Object;
+            try {
+                var source:int = pdi.viewId;
+                if (source <= 0) return;
+                var target:int = int(ExternalInterface.call("aolaMyProModelCandidate","portrait",source,false));
+                if (target <= 0) return;
+                if (posterJob) cancelPoster(posterJob.layer);
+                var binding:Number = Number(ExternalInterface.call("aolaMyProBinding"));
+                if (!(binding > 0)) return;
+                job = {source:source,target:target,binding:binding,pdi:pdi,pet:pdi.id,skin:pdi.specialSkinId,diy:pdi.useDIYBgId,layer:layer,panel:panel,clear:clear,
+                    assets:[],next:0,timer:0,url:null,done:null,domain:ApplicationDomain.currentDomain};
+                posterJob = job;
+                var info:Object = service.getPetSkinInfoBySkinId(target % 10000);
+                if (info && info.isSwitchPackageBG) {
+                    var r:Object = info.packageBackgroundRes;
+                    job.assets.push({path:r.resPath,cls:r.clsName,wide:!info.isSwitchPackageBGNormalSize});
+                }
+                if (info && info.hasBackground) {
+                    r = info.backgroundRes;
+                    var variant:Boolean = target > 10000 || service.isInMultiPetPackageState(info.skinId);
+                    job.assets.push({path:r.resPath,cls:r.clsName + (variant ? "_2" : ""),wide:false});
+                }
+                if (!job.assets.length) { failPoster(job,"config-missing"); return; }
+                loadPoster(job);
+            } catch (error:Error) { if (job) failPoster(job,"display-check-error"); }
+        }
+
+        private static function currentPoster(job:Object):Boolean {
+            return posterJob === job && job.pdi.viewId == job.source &&
+                Number(ExternalInterface.call("aolaMyProBinding")) == job.binding &&
+                int(ExternalInterface.call("aolaMyProModelCandidate","portrait",job.source,false)) == job.target;
+        }
+        private static function failPoster(job:Object, why:String):void {
+            if (posterJob !== job) return;
+            cancelPoster(job.layer);
+            try { ExternalInterface.call("aolaMyProModelUse","portrait",job.source,job.target,false,false,why); }
+            catch (ignored:Error) {}
+        }
+        private static function loadPoster(job:Object):void {
+            if (posterJob !== job) return;
+            try {
+                if (!currentPoster(job)) { cancelPoster(job.layer); return; }
+                var domain:ApplicationDomain = job.domain;
+                while (job.next < job.assets.length) {
+                    var asset:Object = job.assets[job.next];
+                    if (!asset.path || !asset.cls) { failPoster(job,"invalid-config"); return; }
+                    if (!domain.hasDefinition(asset.cls)) {
+                        if (asset.requested) { failPoster(job,"frame-missing"); return; }
+                        asset.requested = true;
+                        var params:Object = getDefinitionByName("mmo.loader.scheduler.ResParams");
+                        var priorities:Object = getDefinitionByName("mmo.loader.scheduler.ResPriority");
+                        var domainClass:Class = getDefinitionByName("mmo.loader.scheduler.ResDomain") as Class;
+                        job.scheduler = getDefinitionByName("mmo.loader.scheduler.ResScheduler");
+                        job.url = asset.path;
+                        var done:Function = function(...unused):void {
+                            if (posterJob !== job || job.done !== done) return;
+                            clearTimeout(job.timer);
+                            job.done = null;
+                            loadPoster(job);
+                        };
+                        job.done = done;
+                        job.timer = setTimeout(function():void { failPoster(job,"preload-timeout"); },20000);
+                        ExternalInterface.call("aolaMyProModelUse","portrait",job.source,job.target,false,false,"preload-pending");
+                        job.scheduler.getRes(params.create(asset.path,job.done,new domainClass(domain),priorities.PRELOAD,
+                            null,function(...unused):void { if (job.done === done) failPoster(job,"preload-error"); }));
+                        return;
+                    }
+                    if (!extendsType(domain,asset.cls,DisplayObject)) { failPoster(job,"class-mismatch"); return; }
+                    job.next++;
+                }
+                // Use the same visual initialization contract as PetSkinDataService.getView.
+                // Keep mapped art passive. Game buttons and the selected pet retain their official state.
+                for each (asset in job.assets) {
+                    var cls:Class = domain.getDefinition(asset.cls) as Class;
+                    var visual:DisplayObject = new cls() as DisplayObject;
+                    if (visual is IDataInitable) IDataInitable(visual).init({canInteract:false});
+                    var wrapper:Sprite = new Sprite();
+                    wrapper.mouseEnabled = wrapper.mouseChildren = false;
+                    wrapper.addChild(visual);
+                    if (asset.wide) { wrapper.name = "skin" + job.target; wrapper.x = -200; }
+                    asset.wrapper = wrapper;
+                }
+                if (!currentPoster(job)) { cancelPoster(job.layer); return; }
+                if (int(ExternalInterface.call("aolaMyProModelUse","portrait",job.source,job.target,false,true,"")) != job.target) {
+                    cancelPoster(job.layer); return;
+                }
+                cancelPoster(job.layer);
+                job.clear();
+                for each (asset in job.assets) (asset.wide ? job.panel : job.layer).addChild(asset.wrapper);
+            } catch (error:Error) { failPoster(job,"display-check-error"); }
+        }
         public static function resolve(source:int):int {
             if (source <= 0 || !ExternalInterface.available) return source;
             try {
