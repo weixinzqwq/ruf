@@ -1,3 +1,6 @@
+use ruffle_core::mypro_observer::{
+    MorphAssetKind, MorphAssetResult, MorphRuleSnapshot, install_morph_asset_sink, publish_morph_rules,
+};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
@@ -89,9 +92,8 @@ struct State {
     in_battle: bool,
     battle_id: Option<u64>,
     binding: u32,
-    bound: [bool; 4],
-    hits: [u64; 4],
-    waiting: u64,
+    hits: [u64; 3],
+    fallback: u64,
     recent: VecDeque<Lookup>,
     stage: &'static str,
     error: Option<String>,
@@ -100,41 +102,12 @@ struct Lookup {
     kind: &'static str,
     source: u32,
     target: u32,
-    face: bool,
-    binding: u32,
+    enemy: bool,
     state: &'static str,
-    reason: Option<&'static str>,
-    preparation: Option<Preparation>,
-}
-#[derive(Clone, Copy, PartialEq)]
-struct Preparation {
-    stage: &'static str,
-    part: u32,
-    total: u32,
 }
 
-pub fn readiness_reason(code: &str) -> Option<&'static str> {
-    [
-        "pm-data-missing",
-        "config-missing",
-        "frame-missing",
-        "invalid-config",
-        "class-mismatch",
-        "preload-pending",
-        "preload-error",
-        "preload-timeout",
-        "display-check-error",
-        "unsupported-id",
-    ]
-    .into_iter()
-    .find(|&known| known == code)
-}
-fn channel(name: &str) -> Option<(usize, &'static str)> {
-    ["body", "icon", "backpack", "portrait"]
-        .into_iter()
-        .enumerate()
-        .find(|(_, s)| *s == name)
-}
+const CHANNELS: [&str; 3] = ["body", "backpack", "portrait"];
+
 impl Default for State {
     fn default() -> Self {
         Self {
@@ -143,9 +116,8 @@ impl Default for State {
             in_battle: false,
             battle_id: None,
             binding: 1,
-            bound: [false; 4],
-            hits: [0; 4],
-            waiting: 0,
+            hits: [0; 3],
+            fallback: 0,
             recent: VecDeque::new(),
             stage: "loading",
             error: None,
@@ -169,120 +141,51 @@ impl State {
             self.battle_id = None;
         }
     }
-    fn proposed(&self, kind: &str, source: u32, face: bool) -> u32 {
-        let fallback = if kind == "portrait" { 0 } else { source };
-        let rules = if matches!(kind, "backpack" | "portrait") {
-            &self.desired
-        } else {
-            &self.battle_rules
+    fn rule_snapshot(&self) -> MorphRuleSnapshot {
+        let mappings = |rules: &Rules, target: fn(&Rule) -> Option<u32>| {
+            rules
+                .rows
+                .iter()
+                .filter(|_| rules.enabled)
+                .filter_map(|(&source, rule)| {
+                    target(rule).filter(|&id| id != source).map(|id| (source, id))
+                })
+                .collect()
         };
-        if !rules.enabled {
-            return fallback;
+        MorphRuleSnapshot {
+            enabled: self.desired.enabled,
+            revision: self.desired.revision,
+            enemy_enabled: self.battle_rules.enabled && self.battle_rules.enemy,
+            backpack_map: mappings(&self.desired, |r| r.backpack),
+            battle_map: mappings(&self.battle_rules, |r| r.fight),
+            poster_map: mappings(&self.desired, |r| r.portrait),
         }
-        let Some(rule) = rules.rows.get(&source) else {
-            return fallback;
+    }
+
+    fn observe(&mut self, kind: MorphAssetKind, source: u32, face: u8, result: MorphAssetResult) {
+        let i = match kind {
+            MorphAssetKind::Battle => 0,
+            MorphAssetKind::Backpack => 1,
+            MorphAssetKind::Poster => 2,
         };
-        match kind {
-            "body" if !face || rules.enemy => rule.fight,
-            "icon" => rule.fight,
-            "backpack" => rule.backpack,
-            "portrait" => rule.portrait,
-            _ => None,
-        }
-        .unwrap_or(fallback)
-    }
-    fn lookup(&mut self, kind: &'static str, source: u32, target: u32, face: bool) -> &mut Lookup {
-        let previous = self
-            .recent
-            .iter()
-            .position(|r| r.kind == kind && r.source == source && r.face == face)
-            .and_then(|index| self.recent.remove(index));
-        let row = previous
-            .filter(|r| r.target == target && r.binding == self.binding)
-            .unwrap_or(Lookup {
-                kind,
-                source,
-                target,
-                face,
-                binding: self.binding,
-                state: if target == 0 || (target == source && kind != "portrait") {
-                    "original"
-                } else {
-                    "requested"
-                },
-                reason: None,
-                preparation: None,
-            });
-        if self.recent.len() >= 24 {
-            self.recent.pop_back();
-        }
-        self.recent.push_front(row);
-        self.recent.front_mut().unwrap()
-    }
-    fn candidate(&mut self, kind: &'static str, source: u32, face: bool) -> u32 {
-        let target = self.proposed(kind, source, face);
-        self.lookup(kind, source, target, face);
-        target
-    }
-    fn use_target(
-        &mut self,
-        kind: &str,
-        source: u32,
-        target: u32,
-        face: bool,
-        ready: bool,
-        reason: Option<&'static str>,
-    ) -> (u32, bool) {
-        let Some((index, kind)) = channel(kind) else {
-            return (source, false);
+        let kind = CHANNELS[i];
+        let enemy = kind == "body" && face == 1;
+        let (target, status) = match result {
+            MorphAssetResult::Original => (source, "original"),
+            MorphAssetResult::Adapted(target) => {
+                self.hits[i] += 1;
+                (target, "selected")
+            }
+            MorphAssetResult::Fallback(target) => {
+                self.fallback += 1;
+                (target, "unavailable")
+            }
         };
-        if target == 0 || (source == target && kind != "portrait") || self.proposed(kind, source, face) != target {
-            return (if kind == "portrait" { 0 } else { source }, false);
-        }
-        let row = self.lookup(kind, source, target, face);
-        let status = if ready { "selected" } else { "unavailable" };
-        let reason = if ready { None } else { reason };
-        let changed = row.state != status || row.reason != reason;
-        row.state = status;
-        row.reason = reason;
-        if ready {
-            self.hits[index] += 1;
-            (target, changed)
-        } else {
-            self.waiting += 1;
-            (source, changed)
-        }
+        self.recent.retain(|r| !(r.kind == kind && r.source == source && r.enemy == enemy));
+        self.recent.truncate(23);
+        self.recent.push_front(Lookup { kind, source, target, enemy, state: status });
     }
-    fn note_progress(
-        &mut self,
-        kind: &str,
-        source: u32,
-        target: u32,
-        face: bool,
-        binding: u32,
-        progress: Preparation,
-    ) -> bool {
-        if binding != self.binding
-            || source == target
-            || self.proposed(kind, source, face) != target
-        {
-            return false;
-        }
-        let Some(row) = self.recent.iter_mut().find(|r| {
-            r.kind == kind
-                && r.source == source
-                && r.target == target
-                && r.face == face
-                && r.binding == binding
-        }) else {
-            return false;
-        };
-        if row.preparation == Some(progress) {
-            return false;
-        }
-        row.preparation = Some(progress);
-        true
-    }
+
     fn snapshot(&self) -> Value {
         let mut result = self.desired.file();
         let o = result.as_object_mut().unwrap();
@@ -292,13 +195,15 @@ impl State {
         o.insert("bindingId".into(), json!(self.binding));
         o.insert("stage".into(), json!(self.stage));
         o.insert("error".into(), json!(self.error));
-        o.insert("hits".into(),json!({"body":self.hits[0],"icon":self.hits[1],"backpack":self.hits[2],"portrait":self.hits[3],"waiting":self.waiting}));
-        o.insert("recent".into(),Value::Array(self.recent.iter().map(|e|json!({"kind":e.kind,"source":e.source,
-            "target":e.target,"face":e.face,"state":e.state,"reason":e.reason,
-            "preparation":e.preparation.map(|p|json!({"stage":p.stage,"part":p.part,"total":p.total}))})).collect()));
+        o.insert("hits".into(), json!({
+            "body":self.hits[0], "backpack":self.hits[1], "portrait":self.hits[2], "waiting":self.fallback
+        }));
+        o.insert("recent".into(), Value::Array(self.recent.iter().map(|r| json!({
+            "kind":r.kind,"source":r.source,"target":r.target,"face":r.enemy,"state":r.state
+        })).collect()));
         let mut channels = json!({});
-        for (i, name) in ["body", "icon", "backpack", "portrait"].into_iter().enumerate() {
-            channels[name] = json!({"available":self.bound[i],"reason":if self.bound[i]{"当前会话已到达展示入口"}else{"等待当前会话进入已识别的展示入口"}});
+        for name in CHANNELS {
+            channels[name] = json!({"available":true});
         }
         o.insert("capabilities".into(), channels);
         result
@@ -312,71 +217,20 @@ fn state() -> &'static Mutex<State> {
 pub(super) fn session() {
     let mut s = state().lock().unwrap();
     s.boundary(false);
-    s.bound = [false; 4];
-    s.hits = [0; 4];
-    s.waiting = 0;
+    s.hits = [0; 3];
+    s.fallback = 0;
     s.recent.clear();
+    publish_morph_rules(s.rule_snapshot());
 }
 pub(super) fn battle(enter: bool, id: u64) {
     let mut s = state().lock().unwrap();
     s.boundary(enter);
     s.battle_id = enter.then_some(id);
-}
-pub fn binding() -> u32 {
-    state().lock().unwrap().binding
+    publish_morph_rules(s.rule_snapshot());
 }
 
-pub fn candidate(kind: &str, source: u32, face: bool) -> u32 {
-    let mut s = state().lock().unwrap();
-    let Some((i, kind)) = channel(kind) else {
-        return source;
-    };
-    s.bound[i] = true;
-    s.candidate(kind, source, face)
-}
-pub fn apply(
-    kind: &str,
-    source: u32,
-    target: u32,
-    face: bool,
-    ready: bool,
-    reason: Option<&'static str>,
-) -> (u32, bool) {
-    state()
-        .lock()
-        .unwrap()
-        .use_target(kind, source, target, face, ready, reason)
-}
-pub fn progress(
-    kind: &str,
-    source: u32,
-    target: u32,
-    face: bool,
-    binding: u32,
-    stage: &str,
-    part: u32,
-    total: u32,
-) -> bool {
-    let Some(stage) = ["loading", "loaded", "load-error", "timeout"]
-        .into_iter()
-        .find(|&s| s == stage)
-    else {
-        return false;
-    };
-    if !(1..=16).contains(&total)
-        || !(1..=total).contains(&part)
-        || (stage == "loaded" && part != total)
-    {
-        return false;
-    }
-    state().lock().unwrap().note_progress(
-        kind,
-        source,
-        target,
-        face,
-        binding,
-        Preparation { stage, part, total },
-    )
+fn observe_asset(kind: MorphAssetKind, source: u32, face: u8, result: MorphAssetResult) {
+    state().lock().unwrap().observe(kind, source, face, result);
 }
 
 fn load(root: &Path) -> Result<Rules, String> {
@@ -435,7 +289,10 @@ fn persist(root: &Path, r: &Rules) -> Result<(), String> {
 fn finish(result: Result<Rules, String>) {
     let mut s = state().lock().unwrap();
     match result {
-        Ok(r) => s.publish(r),
+        Ok(r) => {
+            s.publish(r);
+            publish_morph_rules(s.rule_snapshot());
+        }
         Err(e) => {
             s.stage = "failed";
             s.error = Some(e);
@@ -443,6 +300,7 @@ fn finish(result: Result<Rules, String>) {
     }
 }
 pub(super) fn init(root: PathBuf) {
+    install_morph_asset_sink(observe_asset);
     std::thread::spawn(move || finish(load(&root)));
 }
 pub(super) fn command(root: &Path, name: &str, p: &Value) -> Option<Result<Value, String>> {
@@ -496,53 +354,55 @@ fn change(root: &Path, name: &str, p: &Value) -> Result<Value, String> {
 mod tests {
     use super::*;
     #[test]
-    fn aola_poster_uses_configured_skin_even_when_it_has_the_same_number_as_the_pet() {
-        let mut s = State::default();
-        assert_eq!(s.candidate("portrait",17,false),0);
-        s.boundary(true);
-        let p=json!({"rules":[{"originalId":17,"spskiId":17}],"enabled":true,"enemy":false});
-        s.publish(Rules::parse(&p,1).unwrap());
-        assert_eq!(s.candidate("portrait",17,false),17);
-        assert_eq!(s.use_target("portrait",17,17,false,true,None),(17,true));
-        assert_eq!(s.snapshot()["hits"]["portrait"],1);
-        s.publish(Rules::default());
-        assert_eq!(s.use_target("portrait",17,17,false,true,None),(0,false));
-    }
-    #[test]
     fn aola_mypro_morph_keeps_identity_and_battle_binding() {
-        let p = json!({"enabled":true,"enemy":false,"rules":{"skins":[{"originalId":"4","fightId":7,"backpackId":"/"},{"originalId":7,"fightId":"9"}]}});
+        let p = json!({"enabled":true,"enemy":true,"rules":{"skins":[
+            {"originalId":"4","fightId":7,"backpackId":12,"spskiId":45},
+            {"originalId":7,"fightId":"9"}
+        ]}});
         let mut s = State::default();
         s.publish(Rules::parse(&p, 1).unwrap());
         s.boundary(true);
-        assert_eq!(s.proposed("body", 4, true), 4);
-        assert_eq!(s.proposed("icon", 4, false), 7);
-        assert_eq!(
-            s.use_target("body", 4, 7, false, false, Some("frame-missing")),
-            (4, true)
-        );
-        assert_eq!(s.candidate("body", 4, false), 7);
-        assert_eq!(s.recent[0].state, "unavailable");
-        let part = Preparation {
-            stage: "loading",
-            part: 2,
-            total: 3,
-        };
-        assert_eq!(s.recent[0].reason, Some("frame-missing"));
-        assert!(s.note_progress("body", 4, 7, false, s.binding, part));
-        assert!(!s.note_progress("body", 4, 7, false, s.binding, part));
-        assert_eq!(s.use_target("body", 4, 7, false, true, None), (7, true));
+
+        let active = s.rule_snapshot();
+        assert!(active.enabled);
+        assert!(active.enemy_enabled);
+        assert_eq!(active.battle_map.get(&4), Some(&7));
+        assert_eq!(active.backpack_map.get(&4), Some(&12));
+        assert_eq!(active.poster_map.get(&4), Some(&45));
+
         s.publish(Rules {
             revision: 2,
             ..Default::default()
         });
-        assert_eq!(s.proposed("body", 4, false), 7);
+        let restored = s.rule_snapshot();
+        assert_eq!(restored.revision, 2);
+        assert!(!restored.enabled);
+        assert!(restored.enemy_enabled);
+        assert_eq!(restored.battle_map.get(&4), Some(&7));
+        assert!(restored.backpack_map.is_empty());
+        assert!(restored.poster_map.is_empty());
+
         s.boundary(false);
-        assert_eq!(s.proposed("body", 4, false), 4);
-        assert!(!s.note_progress("body", 4, 7, false, s.binding - 1, part));
+        assert!(s.rule_snapshot().battle_map.is_empty());
+        assert!(!s.rule_snapshot().enemy_enabled);
         let mut invalid = p;
         invalid["rules"]["skins"][1]["originalId"] = json!("4");
         assert!(Rules::parse(&invalid, 3).is_err());
     }
+
+    #[test]
+    fn aola_mypro_morph_reports_http_results_per_channel_and_side() {
+        let mut s = State::default();
+        s.observe(MorphAssetKind::Battle, 4, 1, MorphAssetResult::Original);
+        s.observe(MorphAssetKind::Battle, 4, 2, MorphAssetResult::Adapted(7));
+        s.observe(MorphAssetKind::Poster, 4, 0, MorphAssetResult::Fallback(12));
+        let snapshot = s.snapshot();
+        assert_eq!(snapshot["hits"]["body"], 1);
+        assert_eq!(snapshot["hits"]["waiting"], 1);
+        assert_eq!(snapshot["recent"][1]["target"], 7);
+        assert_eq!(snapshot["recent"][2]["face"], true);
+    }
+
     #[test]
     fn aola_mypro_legacy_rules_roundtrip_and_restore_keeps_user_entries() {
         let root = std::env::temp_dir().join(format!(

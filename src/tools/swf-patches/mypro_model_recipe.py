@@ -20,7 +20,7 @@ def contract(baseline, candidate):
         old_kind, old_offset, old_payload, old_raw = base_tags[old]
         at = old_offset + 8
         if kind == 82 and payload[4:payload.index(0, 4)] in (
-            b"aola.tools.MyProBattleModel", b"aola/tools/MyProBackpackMorph", b"aola.tools.MyProLineup",
+            b"aola/tools/MyProBackpackMorph", b"aola.tools.MyProLineup",
             b"aola.tools.MyProBattleEffects", b"aola.tools.MyProBattleBackground", b"aola.tools.MyProNativeAuto"
         ):
             changes.append((at, b"", raw))

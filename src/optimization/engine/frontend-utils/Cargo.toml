@@ -14,7 +14,7 @@ workspace = true
 default = ["native-tls"]
 cpal = ["dep:cpal", "dep:bytemuck", "ruffle_core/audio"]
 fs = []
-navigator = ["fs", "dep:async-io", "dep:tokio", "dep:lzma-rs", "dep:tempfile"]
+navigator = ["fs", "dep:async-io", "dep:tokio", "dep:flate2", "dep:lzma-rs", "dep:quick-xml", "dep:tempfile"]
 ui = []
 freetype = ["ui", "dep:freetype-rs"]
 
@@ -28,7 +28,9 @@ native-tls = ["reqwest/native-tls"]
 rustls-tls = ["reqwest/rustls-no-provider"]
 
 [dependencies]
+flate2 = { workspace = true, optional = true }
 lzma-rs = { workspace = true, optional = true }
+quick-xml = { workspace = true, optional = true }
 sha2 = { workspace = true }
 serde_json = { workspace = true }
 aoqi-assets = { path = "../aoqi-assets" }
@@ -53,7 +55,7 @@ reqwest = { workspace = true, features = [
     "http2",
     "system-proxy",
 ] }
-tokio = { workspace = true, features = ["net", "macros"], optional = true }
+tokio = { workspace = true, features = ["net", "macros", "rt", "sync"], optional = true }
 cpal = { workspace = true, optional = true }
 bytemuck = { workspace = true, optional = true }
 

@@ -1,5 +1,5 @@
 use crate::avm2::types::*;
-use crate::error::AbcParseError;
+use crate::error::{AbcParseError, UnexpectedEof};
 use crate::extensions::ReadSwfExt;
 
 type Result<T, E = AbcParseError> = std::result::Result<T, E>;
@@ -107,6 +107,10 @@ impl<'a> Reader<'a> {
         len: usize,
         mut read_elem: impl FnMut(&mut Self) -> Result<T>,
     ) -> Result<Vec<T>> {
+        // Every element in an ABC vector occupies at least one byte.
+        if len > self.input.len() {
+            return Err(UnexpectedEof(()).into());
+        }
         (0..len).map(|_| read_elem(self)).collect()
     }
 
@@ -287,16 +291,17 @@ impl<'a> Reader<'a> {
 
     fn read_metadata_entry(&mut self) -> Result<Metadata> {
         let name = self.read_index()?;
-        let num_items = self.read_u30()?;
+        let num_items = self.read_u30()? as usize;
         // Data includes the keys and values
-        let key_value_data = self.read_vec(num_items as usize * 2, Self::read_index)?;
+        let num_fields = num_items.checked_mul(2).ok_or(UnexpectedEof(()))?;
+        let key_value_data = self.read_vec(num_fields, Self::read_index)?;
 
         // Split them up here
-        let mut items = Vec::with_capacity(num_items as usize);
+        let mut items = Vec::with_capacity(num_items);
         for i in 0..num_items {
             items.push(MetadataItem {
-                key: key_value_data[i as usize],
-                value: key_value_data[(num_items + i) as usize],
+                key: key_value_data[i],
+                value: key_value_data[num_items + i],
             })
         }
 
@@ -385,14 +390,11 @@ impl<'a> Reader<'a> {
             }
         };
 
-        let mut metadata = vec![];
-        if flags & 0b0100_0000 != 0 {
-            let num_metadata = self.read_u30()?;
-            metadata.reserve(num_metadata as usize);
-            for _ in 0..num_metadata {
-                metadata.push(self.read_index()?);
-            }
-        }
+        let metadata = if flags & 0b0100_0000 != 0 {
+            self.read_vec_with_len(Self::read_index)?
+        } else {
+            Vec::new()
+        };
 
         Ok(Trait {
             name,
@@ -810,6 +812,15 @@ pub mod tests {
                 "Incorrectly parsed ABC.\nRead:\n{parsed:?}\n\nExpected:\n{abc_file:?}",
             );
         }
+    }
+
+    #[test]
+    fn read_trait_rejects_oversized_metadata_count() {
+        let data = [0, 0x40, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0x03];
+        assert!(matches!(
+            Reader::new(&data).read_trait(),
+            Err(AbcParseError::UnexpectedEof(_))
+        ));
     }
 
     #[test]

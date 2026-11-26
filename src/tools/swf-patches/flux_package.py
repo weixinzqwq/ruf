@@ -124,7 +124,7 @@ def package(output, executable, *, close_phases=False, orphan_goto=False, battle
                                      (b"AOLA_BATTLE_GLOW_REUSE", b"glowCacheRebuilds")):
             raise ValueError(f"Desktop executable lacks glow cache diagnostics: {executable}")
         if mypro_tools and any(image.find(marker) < 0 for marker in
-                               (b"AOLA_MYPRO_TOOLS", b"aolaMyProModelCandidate", b"morph.rules.replace",
+                               (b"AOLA_MYPRO_TOOLS", b"aolaMyProMorphRevision", b"morph.rules.replace",
                                 b"aolaHideBattleDamage", b"aolaHideBattleHealing", b"aolaSkipBattleAnimations",
                                 b"aolaRefreshBattleBackground", b"setNativeAutoBattle", b"workshop.validate",
                                 b"onAolaOpenPanel", b"onAolaThemeApply", b"aolaLineupEditingAllowed")):

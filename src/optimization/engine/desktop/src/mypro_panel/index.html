@@ -576,7 +576,7 @@ async function readSettings() {
   showSettings();
 }
 const morphKeys=["originalId","remark","backpackId","fightId","spskiId"];
-const channelNames={body:"战斗主体",icon:"战斗头像",backpack:"背包模型",portrait:"海报"};
+const channelNames={body:"战斗主体",backpack:"背包模型",portrait:"海报"};
 let morph=null, draft=null, morphDirty=false, formDirty=false, writingMorph=false, afterSave=false, morphRequest=0;
 function formRule(row) {
   const result={};
@@ -638,36 +638,18 @@ function showMorph() {
     const line=document.createElement("div"),term=document.createElement("dt"),value=document.createElement("dd");
     term.textContent=name;
     value.textContent=!ch?.available ? (ch?.reason || "未就绪") :
-      Number.isSafeInteger(morph.hits?.[key]) ? "查询命中 "+morph.hits[key]+" 次" : "可用";
+      Number.isSafeInteger(morph.hits?.[key]) ? "替换分片 "+morph.hits[key]+" 次" : "可用";
     line.append(term,value);nodes.push(line);
   }
   $("morph-channels").replaceChildren(...nodes);
-  const states={original:"沿用官方",requested:"等待检查",unavailable:"目标未就绪，已回退",selected:"已选目标素材键"};
-  const reasons={
-    "pm-data-missing":"游戏中缺少目标亚比资料","config-missing":"目标模型配置尚未载入",
-    "frame-missing":"目标动画仍缺少帧图","invalid-config":"目标动画配置无法解析",
-    "class-mismatch":"目标素材类型不匹配","preload-pending":"正在准备目标素材",
-    "preload-error":"目标资源加载失败","preload-timeout":"目标资源加载超时",
-    "display-check-error":"检查目标素材时出错","unsupported-id":"当前入口不支持此素材 ID"
-  };
+  const states={original:"沿用官方",unavailable:"目标素材失败，已回退",selected:"已交付替换素材"};
   const recent=(morph.recent || []).slice(0,24).map(r=>{
     const side=r.kind==="body" ? (r.face ? "敌方" : "己方") : "";
     const mapped=r.target>0 && r.target!==r.source ? " → "+r.target : "";
-    const info=[states[r.state]||"状态未知"];
-    if(r.state==="unavailable"){
-      if(reasons[r.reason]) info.push(reasons[r.reason]);
-      const p=r.preparation;
-      if(p){
-        const part="第 "+p.part+"/"+p.total+" 片";
-        const progress={loading:"正在加载"+part,loaded:p.total+" 片已返回，下次展示重新检查",
-          "load-error":part+"加载失败",timeout:part+"加载超时"};
-        if(progress[p.stage]) info.push(progress[p.stage]);
-      }
-    }
-    return side+(channelNames[r.kind]||"素材")+" "+r.source+mapped+" · "+info.join("；");
+    return side+(channelNames[r.kind]||"素材")+" "+r.source+mapped+" · "+(states[r.state]||"状态未知");
   });
   $("morph-recent").textContent=recent.join("\n") || "尚未收到素材查询。";
-  if(Number(morph.hits?.waiting)>0)$("morph-status").textContent+=" · 等待或回退 "+morph.hits.waiting+" 次";
+  if(Number(morph.hits?.waiting)>0)$("morph-status").textContent+=" · 回退 "+morph.hits.waiting+" 次";
   updateMorphButtons();
 }
 async function readMorph() {

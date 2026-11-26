@@ -23,6 +23,7 @@ const MAX_METADATA: usize = 16 * 1024;
 pub struct AoqiCache {
     root: PathBuf,
     entries: PathBuf,
+    adapted: PathBuf,
     budget: Option<Arc<budget::DiskBudget>>,
 }
 
@@ -30,6 +31,16 @@ pub struct CachedResource {
     pub bytes: Vec<u8>,
     pub response_url: String,
     pub content_type: Option<String>,
+}
+
+pub(super) struct AdaptedKey(String);
+
+impl AdaptedKey {
+    pub(super) fn new(source: u32, target: u32, part: &str, version: &str) -> Option<Self> {
+        let name = format!("v1-{source}-{target}-{part}-{version}.swf");
+        let path = Path::new(&name);
+        (path.file_name() == Some(path.as_os_str()) && adapted_entry_name(path)).then_some(Self(name))
+    }
 }
 
 impl AoqiCache {
@@ -41,13 +52,16 @@ impl AoqiCache {
         let entries = root.join("v1");
         fs::create_dir_all(&entries)?;
         no_link(&entries)?;
-        Ok(Self { root, entries, budget: None })
+        let adapted = root.join("morph-adapted");
+        fs::create_dir_all(&adapted)?;
+        no_link(&adapted)?;
+        Ok(Self { root, entries, adapted, budget: None })
     }
 
     pub(super) fn for_aola(root: PathBuf) -> io::Result<Self> {
         let mut cache = Self::new(root)?;
         if let Some(limit) = budget::configured_limit(std::env::var("AOLA_DISK_CACHE_BUDGET_MB").ok().as_deref()) {
-            match budget::DiskBudget::start(&cache.entries, limit) {
+            match budget::DiskBudget::start(&cache.entries, &cache.adapted, limit) {
                 Ok(budget) => cache.budget = Some(budget),
                 Err(error) => tracing::warn!("Static cache budget unavailable: {error}"),
             }
@@ -80,7 +94,7 @@ impl AoqiCache {
             Err(error) => return Err(error),
             Ok(_) => no_link(&path)?,
         }
-        let mut file = match File::open(path) {
+        let mut file = match File::open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -104,6 +118,7 @@ impl AoqiCache {
         if bytes.len() > MAX_RESOURCE || !valid_payload(url, &bytes)
             || metadata["size"].as_u64() != Some(bytes.len() as u64)
             || metadata["sha256"].as_str() != Some(hash(&bytes).as_str()) { return Ok(None); }
+        touch(&path);
         Ok(Some(CachedResource {
             bytes, response_url: response_url.to_owned(),
             content_type: metadata["contentType"].as_str().map(str::to_owned),
@@ -114,7 +129,12 @@ impl AoqiCache {
         if status != 200 || !public_resource_url(url) || !public_resource_url(response_url)
             || headers.contains_key("set-cookie") || headers.contains_key("content-range") { return None; }
         let control = headers.get_all("cache-control").iter().filter_map(|v| v.to_str().ok()).collect::<Vec<_>>().join(",").to_ascii_lowercase();
-        if control.split(',').any(|v| matches!(v.trim().split('=').next().unwrap_or(""), "no-store" | "no-cache" | "private")) { return None; }
+        let immutable_morph = versioned_morph_path(url.path()) && response_url.path() == url.path();
+        let allows_storage = control.split(',').all(|value| {
+            let directive = value.split('=').next().unwrap_or("").trim();
+            directive != "no-store" && (immutable_morph || !matches!(directive, "no-cache" | "private"))
+        });
+        if !allows_storage { return None; }
         let vary = headers.get_all("vary").iter().filter_map(|v| v.to_str().ok()).collect::<Vec<_>>().join(",").to_ascii_lowercase();
         if vary.split(',').any(|v| matches!(v.trim(), "*" | "cookie" | "authorization")) { return None; }
         let content_type = headers.get("content-type").and_then(|v| v.to_str().ok()).map(str::to_owned);
@@ -126,6 +146,7 @@ impl AoqiCache {
             name.rsplit_once('~').is_some_and(|(_, suffix)| suffix.split('.').next().is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())))
         });
         let max_age = control.split(',').find_map(|part| part.trim().strip_prefix("max-age=").and_then(|s| s.trim_matches('"').parse::<u64>().ok()))
+            .filter(|&age| age > 0 || !immutable_morph)
             .unwrap_or(if versioned { 7 * 86400 } else { 300 }).min(365 * 86400);
         if max_age == 0 { return None; }
         Some(CachePolicy { response_url: response_url.to_string(), content_type, expires_at: now().saturating_add(max_age) })
@@ -143,20 +164,58 @@ impl AoqiCache {
             "status":200,"size":bytes.len(),"sha256":hash(bytes),"expiresAt":policy.expires_at,
         }))?;
         if metadata.len() > MAX_METADATA { return Ok(false); }
+        self.write_entry(&path, |file| {
+            file.write_all(MAGIC)?;
+            file.write_all(&(metadata.len() as u32).to_le_bytes())?;
+            file.write_all(&metadata)?;
+            file.write_all(bytes)
+        })
+    }
+
+    pub(super) fn open_adapted(&self, key: &AdaptedKey) -> io::Result<Option<(File, u64)>> {
+        no_link(&self.root)?;
+        no_link(&self.adapted)?;
+        let path = self.adapted.join(&key.0);
+        match no_link(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+            Ok(()) => {}
+        }
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let length = file.metadata()?.len();
+        if !adapted_header(&mut file, length)? {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid adapted SWF"));
+        }
+        use std::io::Seek;
+        file.rewind()?;
+        touch(&path);
+        Ok(Some((file, length)))
+    }
+
+    pub(super) fn store_adapted(&self, key: &AdaptedKey, bytes: &[u8]) -> io::Result<bool> {
+        if !adapted_header(&mut &*bytes, bytes.len() as u64)? { return Ok(false); }
+        no_link(&self.root)?;
+        no_link(&self.adapted)?;
+        self.write_entry(&self.adapted.join(&key.0), |file| file.write_all(bytes))
+    }
+
+    fn write_entry(&self, path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<bool> {
+        if path.exists() { no_link(path)?; }
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
         let temporary = path.with_extension(format!("partial-{}-{nonce}", std::process::id()));
         let mut file = OpenOptions::new().write(true).create_new(true).open(&temporary)?;
         let result = (|| {
-            file.write_all(MAGIC)?;
-            file.write_all(&(metadata.len() as u32).to_le_bytes())?;
-            file.write_all(&metadata)?;
-            file.write_all(bytes)?;
+            write(&mut file)?;
             file.sync_all()?;
             drop(file);
             if let Some(budget) = &self.budget {
-                budget.publish(&temporary, &path)
+                budget.publish(&temporary, path)
             } else {
-                fs::rename(&temporary, &path).map(|_| true)
+                fs::rename(&temporary, path).map(|_| true)
             }
         })();
         if !matches!(result, Ok(true)) { let _ = fs::remove_file(temporary); }
@@ -169,6 +228,8 @@ impl AoqiCache {
         no_link(&self.root)?;
         let mut files = 0_u64;
         let mut bytes = 0_u64;
+        let mut adapted_files = 0_u64;
+        let mut adapted_bytes = 0_u64;
         let mut legacy_files = 0_u64;
         let mut legacy_bytes = 0_u64;
         let mut pending = vec![self.root.clone()];
@@ -184,11 +245,14 @@ impl AoqiCache {
                 else if metadata.is_file() {
                     if path.parent() == Some(self.entries.as_path()) && path.extension().is_some_and(|ext| ext == "cache") {
                         files += 1; bytes += metadata.len();
+                    } else if directory == self.adapted && adapted_entry_name(&path) {
+                        adapted_files += 1; adapted_bytes += metadata.len();
                     } else { legacy_files += 1; legacy_bytes += metadata.len(); }
                 }
             }
         }
         Ok(json!({"root":self.root.to_string_lossy(),"format":"aoqi-static-cache-v1","entries":files,"diskBytes":bytes,
+            "morphAdaptedEntries":adapted_files,"morphAdaptedDiskBytes":adapted_bytes,
             "legacyFiles":legacy_files,"legacyBytes":legacy_bytes,"legacyReadable":false}))
     }
 
@@ -203,6 +267,44 @@ pub struct CachePolicy {
 }
 
 fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
+fn touch(path: &Path) {
+    if let Ok(file) = OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(SystemTime::now());
+    }
+}
+
+fn versioned_morph_path(path: &str) -> bool {
+    ["/play/fightassets/bitmap/", "/play/peticon/movie/", "/play/pet/petskin/background/"]
+        .iter().any(|prefix| path.starts_with(prefix))
+        && path.strip_suffix(".swf").and_then(|path| path.rsplit_once('~'))
+            .is_some_and(|(_, version)| numeric_version(version))
+}
+
+pub(super) fn numeric_version(version: &str) -> bool {
+    !version.is_empty() && version.len() <= 24 && version.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn adapted_entry_name(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else { return false; };
+    let Some(name) = name.strip_prefix("v1-").and_then(|name| name.strip_suffix(".swf")) else { return false; };
+    let mut fields = name.splitn(3, '-');
+    let source = fields.next().and_then(|id| id.parse::<u32>().ok());
+    let target = fields.next().and_then(|id| id.parse::<u32>().ok());
+    let Some((part, version)) = fields.next().and_then(|rest| rest.rsplit_once('-')) else { return false; };
+    source.is_some_and(|id| id > 0) && target.is_some_and(|id| id > 0)
+        && source != target && numeric_version(version)
+        && matches!(part, "poster" | "backpack-0" | "backpack-1" | "backpack-2" | "backpack-3"
+            | "battle-1-0" | "battle-1-1" | "battle-1-2" | "battle-2-0" | "battle-2-1" | "battle-2-2")
+}
+
+fn adapted_header(reader: &mut impl Read, length: u64) -> io::Result<bool> {
+    if !(8..=MAX_RESOURCE as u64).contains(&length) { return Ok(false); }
+    let mut prefix = [0; 8];
+    reader.read_exact(&mut prefix)?;
+    let declared = u64::from(u32::from_le_bytes(prefix[4..].try_into().unwrap()));
+    Ok(&prefix[..3] == b"FWS" && prefix[3] != 0 && declared == length)
+}
+
 fn hash(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
 fn no_link(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
@@ -371,6 +473,18 @@ mod tests {
         }
         assert!(AoqiCache::response_policy(&url(), &url(),206,&HeaderMap::new()).is_none());
         assert!(AoqiCache::response_policy(&url(), &url(),404,&HeaderMap::new()).is_none());
+    }
+
+    #[test]
+    fn versioned_morph_leaves_ignore_conservative_cdn_revalidation_headers() {
+        let url = Url::parse("https://aola.100bt.com/play/peticon/movie/type0/petmovie6044/petmovie6044_0~1210.swf").unwrap();
+        let unversioned = Url::parse(url.as_str().replace("~1210", "").as_str()).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("cache-control", "private, no-cache, max-age=0".parse().unwrap());
+        assert!(AoqiCache::response_policy(&url, &url, 200, &headers).is_some());
+        assert!(AoqiCache::response_policy(&unversioned, &unversioned, 200, &headers).is_none());
+        headers.append("cache-control", "no-store".parse().unwrap());
+        assert!(AoqiCache::response_policy(&url, &url, 200, &headers).is_none());
     }
 
     #[test]

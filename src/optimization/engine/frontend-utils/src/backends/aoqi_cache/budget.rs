@@ -1,4 +1,4 @@
-use super::{hash, is_link, no_link, public_resource_url, valid_payload, MAGIC, MAX_METADATA, MAX_RESOURCE};
+use super::{adapted_entry_name, adapted_header, hash, is_link, no_link, public_resource_url, valid_payload, MAGIC, MAX_METADATA, MAX_RESOURCE};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -29,7 +29,7 @@ struct ActiveBudgets {
 }
 
 impl DiskBudget {
-    pub(super) fn start(entries: &Path, limit: u64) -> io::Result<Arc<Self>> {
+    pub(super) fn start(entries: &Path, adapted: &Path, limit: u64) -> io::Result<Arc<Self>> {
         static ACTIVE: OnceLock<Mutex<ActiveBudgets>> = OnceLock::new();
         let mut active = ACTIVE.get_or_init(Default::default).lock().unwrap();
         let lock_path = entries.join(LOCK_NAME);
@@ -52,11 +52,12 @@ impl DiskBudget {
         active.directories.retain(|_, value| value.strong_count() > 0);
         let (writes, receiver) = mpsc::sync_channel(1);
         let directory = entries.to_owned();
+        let adapted_directory = adapted.to_owned();
         std::thread::Builder::new().name("aola-cache-budget".into()).spawn(move || {
             // Scan at startup. After writes, coalesce checks across a 30 s window.
             // An idle or read-only directory requires no periodic work.
             loop {
-                let retry_busy = match trim(&directory, limit) {
+                let retry_busy = match trim(&directory, &adapted_directory, limit) {
                     Ok(()) => false,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
                     Err(error) => {
@@ -135,12 +136,12 @@ fn recognized(path: &Path, length: u64) -> io::Result<bool> {
     Ok(valid_payload(&url, &prefix[..count]))
 }
 
-fn visit(entries: &Path, mut entry: impl FnMut(PathBuf, fs::Metadata)) -> io::Result<()> {
+fn visit(entries: &Path, accepts: fn(&Path) -> bool, mut entry: impl FnMut(PathBuf, fs::Metadata)) -> io::Result<()> {
     no_link(entries.parent().ok_or_else(|| io::Error::other("Missing cache root"))?)?;
     no_link(entries)?;
     for item in fs::read_dir(entries)? {
         let path = item?.path();
-        if !entry_name(&path) { continue; }
+        if !accepts(&path) { continue; }
         if let Ok(metadata) = fs::symlink_metadata(&path) && metadata.is_file() && !is_link(&metadata) {
             entry(path, metadata);
         }
@@ -148,10 +149,13 @@ fn visit(entries: &Path, mut entry: impl FnMut(PathBuf, fs::Metadata)) -> io::Re
     Ok(())
 }
 
-fn trim(entries: &Path, limit: u64) -> io::Result<()> {
+fn trim(entries: &Path, adapted: &Path, limit: u64) -> io::Result<()> {
     // Below budget only filenames and filesystem metadata are inspected.
     let mut upper_bound = 0u64;
-    visit(entries, |_, m| upper_bound = upper_bound.saturating_add(m.len()))?;
+    let directories = [(entries, entry_name as fn(&Path) -> bool), (adapted, adapted_entry_name)];
+    for (directory, accepts) in directories {
+        visit(directory, accepts, |_, m| upper_bound = upper_bound.saturating_add(m.len()))?;
+    }
     if upper_bound <= limit { return Ok(()); }
 
     let lock_path = entries.join(LOCK_NAME);
@@ -166,13 +170,20 @@ fn trim(entries: &Path, limit: u64) -> io::Result<()> {
     // belonging to this cache; legacy and malformed files do not consume its budget.
     let mut owned = Vec::<(SystemTime, PathBuf, u64)>::new();
     let mut total = 0u64;
-    visit(entries, |path, metadata| {
-        if let Ok(modified) = metadata.modified()
-            && recognized(&path, metadata.len()).unwrap_or(false) {
-            total = total.saturating_add(metadata.len());
-            owned.push((modified, path, metadata.len()));
-        }
-    })?;
+    for (directory, accepts) in directories {
+        visit(directory, accepts, |path, metadata| {
+            let length = metadata.len();
+            let valid = if directory == adapted {
+                File::open(&path).and_then(|mut file| adapted_header(&mut file, length))
+            } else {
+                recognized(&path, length)
+            };
+            if let Ok(modified) = metadata.modified() && valid.unwrap_or(false) {
+                total = total.saturating_add(length);
+                owned.push((modified, path, length));
+            }
+        })?;
+    }
     if total <= limit { return Ok(()); }
     owned.sort_unstable();
     let before = total;
@@ -180,7 +191,7 @@ fn trim(entries: &Path, limit: u64) -> io::Result<()> {
     for (modified, path, size) in owned {
         if total <= target { break; }
         no_link(entries.parent().unwrap())?;
-        no_link(entries)?;
+        no_link(path.parent().unwrap())?;
         if no_link(&path).is_ok()
             && let Ok(current) = fs::symlink_metadata(&path)
             && current.len() == size && current.modified().ok() == Some(modified)
@@ -195,7 +206,7 @@ fn trim(entries: &Path, limit: u64) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::AoqiCache;
+    use super::super::{AdaptedKey, AoqiCache};
     use reqwest::header::HeaderMap;
 
     fn store(cache: &AoqiCache, id: u8) -> (Url, PathBuf) {
@@ -247,9 +258,9 @@ mod tests {
         #[cfg(not(any(windows, unix)))]
         let linked = false;
         // The unrecognized files alone must never trigger eviction.
-        trim(&cache.entries, 5 * size).unwrap();
+        trim(&cache.entries, &cache.adapted, 5 * size).unwrap();
         assert!(files.iter().all(|p| p.exists()));
-        let _budget = DiskBudget::start(&cache.entries, 4 * size).unwrap();
+        let _budget = DiskBudget::start(&cache.entries, &cache.adapted, 4 * size).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while files[1].exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -265,14 +276,14 @@ mod tests {
     fn aola_disk_budget_cross_instance_gate_keeps_published_files_whole() {
         let temp = tempfile::tempdir().unwrap();
         let mut cache = AoqiCache::new(temp.path().join("cache")).unwrap();
-        let budget = DiskBudget::start(&cache.entries, u64::MAX).unwrap();
-        let second = DiskBudget::start(&cache.entries, u64::MAX).unwrap();
+        let budget = DiskBudget::start(&cache.entries, &cache.adapted, u64::MAX).unwrap();
+        let second = DiskBudget::start(&cache.entries, &cache.adapted, u64::MAX).unwrap();
         assert!(Arc::ptr_eq(&budget, &second));
         cache.budget = Some(budget.clone());
         let (url, file) = store(&cache, 1);
         let gate = File::open(&budget.lock_path).unwrap();
         gate.lock_shared().unwrap();
-        assert_eq!(trim(&cache.entries, 1).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(trim(&cache.entries, &cache.adapted, 1).unwrap_err().kind(), io::ErrorKind::WouldBlock);
         drop(gate);
         let gate = File::open(&budget.lock_path).unwrap();
         gate.lock().unwrap();
@@ -283,7 +294,31 @@ mod tests {
         drop(gate);
         assert!(cache.store(&url, &policy, b"CWS\x09\x08\0\0\0").unwrap());
         assert_eq!(cache.lookup(&url).unwrap().unwrap().bytes[0], b'C');
-        trim(&cache.entries, 1).unwrap();
+        trim(&cache.entries, &cache.adapted, 1).unwrap();
         assert!(!file.exists());
+    }
+
+    #[test]
+    fn aola_disk_budget_combines_official_and_adapted_lru() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = AoqiCache::new(temp.path().join("cache")).unwrap();
+        let (url, official) = store(&cache, 1);
+        let key = AdaptedKey::new(5336, 6044, "battle-2-0", "1210").unwrap();
+        let adapted = cache.adapted.join(&key.0);
+        let mut bytes = vec![0; 1024];
+        bytes[..8].copy_from_slice(b"FWS\x09\x00\x04\x00\x00");
+        assert!(cache.store_adapted(&key, &bytes).unwrap());
+        let (file, length) = cache.open_adapted(&key).unwrap().unwrap();
+        drop(file);
+        assert_eq!(length, 1024);
+        assert_eq!(cache.stats().unwrap()["morphAdaptedEntries"], 1);
+        OpenOptions::new().write(true).open(&adapted).unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1700000000)).unwrap();
+        File::create(cache.entries.join(LOCK_NAME)).unwrap();
+        trim(&cache.entries, &cache.adapted, 1024).unwrap();
+        assert!(!adapted.exists());
+        assert!(official.exists());
+        assert_eq!(cache.lookup(&url).unwrap().unwrap().bytes, b"FWS\x09\x08\0\0\0");
+        assert!(AdaptedKey::new(1, 2, "x/../../v1-123-456-poster", "1210").is_none());
     }
 }

@@ -92,7 +92,7 @@ impl PerformanceLog {
                 "libraryGpuSweepCpuMs":gc.library_gpu_cache_sweep.total_ns as f64/1e6,
                 "orphanSlots":gc.orphan_slots});
         let mut row = json!({
-            "schema":7,"game":"aola","build":BUILD,"fluxPortBuild":"aola-flux-v1","myProPortBuild":"aola-mypro-v1",
+            "schema":7,"game":"aola","build":BUILD,"fluxPortBuild":"aola-flux-v1","myProPortBuild":"aola-mypro-morph-http-v1",
             "longRunBuild":"aola-weak-keys-battle-gc-v1",
             "weakDictionary":{"inserted":gc.weak_dictionary_inserted, "pruned":gc.weak_dictionary_pruned},
             "battleMaintenance":{"entries":gc.battle_entries, "exits":gc.battle_exits,

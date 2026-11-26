@@ -8,6 +8,8 @@ mod aola_game_ui;
 mod aola_backpack_edits;
 mod aola_battle_edits;
 mod aola_notice_edits;
+mod aola_morph_intercept;
+mod aola_morph_transform;
 
 use crate::backends::navigator::fetch::{Response, ResponseBody};
 use crate::backends::aoqi_cache::{AoqiCache, CachingResponse};
@@ -97,6 +99,7 @@ pub struct ExternalNavigatorBackend<F: FutureSpawner<Error>, I: NavigatorInterfa
     interface: I,
 
     aoqi_cache: Option<AoqiCache>,
+    morph_catalog: Option<aola_morph_intercept::Catalog>,
     aola_pet_patch: Option<aola_pet_patch::PetPatch>,
     aola_lifecycle: Option<aola_lifecycle::Trial>,
     display_patches: Vec<Arc<aola_display_patch::DisplayPatch>>,
@@ -167,6 +170,7 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
             content,
             interface,
             aoqi_cache: None,
+            morph_catalog: None,
             aola_pet_patch: None,
             aola_lifecycle: None,
             display_patches: Vec::new(),
@@ -188,6 +192,7 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
 
     pub fn with_aola_cache(mut self, root: PathBuf) -> io::Result<Self> {
         self.aoqi_cache = Some(AoqiCache::for_aola(root)?);
+        self.morph_catalog = Some(Default::default());
         Ok(self)
     }
 
@@ -344,6 +349,14 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
             AoqiCache::accepts_request(&request, &processed_url)
                 && self.cookie_store.cookies(&processed_url).is_none()
         });
+        let morph = self.morph_catalog.as_ref().filter(|_| cache.is_some()).and_then(|catalog| {
+            aola_morph_intercept::try_match(&request, &processed_url)
+                .map(|selection| (selection, catalog.clone()))
+        });
+        let catalog_request = self.morph_catalog.as_ref().filter(|_| {
+            aola_morph_intercept::is_catalog_request(&request, &processed_url)
+                && self.cookie_store.cookies(&processed_url).is_none()
+        }).map(|catalog| (catalog.clone(), processed_url.clone()));
 
         let error_trial = lifecycle.clone();
         let fetch: OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> = match processed_url.scheme() {
@@ -397,6 +410,10 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
                 })
             }
             _ => Box::pin(async move {
+                if let (Some((selection, catalog)), Some(cache)) = (morph, &cache)
+                    && let Some(response) = selection.replace(&processed_url, cache, &catalog, client.as_deref(), &cookie_store).await {
+                    return Ok(response);
+                }
                 if let Some(cache) = &cache {
                     let worker_cache = cache.clone();
                     let worker_url = processed_url.clone();
@@ -489,6 +506,9 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
         }
         if let Some(selection) = game_ui {
             return Box::pin(async move { Ok(selection.wrap(fetch.await?)) });
+        }
+        if let Some((catalog, url)) = catalog_request {
+            return Box::pin(async move { Ok(aola_morph_intercept::capture_catalog(catalog, url, fetch.await?)) });
         }
         fetch
     }
@@ -1086,6 +1106,76 @@ mod tests {
         assert!(backend.fetch(Request::get("https://aoqi.100bt.com/play/missing~124.swf".into())).await.is_err());
         backend.cookie_store.add_cookie_str("session=synthetic-test-only", &url);
         assert!(backend.fetch(Request::get(url.to_string())).await.is_err(), "requests carrying implicit cookies must bypass cache");
+    }
+
+    #[tokio::test]
+    async fn morph_fetch_adapts_official_target_then_streams_disk_and_restores_source() {
+        use aola_morph_transform::tests::fixture;
+        use ruffle_core::mypro_observer::{MorphRuleSnapshot, publish_morph_rules};
+        use ruffle_core::swf::{self, Compression, DefineBinaryData, Header, SwfStr, SymbolClassLink, Tag, TagCode};
+
+        struct ResetRules;
+        impl Drop for ResetRules {
+            fn drop(&mut self) { publish_morph_rules(MorphRuleSnapshot::default()); }
+        }
+        let _reset = ResetRules;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("cache");
+        let cache = AoqiCache::new(root.clone()).unwrap();
+        let mut backend = new_test_backend(false).with_aola_cache(root).unwrap();
+        backend.client = None;
+
+        let source = Url::parse("https://aola.100bt.com/play/peticon/movie/type0/petmovie431/petmovie431_0~17.swf").unwrap();
+        let target = Url::parse("https://aola.100bt.com/play/peticon/movie/type0/petmovie12345/petmovie12345_0~42.swf").unwrap();
+        let catalog = Url::parse("https://aola.100bt.com/play/versiondata~10.swf").unwrap();
+        let original = fixture(Compression::None, TagCode::DoAbc2,
+            &["mmo.peticon.PetMovie431_1", "mmo.peticon.PetMovie431Config"]);
+        let replacement = fixture(Compression::Zlib, TagCode::DoAbc2,
+            &["mmo.peticon.PetMovie12345_2", "mmo.peticon.PetMovie12345Config"]);
+        let xml = br#"<version><f n="peticon/movie/type0/petmovie12345/petmovie12345_0" v="42" /></version>"#;
+        let mut catalog_bytes = Vec::new();
+        swf::write_swf(&Header::default_with_swf_version(18), &[
+            Tag::DefineBinaryData(DefineBinaryData { id: 1, data: xml }),
+            Tag::SymbolClass(vec![SymbolClassLink {
+                id: 1, class_name: SwfStr::from_utf8_str("mmo.versiondata.VersionData_versionClass"),
+            }]),
+        ], &mut catalog_bytes).unwrap();
+        for (url, bytes) in [(&source, &original), (&target, &replacement), (&catalog, &catalog_bytes)] {
+            let policy = AoqiCache::response_policy(url, url, 200, &header::HeaderMap::new()).unwrap();
+            assert!(cache.store(url, &policy, bytes).unwrap());
+        }
+        publish_morph_rules(MorphRuleSnapshot {
+            enabled: true, revision: 1, backpack_map: [(431, 12345)].into(), ..Default::default()
+        });
+
+        async fn get(backend: &ExternalNavigatorBackend<TestFutureSpawner, ()>, url: &Url) -> Box<dyn SuccessResponse> {
+            backend.fetch(Request::get(url.to_string())).await.ok().unwrap()
+        }
+        assert_eq!(get(&backend, &source).await.body().await.unwrap(), original, "catalog unavailable");
+        assert_eq!(get(&backend, &catalog).await.body().await.unwrap(), catalog_bytes);
+        let response = get(&backend, &source).await;
+        assert_eq!(response.url(), source.as_str());
+        let adapted = response.body().await.unwrap();
+        let movie = swf::decompress_swf(adapted.as_slice()).unwrap();
+        let parsed = swf::parse_swf(&movie).unwrap();
+        assert!(parsed.tags.iter().any(|tag| matches!(tag, Tag::SymbolClass(links)
+            if links.iter().any(|link| link.class_name.as_bytes() == b"mmo.peticon.PetMovie431_2"))));
+        assert_eq!(cache.stats().unwrap()["morphAdaptedEntries"], 1);
+        assert_eq!(cache.lookup(&target).unwrap().unwrap().bytes, replacement);
+        assert_eq!(cache.lookup(&source).unwrap().unwrap().bytes, original);
+
+        let official = cache.root().join("v1");
+        let offline = cache.root().join("offline-test");
+        std::fs::rename(&official, &offline).unwrap();
+        let mut response = get(&backend, &source).await;
+        assert_eq!(response.expected_length().unwrap(), Some(adapted.len() as u64));
+        assert_eq!(response.next_chunk().await.unwrap().unwrap(), adapted);
+        assert!(response.next_chunk().await.unwrap().is_none());
+        drop(response);
+        std::fs::rename(&offline, &official).unwrap();
+
+        publish_morph_rules(MorphRuleSnapshot { revision: 2, ..Default::default() });
+        assert_eq!(get(&backend, &source).await.body().await.unwrap(), original);
     }
 
     #[tokio::test]

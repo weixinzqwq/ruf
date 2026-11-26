@@ -125,7 +125,7 @@ pub fn diagnostic_enabled(meta: &tracing::Metadata<'_>) -> bool {
     }
     matches!(
         meta.target(),
-        "aola_notice" | "aola_battle" | "aola_backpack" | "aola_game_ui"
+        "aola_notice" | "aola_battle" | "aola_backpack" | "aola_game_ui" | "aola_morph_http"
     ) || meta.target() == "aola_swf_lifecycle"
         || meta.target() == "aola_swf_operation"
         || meta.target() == "aola_pet_patch"
@@ -258,14 +258,14 @@ impl Visit for SwfLifecycleFields {
     fn record_str(&mut self, field: &Field, value: &str) {
         if matches!(
             field.name(),
-            "mode" | "resource" | "version" | "source" | "result"
+            "mode" | "resource" | "version" | "source" | "result" | "kind" | "reason" | "catalog_url"
         ) {
             self.0.insert(field.name().into(), value.into());
         }
     }
     fn record_u64(&mut self, field: &Field, value: u64) {
-        if field.name() == "bytes" {
-            self.0.insert("bytes".into(), value.into());
+        if matches!(field.name(), "bytes" | "source" | "target" | "face" | "part" | "entries") {
+            self.0.insert(field.name().into(), value.into());
         }
     }
     fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
@@ -303,7 +303,7 @@ impl<S: Subscriber> Layer<S> for DiagnosticLayer {
         let target = event.metadata().target();
         if matches!(
             target,
-            "aola_swf_lifecycle" | "aola_notice" | "aola_battle" | "aola_backpack" | "aola_game_ui"
+            "aola_swf_lifecycle" | "aola_notice" | "aola_battle" | "aola_backpack" | "aola_game_ui" | "aola_morph_http"
         ) {
             let mut fields = SwfLifecycleFields::default();
             event.record(&mut fields);
@@ -314,6 +314,7 @@ impl<S: Subscriber> Layer<S> for DiagnosticLayer {
                     "aola_battle" => "battle-swf",
                     "aola_backpack" => "backpack-swf",
                     "aola_game_ui" => "game-ui-resource",
+                    "aola_morph_http" => "morph-http",
                     _ => "swf-lifecycle",
                 }
                 .into(),
@@ -479,96 +480,12 @@ impl ExternalInterfaceProvider for AolaInterface {
             "aolaLineupEditingAllowed" => return Value::Bool(crate::mypro_host::enabled() && !crate::mypro_services::in_battle()),
             _ => {}
         }
-        if name == "aolaMyProBinding" {
-            return Value::from(if crate::mypro_host::enabled() {
-                crate::mypro_features::morph::binding()
-            } else {
-                0
-            });
-        }
-        if matches!(
-            name,
-            "aolaMyProModelCandidate" | "aolaMyProModelUse" | "aolaMyProModelProgress"
-        ) {
-            let args = arguments(args);
-            let integer = |v: &Value| match v {
-                Value::Number(n) if n.fract() == 0.0 && (1.0..=f64::from(i32::MAX)).contains(n) => {
-                    Some(*n as u32)
-                }
-                _ => None,
-            };
-            let Some(source) = args.get(1).and_then(integer) else {
-                return args.get(1).cloned().unwrap_or(Value::Undefined);
-            };
-            if !crate::mypro_host::enabled() {
-                return Value::from(source);
+        if name == "aolaMyProMorphRevision" {
+            if !crate::mypro_host::enabled() || crate::mypro_services::in_battle() {
+                return Value::Undefined;
             }
-            let selected = match (name, args) {
-                ("aolaMyProModelCandidate", [Value::String(kind), _, Value::Bool(face)]) => {
-                    crate::mypro_features::morph::candidate(kind, source, *face)
-                }
-                (
-                    "aolaMyProModelUse",
-                    [
-                        Value::String(kind),
-                        _,
-                        target,
-                        Value::Bool(face),
-                        Value::Bool(ready),
-                        extra @ ..,
-                    ],
-                ) if extra.len() <= 1 => {
-                    let Some(target) = integer(target) else {
-                        return Value::from(source);
-                    };
-                    let reason = match extra {
-                        [Value::String(code)] if !ready => {
-                            crate::mypro_features::morph::readiness_reason(code)
-                        }
-                        _ => None,
-                    };
-                    let (selected, changed) = crate::mypro_features::morph::apply(
-                        kind, source, target, *face, *ready, reason,
-                    );
-                    if changed {
-                        write_event(
-                            json!({"type":"model-display","elapsedMs":elapsed_ms() as u64,"kind":kind,
-                            "sourceId":source,"targetId":target,"face":face,"selectedId":selected,"reason":reason}),
-                        );
-                    }
-                    selected
-                }
-                (
-                    "aolaMyProModelProgress",
-                    [
-                        Value::String(kind),
-                        _,
-                        target,
-                        Value::Bool(face),
-                        binding,
-                        Value::String(stage),
-                        part,
-                        total,
-                    ],
-                ) => {
-                    if let (Some(target), Some(binding), Some(part), Some(total)) = (
-                        integer(target),
-                        integer(binding),
-                        integer(part),
-                        integer(total),
-                    ) && crate::mypro_features::morph::progress(
-                        kind, source, target, *face, binding, stage, part, total,
-                    ) {
-                        write_event(
-                            json!({"type":"model-preload","elapsedMs":elapsed_ms() as u64,"kind":kind,
-                            "sourceId":source,"targetId":target,"face":face,"binding":binding,"stage":stage,"part":part,"total":total}),
-                        );
-                    }
-                    source
-                }
-                _ => source,
-            };
-            return Value::from(selected);
+            let revision = ruffle_core::mypro_observer::morph_rule_snapshot().revision;
+            return Value::Number(revision as f64);
         }
         if name == "aolaBlockSkill" {
             return self.skill_result(args);

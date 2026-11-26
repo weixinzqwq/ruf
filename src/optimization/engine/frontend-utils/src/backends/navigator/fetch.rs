@@ -2,11 +2,16 @@ use reqwest::Response as ReqwestResponse;
 use ruffle_core::backend::navigator::{OwnedFuture, SuccessResponse};
 use ruffle_core::loader::Error;
 use ruffle_core::swf::Encoding;
+use std::fs::File;
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 
 pub enum ResponseBody {
     /// The response's body comes from a file.
     File(Result<Vec<u8>, std::io::Error>),
+
+    /// An opened disk cache entry, read only when the caller consumes it.
+    Disk(Arc<Mutex<File>>, u64),
 
     /// The response's body comes from the network.
     ///
@@ -14,6 +19,12 @@ pub enum ResponseBody {
     /// owned futures. A synchronous lock is used here as we do not
     /// expect contention on this lock.
     Network(Arc<Mutex<Option<ReqwestResponse>>>),
+}
+
+impl ResponseBody {
+    pub(super) fn disk(file: File, length: u64) -> Self {
+        Self::Disk(Arc::new(Mutex::new(file)), length)
+    }
 }
 
 pub struct Response {
@@ -83,6 +94,9 @@ impl SuccessResponse for Response {
             ResponseBody::File(file) => {
                 Box::pin(async move { file.map_err(|e| Error::FetchError(e.to_string())) })
             }
+            ResponseBody::Disk(file, length) => Box::pin(async move {
+                read_disk(file, length as usize, true).await
+            }),
             ResponseBody::Network(response) => Box::pin(async move {
                 let result = response
                     .lock()
@@ -135,6 +149,13 @@ impl SuccessResponse for Response {
                     }
                 })
             }
+            ResponseBody::Disk(file, _) => {
+                let file = file.clone();
+                Box::pin(async move {
+                    let bytes = read_disk(file, 64 * 1024, false).await?;
+                    Ok((!bytes.is_empty()).then_some(bytes))
+                })
+            }
             ResponseBody::Network(response) => {
                 let response = response.clone();
                 Box::pin(async move {
@@ -166,6 +187,7 @@ impl SuccessResponse for Response {
     fn expected_length(&self) -> Result<Option<u64>, Error> {
         match &self.response_body {
             ResponseBody::File(file) => Ok(file.as_ref().map(|file| file.len() as u64).ok()),
+            ResponseBody::Disk(_, length) => Ok(Some(*length)),
             ResponseBody::Network(response) => {
                 let lock = response.lock().expect("no recursive locks");
                 let response = lock.as_ref().expect("Body cannot already be consumed");
@@ -173,4 +195,19 @@ impl SuccessResponse for Response {
             }
         }
     }
+}
+
+async fn read_disk(file: Arc<Mutex<File>>, length: usize, complete: bool) -> Result<Vec<u8>, Error> {
+    super::spawn_tokio(async move {
+        tokio::task::spawn_blocking(move || {
+            let mut file = file.lock().map_err(|_| std::io::Error::other("Cache read lock poisoned"))?;
+            let mut bytes = Vec::with_capacity(length);
+            (&mut *file).take(length as u64).read_to_end(&mut bytes)?;
+            if complete && bytes.len() != length {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Adapted cache entry truncated"));
+            }
+            Ok(bytes)
+        }).await
+    }).await.map_err(|error| Error::FetchError(error.to_string()))?
+        .map_err(|error| Error::FetchError(error.to_string()))
 }
