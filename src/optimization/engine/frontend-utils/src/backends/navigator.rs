@@ -41,6 +41,8 @@ use tokio::net::TcpStream;
 use tracing::warn;
 use url::{ParseError, Url};
 
+const USER_AGENT: &str = concat!("Ruffle/", env!("CARGO_PKG_VERSION"), " (https://ruffle.rs)");
+
 pub trait NavigatorInterface: Clone + Send + 'static {
     fn navigate_to_website(&self, url: Url);
 
@@ -87,6 +89,7 @@ pub struct ExternalNavigatorBackend<F: FutureSpawner<Error>, I: NavigatorInterfa
     // Client to use for network requests
     client: Option<Rc<reqwest::Client>>,
     cookie_store: Arc<cookie::Jar>,
+    proxy: Option<Proxy>,
 
     socket_allowed: HashSet<String>,
 
@@ -100,6 +103,7 @@ pub struct ExternalNavigatorBackend<F: FutureSpawner<Error>, I: NavigatorInterfa
 
     aoqi_cache: Option<AoqiCache>,
     morph_catalog: Option<aola_morph_intercept::Catalog>,
+    morph_client: Option<reqwest::Client>,
     aola_pet_patch: Option<aola_pet_patch::PetPatch>,
     aola_lifecycle: Option<aola_lifecycle::Trial>,
     display_patches: Vec<Arc<aola_display_patch::DisplayPatch>>,
@@ -124,11 +128,7 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
         let cookie_store = Arc::new(cookie::Jar::default());
         let mut builder = reqwest::ClientBuilder::new()
             .cookie_provider(cookie_store.clone())
-            .user_agent(concat!(
-                "Ruffle/",
-                env!("CARGO_PKG_VERSION"),
-                " (https://ruffle.rs)"
-            ));
+            .user_agent(USER_AGENT);
 
         if let Some(referer) = referer {
             let mut headers = header::HeaderMap::new();
@@ -140,15 +140,15 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
             cookie_store.add_cookie_str(&cookie, &base_url);
         }
 
-        if let Some(proxy) = proxy {
-            match Proxy::all(proxy.clone()) {
-                Ok(proxy) => {
-                    builder = builder.proxy(proxy);
-                }
-                Err(e) => {
-                    tracing::error!("Couldn't configure proxy {proxy}: {e}")
-                }
+        let proxy = proxy.and_then(|url| match Proxy::all(url.clone()) {
+            Ok(proxy) => Some(proxy),
+            Err(error) => {
+                tracing::error!("Couldn't configure proxy {url}: {error}");
+                None
             }
+        });
+        if let Some(proxy) = &proxy {
+            builder = builder.proxy(proxy.clone());
         }
 
         let client = builder.build().ok().map(Rc::new);
@@ -163,6 +163,7 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
             future_spawner,
             client,
             cookie_store,
+            proxy,
             base_url,
             upgrade_to_https,
             socket_allowed,
@@ -171,6 +172,7 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
             interface,
             aoqi_cache: None,
             morph_catalog: None,
+            morph_client: None,
             aola_pet_patch: None,
             aola_lifecycle: None,
             display_patches: Vec::new(),
@@ -193,6 +195,13 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
     pub fn with_aola_cache(mut self, root: PathBuf) -> io::Result<Self> {
         self.aoqi_cache = Some(AoqiCache::for_aola(root)?);
         self.morph_catalog = Some(Default::default());
+        let mut builder = reqwest::Client::builder().user_agent(USER_AGENT).cookie_store(false);
+        if let Some(proxy) = &self.proxy {
+            builder = builder.proxy(proxy.clone());
+        }
+        self.morph_client = builder.build().inspect_err(|error| {
+            tracing::warn!("Couldn't create anonymous Aola resource client: {error}");
+        }).ok();
         Ok(self)
     }
 
@@ -344,19 +353,19 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
             .find(|p| p.recipe.accepts(&request, &processed_url)).cloned();
         let client = self.client.clone();
         let cookie_store = self.cookie_store.clone();
+        let morph_client = self.morph_client.clone();
         ruffle_core::aola_panel_diagnostics::resource(processed_url.as_str(), "resource-request", 0);
-        let cache = self.aoqi_cache.clone().filter(|_| {
-            AoqiCache::accepts_request(&request, &processed_url)
-                && self.cookie_store.cookies(&processed_url).is_none()
-        });
+        let cache = self.aoqi_cache.clone()
+            .filter(|_| AoqiCache::accepts_request(&request, &processed_url));
         let morph = self.morph_catalog.as_ref().filter(|_| cache.is_some()).and_then(|catalog| {
             aola_morph_intercept::try_match(&request, &processed_url)
                 .map(|selection| (selection, catalog.clone()))
         });
         let catalog_request = self.morph_catalog.as_ref().filter(|_| {
             aola_morph_intercept::is_catalog_request(&request, &processed_url)
-                && self.cookie_store.cookies(&processed_url).is_none()
         }).map(|catalog| (catalog.clone(), processed_url.clone()));
+        let public_morph_request = cache.is_some() && self.morph_catalog.is_some()
+            && (catalog_request.is_some() || aola_morph_intercept::parse_versioned_asset(&processed_url).is_some());
 
         let error_trial = lifecycle.clone();
         let fetch: OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> = match processed_url.scheme() {
@@ -411,15 +420,19 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
             }
             _ => Box::pin(async move {
                 if let (Some((selection, catalog)), Some(cache)) = (morph, &cache)
-                    && let Some(response) = selection.replace(&processed_url, cache, &catalog, client.as_deref(), &cookie_store).await {
+                    && let Some(response) = selection.replace(&processed_url, cache, &catalog, morph_client.as_ref()).await {
                     return Ok(response);
                 }
-                if let Some(cache) = &cache {
+                let no_session_cookie = cache.is_some() && cookie_store.cookies(&processed_url).is_none();
+                if let Some(cache) = cache.as_ref().filter(|_| public_morph_request || no_session_cookie) {
                     let worker_cache = cache.clone();
                     let worker_url = processed_url.clone();
                     match ruffle_core::aoqi_work::blocking(move || worker_cache.lookup(&worker_url)).await
                         .unwrap_or_else(|error| Err(std::io::Error::other(error))) {
-                        Ok(Some(hit)) if Url::parse(&hit.response_url).ok().is_some_and(|url| cookie_store.cookies(&url).is_none()) => {
+                        Ok(Some(hit)) if Url::parse(&hit.response_url).ok().is_some_and(|url| {
+                            (public_morph_request && url.path() == processed_url.path())
+                                || (no_session_cookie && cookie_store.cookies(&url).is_none())
+                        }) => {
                             ruffle_core::aola_panel_diagnostics::resource(processed_url.as_str(), "resource-cache", hit.bytes.len() as u64);
                             let text_encoding = hit.content_type.as_deref().and_then(get_encoding);
                             let redirected = hit.response_url != processed_url.as_str();
@@ -433,7 +446,8 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
                         Err(error) => tracing::warn!("Static resource cache read failed: {error}"),
                     }
                 }
-                let client = client.ok_or_else(|| ErrorResponse {
+                let anonymous_client = morph_client.as_ref().filter(|_| public_morph_request);
+                let client = anonymous_client.or(client.as_deref()).ok_or_else(|| ErrorResponse {
                     url: processed_url.to_string(),
                     error: Error::FetchError("Network unavailable".to_string()),
                 })?;
@@ -473,7 +487,10 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
                 let status = response.status().as_u16();
                 ruffle_core::aola_panel_diagnostics::resource(processed_url.as_str(), "resource-status", status as u64);
                 let redirected = *response.url() != processed_url;
-                let cache_policy = cache.as_ref().filter(|_| cookie_store.cookies(response.url()).is_none())
+                let cache_policy = cache.as_ref().filter(|_| {
+                    (anonymous_client.is_some() && response.url().path() == processed_url.path())
+                        || (no_session_cookie && cookie_store.cookies(response.url()).is_none())
+                })
                     .and_then(|_| AoqiCache::response_policy(&processed_url, response.url(), status, response.headers()));
                 if !response.status().is_success() {
                     if let Some(patch) = &display_patch { patch.recipe.audit("network", "http-error"); }
@@ -761,7 +778,7 @@ mod tests {
     // and local IO to execute, but small enough to fail tests quickly.
     const TIMEOUT: Duration = Duration::from_secs(1);
 
-    struct TestFutureSpawner;
+    pub(super) struct TestFutureSpawner;
 
     impl<E: 'static> FutureSpawner<E> for TestFutureSpawner {
         fn spawn(&self, future: OwnedFuture<(), E>) {
@@ -805,7 +822,7 @@ mod tests {
         };
     }
 
-    fn new_test_backend(socket_allow: bool) -> ExternalNavigatorBackend<TestFutureSpawner, ()> {
+    pub(super) fn new_test_backend(socket_allow: bool) -> ExternalNavigatorBackend<TestFutureSpawner, ()> {
         let url = Url::parse("https://example.com/path/").unwrap();
         ExternalNavigatorBackend::new(
             url.clone(),
@@ -1111,23 +1128,46 @@ mod tests {
     #[tokio::test]
     async fn morph_fetch_adapts_official_target_then_streams_disk_and_restores_source() {
         use aola_morph_transform::tests::fixture;
-        use ruffle_core::mypro_observer::{MorphRuleSnapshot, publish_morph_rules};
+        use ruffle_core::mypro_observer::{
+            MorphAssetKind, MorphAssetResult, MorphRuleSnapshot, install_morph_asset_sink,
+            publish_morph_rules,
+        };
         use ruffle_core::swf::{self, Compression, DefineBinaryData, Header, SwfStr, SymbolClassLink, Tag, TagCode};
+
+        static LAST_REPORT: Mutex<Option<MorphAssetResult>> = Mutex::new(None);
+        fn capture_report(kind: MorphAssetKind, source: u32, face: u8, result: MorphAssetResult) {
+            if matches!(kind, MorphAssetKind::Backpack) && source == 431 && face == 0 {
+                *LAST_REPORT.lock().unwrap() = Some(result);
+            }
+        }
 
         struct ResetRules;
         impl Drop for ResetRules {
-            fn drop(&mut self) { publish_morph_rules(MorphRuleSnapshot::default()); }
+            fn drop(&mut self) {
+                publish_morph_rules(MorphRuleSnapshot::default());
+                let _ = LAST_REPORT.lock().unwrap().take();
+            }
         }
         let _reset = ResetRules;
+        install_morph_asset_sink(capture_report);
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("cache");
         let cache = AoqiCache::new(root.clone()).unwrap();
         let mut backend = new_test_backend(false).with_aola_cache(root).unwrap();
         backend.client = None;
+        backend.morph_client = None;
 
         let source = Url::parse("https://aola.100bt.com/play/peticon/movie/type0/petmovie431/petmovie431_0~17.swf").unwrap();
         let target = Url::parse("https://aola.100bt.com/play/peticon/movie/type0/petmovie12345/petmovie12345_0~42.swf").unwrap();
         let catalog = Url::parse("https://aola.100bt.com/play/versiondata~10.swf").unwrap();
+        let login_cookie = "session=synthetic-morph-login";
+        backend.cookie_store.add_cookie_str(
+            &format!("{login_cookie}; Domain=.100bt.com; Path=/"),
+            &source,
+        );
+        for url in [&source, &target, &catalog] {
+            assert_eq!(backend.cookie_store.cookies(url).unwrap(), login_cookie);
+        }
         let original = fixture(Compression::None, TagCode::DoAbc2,
             &["mmo.peticon.PetMovie431_1", "mmo.peticon.PetMovie431Config"]);
         let replacement = fixture(Compression::Zlib, TagCode::DoAbc2,
@@ -1152,9 +1192,11 @@ mod tests {
             backend.fetch(Request::get(url.to_string())).await.ok().unwrap()
         }
         assert_eq!(get(&backend, &source).await.body().await.unwrap(), original, "catalog unavailable");
+        assert!(matches!(LAST_REPORT.lock().unwrap().take(), Some(MorphAssetResult::Fallback(12345))));
         assert_eq!(get(&backend, &catalog).await.body().await.unwrap(), catalog_bytes);
         let response = get(&backend, &source).await;
         assert_eq!(response.url(), source.as_str());
+        assert!(matches!(LAST_REPORT.lock().unwrap().take(), Some(MorphAssetResult::Adapted(12345))));
         let adapted = response.body().await.unwrap();
         let movie = swf::decompress_swf(adapted.as_slice()).unwrap();
         let parsed = swf::parse_swf(&movie).unwrap();
@@ -1171,11 +1213,13 @@ mod tests {
         assert_eq!(response.expected_length().unwrap(), Some(adapted.len() as u64));
         assert_eq!(response.next_chunk().await.unwrap().unwrap(), adapted);
         assert!(response.next_chunk().await.unwrap().is_none());
+        assert!(matches!(LAST_REPORT.lock().unwrap().take(), Some(MorphAssetResult::Adapted(12345))));
         drop(response);
         std::fs::rename(&offline, &official).unwrap();
 
         publish_morph_rules(MorphRuleSnapshot { revision: 2, ..Default::default() });
         assert_eq!(get(&backend, &source).await.body().await.unwrap(), original);
+        assert!(matches!(LAST_REPORT.lock().unwrap().take(), Some(MorphAssetResult::Original)));
     }
 
     #[tokio::test]

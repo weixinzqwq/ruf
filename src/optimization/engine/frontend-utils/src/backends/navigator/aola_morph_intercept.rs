@@ -5,7 +5,6 @@ use super::fetch::{self, MovieBodyFilter, Response, ResponseBody};
 use super::spawn_tokio;
 use crate::backends::aoqi_cache::{AdaptedKey, AoqiCache, numeric_version};
 use quick_xml::{Reader, events::Event};
-use reqwest::cookie::{CookieStore, Jar};
 use ruffle_core::backend::navigator::{NavigationMethod, Request, SuccessResponse};
 use ruffle_core::mypro_observer::{self, MorphAssetKind, MorphAssetResult};
 use ruffle_core::swf::{self, Tag};
@@ -88,7 +87,7 @@ pub(super) fn try_match(request: &Request, url: &Url) -> Option<Selection> {
     Some(Selection { source, target, kind })
 }
 
-fn parse_versioned_asset(url: &Url) -> Option<(u32, MorphKind)> {
+pub(super) fn parse_versioned_asset(url: &Url) -> Option<(u32, MorphKind)> {
     if !official(url) { return None; }
     let path = url.path().strip_prefix("/play/")?.strip_suffix(".swf")?;
     let (name, version) = path.rsplit_once('~')?;
@@ -141,13 +140,13 @@ fn asset_name(id: u32, kind: MorphKind) -> String {
 impl Selection {
     pub(super) async fn replace(
         self, original_url: &Url, cache: &AoqiCache, catalog: &Catalog,
-        client: Option<&reqwest::Client>, cookies: &Arc<Jar>,
+        anonymous_client: Option<&reqwest::Client>,
     ) -> Option<Box<dyn SuccessResponse>> {
         let name = asset_name(self.target, self.kind);
         let version = catalog.read().ok().and_then(|catalog| catalog.target_version(&name));
         let result = match &version {
             None => Err(io::Error::new(io::ErrorKind::NotFound, "Target resource version missing").into()),
-            Some(version) => self.load(original_url, cache, client, cookies, &name, version).await,
+            Some(version) => self.load(original_url, cache, anonymous_client, &name, version).await,
         };
         match result {
             Ok((body, size, phase)) => {
@@ -167,8 +166,8 @@ impl Selection {
     }
 
     async fn load(
-        self, original_url: &Url, cache: &AoqiCache, client: Option<&reqwest::Client>,
-        cookies: &Arc<Jar>, name: &str, version: &str,
+        self, original_url: &Url, cache: &AoqiCache, anonymous_client: Option<&reqwest::Client>,
+        name: &str, version: &str,
     ) -> Result<(ResponseBody, u64, &'static str), FetchError> {
         let part = match self.kind {
             MorphKind::Backpack { index } => format!("backpack-{index}"),
@@ -191,7 +190,7 @@ impl Selection {
         let mut url = original_url.clone();
         url.set_path(&format!("/play/{name}~{version}.swf"));
         url.set_query(None);
-        let target = target_bytes(cache, client, cookies, url).await?;
+        let target = target_bytes(cache, anonymous_client, url).await?;
         let adapted = aola_morph_transform::transform(target, self.source, self.target, self.kind).await?;
         let owned_cache = cache.clone();
         let adapted = spawn_tokio(async move {
@@ -229,9 +228,8 @@ fn observe(source: u32, kind: MorphKind, result: MorphAssetResult) {
 }
 
 async fn target_bytes(
-    cache: &AoqiCache, client: Option<&reqwest::Client>, cookies: &Arc<Jar>, url: Url,
+    cache: &AoqiCache, anonymous_client: Option<&reqwest::Client>, url: Url,
 ) -> Result<Vec<u8>, FetchError> {
-    if cookies.cookies(&url).is_some() { return Err(io::Error::other("Target request carries cookies").into()); }
     let owned_cache = cache.clone();
     let cached_url = url.clone();
     let hit = spawn_tokio(async move {
@@ -239,21 +237,20 @@ async fn target_bytes(
     }).await??;
     if let Some(hit) = hit {
         let response_url = Url::parse(&hit.response_url)?;
-        if response_url.path() == url.path() && cookies.cookies(&response_url).is_none() {
+        if response_url.path() == url.path() {
             return Ok(hit.bytes);
         }
     }
-    let client = client.cloned().ok_or_else(|| io::Error::other("Network unavailable"))?;
+    let client = anonymous_client.cloned().ok_or_else(|| io::Error::other("Network unavailable"))?;
     let cache = cache.clone();
-    let cookies = cookies.clone();
     spawn_tokio(async move {
         let mut response = client.get(url.clone()).timeout(Duration::from_secs(90)).send().await?;
         let status = response.status();
         if status != reqwest::StatusCode::OK {
             return Err(io::Error::other(format!("Target HTTP {status}")).into());
         }
-        if response.url().path() != url.path() || cookies.cookies(response.url()).is_some() {
-            return Err(io::Error::other("Target response has unexpected resource identity or cookies").into());
+        if response.url().path() != url.path() {
+            return Err(io::Error::other("Target response has unexpected resource identity").into());
         }
         let policy = AoqiCache::response_policy(&url, response.url(), status.as_u16(), response.headers())
             .ok_or_else(|| io::Error::other("Target response is not a cacheable public resource"))?;
@@ -380,6 +377,66 @@ fn parse_versions(xml: &[u8], source: CatalogSource) -> Result<Versions, FetchEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cold_target_fetch_is_anonymous_and_cached() {
+        use crate::backends::navigator::tests::new_test_backend;
+        use reqwest::cookie::CookieStore;
+        use ruffle_core::swf::Header;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+            time::timeout,
+        };
+
+        let target = Url::parse("http://aola.100bt.com/play/fightassets/bitmap/pet12345/pet12345_2_1~72.swf").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = AoqiCache::new(temporary.path().to_owned()).unwrap();
+        let mut backend = new_test_backend(false);
+        backend.proxy = Some(reqwest::Proxy::all(format!("http://{address}")).unwrap());
+        let backend = backend.with_aola_cache(cache.root().to_owned()).unwrap();
+        let login_cookie = "session=synthetic-morph-login";
+        backend.cookie_store.add_cookie_str(
+            &format!("{login_cookie}; Domain=.100bt.com; Path=/"),
+            &target,
+        );
+        assert_eq!(backend.cookie_store.cookies(&target).unwrap(), login_cookie);
+        assert!(cache.lookup(&target).unwrap().is_none());
+
+        let mut bytes = Vec::new();
+        swf::write_swf(&Header::default_with_swf_version(18), &[], &mut bytes).unwrap();
+        let reply = bytes.clone();
+        let expected_request = format!("GET {target} HTTP/1.1");
+        let proxy = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 8192);
+                request.push(connection.read_u8().await.unwrap());
+            }
+            let request = std::str::from_utf8(&request).unwrap();
+            assert_eq!(request.lines().next(), Some(expected_request.as_str()));
+            assert!(!request.lines().any(|line| {
+                line.split_once(':').is_some_and(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+            }));
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nCache-Control: private, no-cache\r\nConnection: close\r\n\r\n",
+                reply.len()
+            );
+            connection.write_all(headers.as_bytes()).await.unwrap();
+            connection.write_all(&reply).await.unwrap();
+        });
+
+        let response = timeout(
+            Duration::from_secs(5),
+            target_bytes(&cache, backend.morph_client.as_ref(), target.clone()),
+        ).await.unwrap().unwrap();
+        proxy.await.unwrap();
+        assert_eq!(response, bytes);
+        assert_eq!(cache.lookup(&target).unwrap().unwrap().bytes, bytes);
+    }
 
     #[test]
     fn only_exact_official_morph_paths_match() {
