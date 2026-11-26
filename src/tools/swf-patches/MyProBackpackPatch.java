@@ -65,12 +65,55 @@ public class MyProBackpackPatch {
         code.checkValidOffsets(body);
     }
 
+    private static void scale(ABC abc, boolean verify) throws Exception {
+        var c = abc.constants;
+        int helper = c.getQnameId("MyProBackpackMorph", Namespace.KIND_PACKAGE, "aola.tools", !verify);
+        int scaleOnLoaded = c.getPublicQnameId("scaleOnLoaded", !verify);
+        int setIcon = c.getPublicQnameId("setIcon", false);
+        int viewId = c.getPublicQnameId("viewId", false);
+        int handler = member(abc, "_petIconHandler");
+        int pet = member(abc, "curPbi");
+        var body = method(abc, "afterOtherOperate");
+        var code = body.getCode();
+        var nativeArgs = List.of(op(GetLocal0), op(GetProperty, handler),
+            op(GetLocal0), op(GetProperty, pet), op(GetProperty, viewId), op(GetLocal1),
+            op(GetLocal0), op(GetProperty, pet));
+        var callback = List.of(op(GetLex, helper), op(GetLocal0), op(GetProperty, handler),
+            op(GetLocal0), op(GetProperty, pet), op(GetProperty, viewId), op(GetLocal1),
+            op(CallProperty, scaleOnLoaded, 3));
+        int call = -1;
+        for (int i = 0; i < code.code.size(); i++) {
+            var ins = code.code.get(i);
+            if (ins.definition.instructionCode == CallPropVoid && ins.operands[0] == setIcon) {
+                require(call == -1 && ins.operands[1] == (verify ? 4 : 3));
+                call = i;
+            }
+        }
+        int at = call - nativeArgs.size() - (verify ? callback.size() : 0);
+        require(at >= 0);
+        for (var ins : nativeArgs) require(Arrays.equals(code.code.get(at++).getBytes(), ins.getBytes()));
+        if (verify) {
+            for (var ins : callback) require(Arrays.equals(code.code.get(at++).getBytes(), ins.getBytes()));
+            require(at == call && body.max_stack >= 8);
+        } else {
+            // Keep the existing arguments and pass the scale callback to
+            // setIcon, which runs it once the native model is laid out.
+            code.code.get(call).operands[1] = 4;
+            for (int i = callback.size() - 1; i >= 0; i--) {
+                code.insertInstruction(call, callback.get(i), body);
+            }
+            body.max_stack = Math.max(body.max_stack, 8);
+            body.setCode(code);
+        }
+        code.checkValidOffsets(body);
+    }
+
     private static AVM2Instruction op(int opcode, int... operands) {
         return new AVM2Instruction(0, AVM2Code.instructionSet[opcode], operands);
     }
 
     private static void require(boolean condition) {
-        if (!condition) throw new IllegalArgumentException("Unrecognized backpack revision hook layout");
+        if (!condition) throw new IllegalArgumentException("Unrecognized backpack hook layout");
     }
 
     private static void verify(Path candidate) throws Exception {
@@ -80,7 +123,8 @@ public class MyProBackpackPatch {
             var game = tags.stream().map(tag -> tag.getABC())
                 .filter(abc -> abc.findClassByName(DETAIL) >= 0).findFirst().orElseThrow();
             revision(game, true);
-            System.out.println("Verified PetBigIconDetail.updatePetIcon revision guard in " + candidate);
+            scale(game, true);
+            System.out.println("Verified backpack revision and scale callbacks in " + candidate);
         }
     }
 
@@ -97,6 +141,7 @@ public class MyProBackpackPatch {
         PetTabSwitchPatch.apply(abc);
         PetActiveTabSwitchPatch.apply(abc);
         revision(abc, false);
+        scale(abc, false);
         try (var out = Files.newOutputStream(Path.of(args[2]))) { abc.saveToStream(out); }
     }
 }

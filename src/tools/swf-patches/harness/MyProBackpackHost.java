@@ -2,7 +2,7 @@ import com.jpexs.decompiler.flash.SWF;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
-// Only redirect ExternalInterface in the isolated probe, retaining the revision bytecode.
+// Only redirect ExternalInterface in the isolated probe, retaining the revision and scale bytecode.
 class MyProBackpackHost {
     public static void main(String[] args) throws Exception {
         try (var in=Files.newInputStream(Path.of(args[0])); var out=Files.newOutputStream(Path.of(args[1]))) {

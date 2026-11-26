@@ -1,7 +1,7 @@
-"""Exercise the packaged backpack revision guard with an offline asset domain and host."""
+"""Exercise the packaged backpack revision and HD scaling with an offline host."""
 import struct
 
-from observe_skin_motion import iter_tags, unpack_swf
+from observe_skin_motion import INTERFACES, abc_tags, iter_tags, unpack_swf
 from test_notice_patch import probe_args, run_probe
 
 
@@ -17,6 +17,14 @@ if __name__ == "__main__":
     args.work.mkdir(parents=True)
     args.candidate = args.work / "helper.swf"
     args.candidate.write_bytes(b"FWS\x12" + struct.pack("<I", len(body) + 8) + body)
-    run_probe(args, "aola_backpack_revision", "MyProBackpackProbe", "MyProBackpackHost.java", b"",
+    scale_classes = {b"mmo/interfaces/pet/peticon/PetIconType", b"mmo/interfaces/pet/peticon/PetIconConfig"}
+    native_scale = b"".join(abc_tags(INTERFACES.read_bytes(), scale_classes.__contains__))
+    run_probe(args, "aola_backpack_revision", "MyProBackpackProbe", "MyProBackpackHost.java", native_scale,
               "initial false true\nrule changed true true\nsame rule false true\nrestore true true\n"
-              "missing result false true\nmissing host false true\nhost resumed true true\n")
+              "missing result false true\nmissing host false true\nhost resumed true true\n"
+              "native scale groups true\n"
+              "normal to .3 true true true true\nfresh attachment true true true true\n"
+              ".3 to normal true true true true\n.3 to .4 true true true true\n"
+              ".4 to .3 true true true true\nsame scale group true true true true\n"
+              "no mapping true true true true\nbitmap ignores mapping true true true true\n"
+              "unexpected hierarchy true true true true\nmissing host keeps scale true true true true\n")

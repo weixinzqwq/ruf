@@ -357,6 +357,20 @@ fn arguments(args: &[Value]) -> &[Value] {
     }
 }
 
+fn backpack_target(args: &[Value], rules: &ruffle_core::mypro_observer::MorphRuleSnapshot) -> u32 {
+    let [Value::Number(source)] = arguments(args) else {
+        return 0;
+    };
+    if !rules.enabled || !(1.0..=f64::from(i32::MAX)).contains(source) || source.fract() != 0.0 {
+        return 0;
+    }
+    rules
+        .backpack_map
+        .get(&(*source as u32))
+        .copied()
+        .unwrap_or_default()
+}
+
 fn text(value: Option<&Value>) -> String {
     match value {
         Some(Value::String(value)) => value.clone(),
@@ -486,6 +500,15 @@ impl ExternalInterfaceProvider for AolaInterface {
             }
             let revision = ruffle_core::mypro_observer::morph_rule_snapshot().revision;
             return Value::Number(revision as f64);
+        }
+        if name == "aolaMyProBackpackTarget" {
+            if !crate::mypro_host::enabled() {
+                return Value::from(0u32);
+            }
+            return Value::from(backpack_target(
+                args,
+                &ruffle_core::mypro_observer::morph_rule_snapshot(),
+            ));
         }
         if name == "aolaBlockSkill" {
             return self.skill_result(args);
@@ -804,6 +827,27 @@ impl LoginBrowser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aola_backpack_target_reads_only_enabled_backpack_rules() {
+        let mut rules = ruffle_core::mypro_observer::MorphRuleSnapshot {
+            backpack_map: [(5336, 6044)].into(),
+            battle_map: [(1234, 5994)].into(),
+            ..Default::default()
+        };
+        assert_eq!(backpack_target(&[Value::from(5336)], &rules), 0);
+        rules.enabled = true;
+        assert_eq!(backpack_target(&[Value::from(5336)], &rules), 6044);
+        assert_eq!(
+            backpack_target(&[Value::List(vec![Value::from(5336)])], &rules),
+            6044
+        );
+        for invalid in [1234.0, -1.0, 5336.5, f64::NAN, f64::INFINITY] {
+            assert_eq!(backpack_target(&[Value::Number(invalid)], &rules), 0);
+        }
+        assert_eq!(backpack_target(&[], &rules), 0);
+    }
+
     #[test]
     fn aola_battle_gc_events_keep_the_numeric_per_cleanup_counters() {
         use tracing_subscriber::prelude::*;
