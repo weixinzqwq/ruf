@@ -168,7 +168,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:32vh;overflow:auto;pa
     <p class="hint" id="theme-status" role="status"></p>
   </article>
   <article class="card">
-    <h2>游戏表现</h2><p class="hint">设置在下一次对应内容出现时生效。</p>
+    <h2>游戏表现</h2><p class="hint">演出设置在下一次对应内容出现时生效。</p>
     <div id="setting-options"></div><p class="hint" id="setting-status" role="status"></p>
   </article>
   <article class="card"><h2>战斗背景</h2>
@@ -388,7 +388,7 @@ function timeLabel(value) {
   if (value >= 1e11) return new Date(value).toLocaleTimeString("zh-CN",{hour12:false});
   return (value/1000).toFixed(1)+" 秒";
 }
-const presentationOptions = {hideNotice:"隐藏公告",blockWanyu:"跳过万域之潮出招演出",hideTransformPortrait:"隐藏变身立绘",skipBattleBackdrop:"跳过战场背景切换",hideBattleDamage:"隐藏伤害浮字",hideBattleHealing:"隐藏治疗浮字",skipBattleAnimations:"跳过战斗演出"};
+const presentationOptions = {hideNotice:"隐藏公告",blockWanyu:"跳过万域之潮出招演出",hideTransformPortrait:"隐藏变身立绘",skipBattleBackdrop:"跳过战场背景切换",hideBattleDamage:"隐藏伤害浮字",hideBattleHealing:"隐藏治疗浮字",skipBattleAnimations:"跳过战斗演出",battleInputNormalFps:"选技能时恢复原版帧率（防回合倒计时过快）"};
 let rehearsal=null, workshopVersion=0;
 let ownBagText=null, ownBagPending=false, ownBagCapture=null;
 function clearOwnBagAction() {
@@ -617,6 +617,7 @@ for(const [key,title] of Object.entries(presentationOptions)) {
   const row=document.createElement("label");
   row.style.cssText="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--line)";
   const input=document.createElement("input"); input.type="checkbox"; input.disabled=true; input.id="setting-"+key;
+  input.defaultChecked=key==="battleInputNormalFps";
   input.style.cssText="width:17px;height:17px;margin:0;accent-color:var(--green)";
   row.append(input,document.createTextNode(title)); $("setting-options").append(row);
   input.onchange=operation(async()=>{
@@ -633,7 +634,7 @@ for(const [key,title] of Object.entries(presentationOptions)) {
 function showSettings() {
   const waiting=presentation?.stage==="saving" || writingSetting;
   for(const key of Object.keys(presentationOptions)) {
-    const input=$("setting-"+key); input.checked=presentation?.values?.[key]===true;
+    const input=$("setting-"+key); input.checked=(presentation?.values?.[key] ?? input.defaultChecked)===true;
     input.disabled=!cap("settings.patch") || !presentation || presentation.stage==="loading" || waiting;
   }
   const status=waiting ? "正在保存…" : presentation?.stage==="failed" ? presentation.error || "保存失败。" :

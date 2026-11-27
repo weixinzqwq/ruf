@@ -232,7 +232,7 @@ pub fn set_frame_rate<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     if !activation.context.forced_frame_rate {
         let new_frame_rate = args.get_f64(0).clamp(0.01, 1000.0);
-        *activation.context.frame_rate = new_frame_rate;
+        activation.context.set_base_frame_rate(new_frame_rate);
     }
 
     Ok(Value::Undefined)

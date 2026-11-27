@@ -245,7 +245,7 @@ pub fn exec<'gc>(
         && crate::aola_panel_diagnostics::begin_method(method.profile_name());
     let detail = activation.context.tick_profile.begin_detail(method.detail_root(), || method.profile_name());
     let operation = method.swf_operation();
-    let previous_managers = if operation == Operation::DisposeFight {
+    let previous_managers = if operation == Operation::DisposeFight && Operation::tracks_battle_lifecycle() {
         activation.context.battle_maintenance.managers_returned.take()
     } else { None };
     let result = if detail == crate::tick_profile::DetailCall::FullRoot {
@@ -259,10 +259,33 @@ pub fn exec<'gc>(
         crate::orphan_census::after_response(activation.context);
     }
     if operation != Operation::Other {
-        if operation == Operation::OpenActivityPanel {
-            observe_panel(user_arguments, result.is_ok());
+        let succeeded = result.is_ok();
+        match operation {
+            Operation::BattleEnableClick if succeeded => {
+                // Official SWFs with a separate disableClick have no enableClick argument.
+                let enabled = if user_arguments.is_empty() {
+                    // initPet opens replay controls without starting the turn countdown.
+                    let stack = activation.context.avm2.call_stack();
+                    let replay = stack.borrow().callers().next()
+                        .is_some_and(|caller| caller.swf_operation() == Operation::BattleInitPet);
+                    Value::Bool(!replay)
+                } else {
+                    user_arguments.get_at(0)
+                };
+                if let Value::Bool(enabled) = enabled {
+                    activation.context.set_battle_input_waiting(enabled);
+                }
+            }
+            Operation::BattleDisableClick if succeeded => {
+                activation.context.set_battle_input_waiting(false);
+            }
+            Operation::ConstructFight | Operation::DisposeFight => {
+                activation.context.reset_battle_input_state();
+            }
+            Operation::OpenActivityPanel => observe_panel(user_arguments, succeeded),
+            _ => {}
         }
-        observe_swf_return(operation, receiver, result.is_ok(), previous_managers, activation);
+        observe_swf_return(operation, receiver, succeeded, previous_managers, activation);
     }
     if crate::aola_panel_diagnostics::armed() {
         if let Err(error) = &result {
@@ -289,15 +312,16 @@ fn observe_swf_return<'gc>(operation: Operation, receiver: Value<'gc>, succeeded
     previous_managers: Option<usize>, activation: &mut Activation<'_, 'gc>) {
     if operation == Operation::SwitchPet && succeeded && crate::mypro_observer::installed() {
         tracing::info!(target: "aola_swf_operation", operation = "pet-switch-completed");
-    } else if operation == Operation::DisposeFight {
+    } else if operation == Operation::DisposeFight && Operation::tracks_battle_lifecycle() {
         activation.context.battle_maintenance.finish_dispose(previous_managers,
             receiver.as_object().map(|o| o.as_ptr() as usize), succeeded, web_time::Instant::now(),
             ruffle_render::backend::aola_long_run_maintenance());
-    } else if operation == Operation::ConstructFight && succeeded {
+    } else if operation == Operation::ConstructFight && succeeded && Operation::tracks_battle_lifecycle() {
         if let Some(obj) = receiver.as_object() {
             activation.context.battle_maintenance.enter(obj.as_ptr() as usize);
         }
-    } else if (operation.observes_return() || operation == Operation::DisposeFightManagers) && succeeded {
+    } else if succeeded && (operation.observes_return()
+        || (operation == Operation::DisposeFightManagers && Operation::tracks_battle_lifecycle())) {
         let stack = activation.context.avm2.call_stack();
         let stack = stack.borrow();
         // exec_inner has already popped the successfully returned method.

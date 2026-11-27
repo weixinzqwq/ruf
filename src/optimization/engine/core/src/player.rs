@@ -24,7 +24,7 @@ use crate::backend::{
 use crate::compatibility_rules::CompatibilityRules;
 use crate::compatibility_rules::UrlRewriteStage;
 use crate::config::Letterbox;
-use crate::context::{ActionQueue, ActionType, RenderContext, UpdateContext};
+use crate::context::{ActionQueue, ActionType, RenderContext, UpdateContext, effective_frame_rate};
 use crate::context_menu::{
     BuiltInItemFlags, ContextMenuCallback, ContextMenuItem, ContextMenuState,
 };
@@ -443,6 +443,9 @@ pub struct Player {
     in_tick: bool,
 
     frame_rate: f64,
+    base_frame_rate: f64,
+    battle_input_waiting: bool,
+    battle_native_auto_enabled: bool,
     forced_frame_rate: bool,
     actions_since_timeout_check: u32,
 
@@ -772,6 +775,7 @@ impl Player {
 
     pub fn tick(&mut self, dt: FloatDuration) {
         use crate::tick_profile::TickWork;
+        self.apply_dynamic_frame_rate();
         if !self.is_playing() {
             self.collect_frame_gc(Duration::ZERO);
             return;
@@ -782,7 +786,7 @@ impl Player {
         self.in_tick = true;
 
         self.frame_accumulator += dt;
-        let frame_duration = self.frame_duration();
+        let mut frame_duration = self.frame_duration();
 
         let max_frames_per_tick = self.max_frames_per_tick();
         let mut frame = 0;
@@ -796,6 +800,7 @@ impl Player {
             self.add_frame_timing(elapsed);
 
             self.frame_accumulator -= frame_duration;
+            frame_duration = self.frame_duration();
             frame += 1;
             // The script probably tried implementing an FPS limiter with a busy loop.
             // We fooled the busy loop by pretending that more time has passed that actually did.
@@ -2470,6 +2475,38 @@ impl Player {
         self.frame_rate
     }
 
+    pub fn base_frame_rate(&self) -> f64 {
+        self.base_frame_rate
+    }
+
+    pub fn battle_input_waiting(&self) -> bool {
+        self.battle_input_waiting
+    }
+
+    pub fn set_battle_native_auto_enabled(&mut self, enabled: bool) {
+        self.battle_native_auto_enabled = enabled;
+        self.apply_dynamic_frame_rate();
+    }
+
+    pub fn apply_dynamic_frame_rate(&mut self) {
+        let rate = effective_frame_rate(
+            self.base_frame_rate,
+            self.battle_input_waiting,
+            self.battle_native_auto_enabled,
+        );
+        if rate.to_bits() != self.frame_rate.to_bits() {
+            self.frame_rate = rate;
+            self.audio.set_frame_rate(rate);
+        }
+    }
+
+    /// Store the host-selected frame rate and apply any active battle input limit.
+    pub fn set_forced_frame_rate(&mut self, frame_rate: u16) {
+        self.base_frame_rate = f64::from(frame_rate.clamp(1, 1000));
+        self.forced_frame_rate = true;
+        self.apply_dynamic_frame_rate();
+    }
+
     pub fn is_frame_rate_forced(&self) -> bool {
         self.forced_frame_rate
     }
@@ -2673,6 +2710,9 @@ impl Player {
                 time_offset: &mut this.time_offset,
                 audio_manager,
                 frame_rate: &mut this.frame_rate,
+                base_frame_rate: &mut this.base_frame_rate,
+                battle_input_waiting: &mut this.battle_input_waiting,
+                battle_native_auto_enabled: &mut this.battle_native_auto_enabled,
                 forced_frame_rate: this.forced_frame_rate,
                 actions_since_timeout_check: &mut this.actions_since_timeout_check,
                 frame_phase: &mut this.frame_phase,
@@ -3411,6 +3451,9 @@ impl PlayerBuilder {
 
                 // Timing
                 frame_rate,
+                base_frame_rate: frame_rate,
+                battle_input_waiting: false,
+                battle_native_auto_enabled: false,
                 forced_frame_rate,
                 frame_phase: Default::default(),
                 frame_accumulator: FloatDuration::ZERO,
@@ -3673,6 +3716,39 @@ mod aoqi_frame_rate_tests {
     use crate::avm2::{activation::Activation, FunctionArgs, Value};
 
     #[test]
+    fn aola_battle_input_rate_preserves_manual_target_and_resets_on_battle_exit() {
+        let player = PlayerBuilder::new().with_frame_rate(Some(60.0)).build();
+        let mut player = player.lock().unwrap();
+
+        player.mutate_with_update_context(|context| context.set_battle_input_waiting(true));
+        assert!(player.battle_input_waiting());
+        assert_eq!(player.frame_rate(), 25.0);
+        assert_eq!(player.base_frame_rate(), 60.0);
+        assert_eq!(player.time_til_next_frame(), Duration::from_millis(40));
+
+        player.set_forced_frame_rate(90);
+        assert_eq!(player.frame_rate(), 25.0);
+        assert_eq!(player.base_frame_rate(), 90.0);
+
+        player.set_battle_native_auto_enabled(true);
+        assert_eq!(player.frame_rate(), 90.0);
+        player.set_battle_native_auto_enabled(false);
+        assert_eq!(player.frame_rate(), 25.0);
+
+        player.set_forced_frame_rate(20);
+        assert_eq!(player.frame_rate(), 20.0);
+
+        player.set_forced_frame_rate(120);
+        player.mutate_with_update_context(|context| context.set_battle_input_waiting(false));
+        assert_eq!(player.frame_rate(), 120.0);
+        player.set_battle_native_auto_enabled(true);
+        player.mutate_with_update_context(|context| context.reset_battle_input_state());
+        assert!(!player.battle_input_waiting());
+        assert!(!player.battle_native_auto_enabled);
+        assert_eq!(player.frame_rate(), 120.0);
+    }
+
+    #[test]
     fn recovered_stage_controller_can_switch_rates_when_native_override_is_absent() {
         for forced in [None, Some(50.0), Some(60.0)] {
             let player = PlayerBuilder::new().with_frame_rate(forced).build();
@@ -3685,6 +3761,7 @@ mod aoqi_frame_rate_tests {
                     ).unwrap();
                 });
                 assert_eq!(player.frame_rate(), forced.unwrap_or(rate));
+                assert_eq!(player.base_frame_rate(), forced.unwrap_or(rate));
                 assert_eq!(player.is_frame_rate_forced(), forced.is_some());
             }
         }

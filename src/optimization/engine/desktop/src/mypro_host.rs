@@ -11,6 +11,7 @@ use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
@@ -114,6 +115,7 @@ pub struct ToolsHost {
     event_sequence: u64,
     background_revision: u32,
     visual_morph_revision: u64,
+    next_native_auto_sample: Instant,
     services: ToolsService,
     lineups: crate::mypro_features::lineups::Lineups,
     features: Features,
@@ -252,6 +254,7 @@ impl ToolsHost {
             toolbar, panel_move, panel, parent, proxy, generation: Rc::new(Cell::new(0)), queued: Rc::new(Cell::new(0)),
             ready: 0, last_request: 0, visible: false, shown: false, session: None, event_sequence: 0,
             background_revision: 0, visual_morph_revision: 0, services: ToolsService::new(root.clone()),
+            next_native_auto_sample: Instant::now(),
             lineups: crate::mypro_features::lineups::Lineups::new(root.join("mypro")), features: Features::new(root) })
     }
 
@@ -416,6 +419,13 @@ impl ToolsHost {
     pub fn sync_session(&mut self, player: &PlayerController) {
         let current = player.session_id();
         crate::mypro_features::game_ui::sync(player);
+        let now = Instant::now();
+        if now >= self.next_native_auto_sample {
+            self.next_native_auto_sample = now + Duration::from_millis(250);
+            if let Some(mut movie) = player.get() && movie.battle_input_waiting() {
+                Self::native_auto_result(&mut movie, "getNativeAutoBattle", None);
+            }
+        }
         let revision = crate::mypro_features::background::revision();
         if revision != self.background_revision {
             if let Some(mut movie) = player.get() {
@@ -460,7 +470,7 @@ impl ToolsHost {
     }
 
     fn snapshot(&self, player: &PlayerController, game: &Window, session: &str) -> Value {
-        let state = player.get().map(|p| (p.is_playing(), p.performance_stats().frames, p.frame_rate()));
+        let state = player.get().map(|p| (p.is_playing(), p.performance_stats().frames, p.base_frame_rate()));
         let playing = state.map(|s| s.0);
         let mut capabilities = json!({});
         for name in ["session.pause","session.resume","panel.hide","panel.reload","battle.auto.read","battle.auto.set",
@@ -480,13 +490,25 @@ impl ToolsHost {
             "coreBuild":concat!("Ruffle ",env!("CARGO_PKG_VERSION"))})
     }
 
+    fn native_auto_result(
+        movie: &mut ruffle_core::Player,
+        callback: &str,
+        arg: Option<ruffle_core::external::Value>,
+    ) -> Option<ruffle_core::external::Value> {
+        use ruffle_core::external::Value as Flash;
+        let result = movie.try_call_internal_interface(callback, arg);
+        let enabled = matches!(&result, Some(Flash::Object(state)) if state.get("enabled") == Some(&Flash::Bool(true)));
+        movie.set_battle_native_auto_enabled(enabled);
+        result
+    }
+
     fn native_auto(player: &PlayerController, command: &str, payload: &Value) -> Result<Value, String> {
         use ruffle_core::external::Value as Flash;
         let (callback, arg) = if command == "battle.auto.set" {
             let enabled = payload["enabled"].as_bool().ok_or("InvalidArguments: expected enabled")?;
             ("setNativeAutoBattle", Some(Flash::Bool(enabled)))
         } else { ("getNativeAutoBattle", None) };
-        if let Some(Flash::Object(result)) = player.get().and_then(|mut p| p.try_call_internal_interface(callback, arg)) {
+        if let Some(Flash::Object(result)) = player.get().and_then(|mut p| Self::native_auto_result(&mut p, callback, arg)) {
             if let Some(Flash::String(status)) = result.get("status") {
                 let enabled = match result.get("enabled") { Some(Flash::Bool(flag)) => Some(*flag), _ => None };
                 let changed = matches!(result.get("changed"), Some(Flash::Bool(true)));
@@ -535,6 +557,11 @@ impl ToolsHost {
                 .unwrap_or_else(|| Err("UnsupportedCapability".into())),
         }};
         let success = result.is_ok();
+        if success && req.command == "settings.patch" && req.payload["values"].get("battleInputNormalFps").is_some()
+            && let Some(mut movie) = player.get()
+        {
+            movie.apply_dynamic_frame_rate();
+        }
         let mut response = json!({"protocolVersion":1,"kind":"response","requestId":req.request_id,
             "sessionId":session,"bridgeGeneration":generation,"ok":success});
         match result {

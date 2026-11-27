@@ -54,6 +54,14 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use web_time::Instant;
 
+pub(crate) fn effective_frame_rate(base: f64, waiting: bool, native_auto: bool) -> f64 {
+    if waiting && base > 25.0 && !native_auto && crate::mypro_observer::battle_input_normal_fps() {
+        25.0
+    } else {
+        base
+    }
+}
+
 /// `UpdateContext` holds shared data that is used by the various subsystems of Ruffle.
 /// `Player` creates this when it begins a tick and passes it through the call stack to
 /// children and the VM.
@@ -206,6 +214,10 @@ pub struct UpdateContext<'gc> {
 
     /// The current stage frame rate.
     pub frame_rate: &'gc mut f64,
+
+    pub(crate) base_frame_rate: &'gc mut f64,
+    pub(crate) battle_input_waiting: &'gc mut bool,
+    pub(crate) battle_native_auto_enabled: &'gc mut bool,
 
     /// Whether movies are prevented from changing the stage frame rate.
     pub forced_frame_rate: bool,
@@ -364,6 +376,29 @@ impl<'gc> UpdateContext<'gc> {
         self.audio_manager.set_sound_transforms_dirty()
     }
 
+    pub(crate) fn set_base_frame_rate(&mut self, frame_rate: f64) {
+        *self.base_frame_rate = frame_rate;
+        self.apply_dynamic_frame_rate();
+    }
+
+    pub(crate) fn set_battle_input_waiting(&mut self, waiting: bool) {
+        *self.battle_input_waiting = waiting;
+        self.apply_dynamic_frame_rate();
+    }
+
+    pub(crate) fn reset_battle_input_state(&mut self) {
+        *self.battle_native_auto_enabled = false;
+        self.set_battle_input_waiting(false);
+    }
+
+    fn apply_dynamic_frame_rate(&mut self) {
+        *self.frame_rate = effective_frame_rate(
+            *self.base_frame_rate,
+            *self.battle_input_waiting,
+            *self.battle_native_auto_enabled,
+        );
+    }
+
     /// Change the root movie.
     ///
     /// This should only be called once, as it makes no attempt at proper clean-up
@@ -371,8 +406,9 @@ impl<'gc> UpdateContext<'gc> {
     /// should use `replace_root_movie`.
     pub fn set_root_movie(&mut self, movie: SwfMovieData) {
         if !self.forced_frame_rate {
-            *self.frame_rate = movie.frame_rate().into();
+            *self.base_frame_rate = movie.frame_rate().into();
         }
+        self.reset_battle_input_state();
 
         info!(
             "Loaded SWF version {}, resolution {}x{} @ {} FPS",

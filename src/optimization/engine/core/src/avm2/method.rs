@@ -229,7 +229,7 @@ impl<'gc> Method<'gc> {
             activation.gc(),
             MethodData {
                 profile_name: std::cell::OnceCell::new(),
-                swf_operation: super::swf_operation::Operation::for_method(&abc, abc_method.0),
+                swf_operation: txunit.swf_operation(abc_method.0),
                 detail_root: std::cell::Cell::new(None),
                 txunit,
                 abc: txunit.abc(),

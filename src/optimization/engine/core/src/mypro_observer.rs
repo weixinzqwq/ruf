@@ -7,11 +7,20 @@ use std::sync::{
 
 static SINK: OnceLock<fn(&str, &str, &str)> = OnceLock::new();
 static RECORDING: AtomicBool = AtomicBool::new(false);
+static BATTLE_INPUT_NORMAL_FPS: AtomicBool = AtomicBool::new(true);
 
 pub fn install(sink: fn(&str, &str, &str)) { let _ = SINK.set(sink); }
 pub fn set_recording(active: bool) { RECORDING.store(active, Ordering::Relaxed); }
 pub fn recording() -> bool { RECORDING.load(Ordering::Relaxed) }
 pub fn installed() -> bool { SINK.get().is_some() }
+
+pub fn set_battle_input_normal_fps(enabled: bool) {
+    BATTLE_INPUT_NORMAL_FPS.store(enabled, Ordering::Relaxed);
+}
+
+pub fn battle_input_normal_fps() -> bool {
+    BATTLE_INPUT_NORMAL_FPS.load(Ordering::Relaxed)
+}
 
 pub fn observe(kind: &str, address: &str, class: &str) {
     if recording() && let Some(sink) = SINK.get() { sink(kind, address, class); }

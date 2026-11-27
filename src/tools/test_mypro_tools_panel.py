@@ -26,7 +26,7 @@ class Fixture:
                       "rules": [{"remark": "初始测试", "originalId": "5336", "backpackId": "6044",
                                  "fightId": "/", "spskiId": "/"}]}
         self.battle = None
-        self.display = {}
+        self.display = {"battleInputNormalFps": True}
         self.auto = False
         self.background = False
         self.theme = 0
@@ -360,6 +360,12 @@ def presentation(page, fixture):
     page.locator("[data-tab=settings]").click()
     damage = page.locator("#setting-hideBattleDamage")
     healing = page.locator("#setting-hideBattleHealing")
+    normal_fps = page.get_by_role("checkbox", name="选技能时恢复原版帧率（防回合倒计时过快）")
+    expect(normal_fps).to_be_checked()
+    normal_fps.uncheck()
+    expect(normal_fps).not_to_be_checked()
+    expect(normal_fps).to_be_enabled()
+    assert fixture.display["battleInputNormalFps"] is False
     damage.check()
     expect(damage).to_be_checked()
     expect(healing).not_to_be_checked()
@@ -373,7 +379,8 @@ def presentation(page, fixture):
     expect(page.locator("#background-status")).to_contain_text("960×560")
     page.locator("#background-clear").click()
     expect(page.locator("#background-status")).to_have_text("使用游戏背景")
-    assert fixture.display == {"hideBattleDamage": True, "hideBattleHealing": True, "skipBattleAnimations": True}
+    assert fixture.display == {"battleInputNormalFps": False, "hideBattleDamage": True,
+                               "hideBattleHealing": True, "skipBattleAnimations": True}
 
 
 def main():

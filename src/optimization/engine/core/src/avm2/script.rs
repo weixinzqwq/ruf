@@ -1,6 +1,7 @@
 //! Whole script representation
 
 use super::api_version::ApiVersion;
+use super::swf_operation::Operation;
 use crate::PlayerRuntime;
 use crate::avm2::activation::Activation;
 use crate::avm2::class::Class;
@@ -56,6 +57,9 @@ struct TranslationUnitData<'gc> {
     #[collect(require_static)]
     abc: Rc<AbcFile>,
 
+    #[collect(require_static)]
+    battle_methods: Box<[(u32, Operation)]>,
+
     /// All classes loaded from the ABC's class list.
     classes: Box<[OnceLock<Class<'gc>>]>,
 
@@ -95,6 +99,7 @@ impl<'gc> TranslationUnit<'gc> {
         let this = TranslationUnitData {
             domain,
             name,
+            battle_methods: Operation::battle_methods(&abc),
             classes: repeat_n(OnceLock::new(), abc.classes.len()).collect(),
             methods: repeat_n(OnceLock::new(), abc.methods.len()).collect(),
             scripts: repeat_n(OnceLock::new(), abc.scripts.len()).collect(),
@@ -145,6 +150,10 @@ impl<'gc> TranslationUnit<'gc> {
     /// Retrieve the underlying `AbcFile` for this translation unit.
     pub fn abc(self) -> Rc<AbcFile> {
         self.0.abc.clone()
+    }
+
+    pub(super) fn swf_operation(self, index: u32) -> Operation {
+        Operation::for_method(&self.0.abc, index, &self.0.battle_methods)
     }
 
     /// Determines whether this `TranslationUnit` and the provided
