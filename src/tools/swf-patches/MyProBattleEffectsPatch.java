@@ -22,6 +22,7 @@ class MyProBattleEffectsPatch {
     final ABC abc;
     final int helper;
     String owner;
+    String methodName;
     MethodBody body;
     final Map<Integer, byte[]> prefixes = new HashMap<>();
     final Map<Integer, byte[]> checked = new HashMap<>();
@@ -40,14 +41,16 @@ class MyProBattleEffectsPatch {
         return matches.getFirst().name_index;
     }
 
-    void method(String owner, String name, int expected) {
+    void method(String owner, String name) {
         this.owner = owner;
+        this.methodName = name;
         var traits = abc.instance_info.get(abc.findClassByName(BASE + owner)).instance_traits.traits;
         int key = member(name);
         for (var t : traits) {
-            if (t.name_index == key && t instanceof TraitMethodGetterSetter m && m.method_info == expected) {
-                body = abc.findBody(expected);
-                if (body.exceptions.length != 0) throw new IllegalStateException("Unexpected exception table");
+            if (t.name_index == key && t instanceof TraitMethodGetterSetter m) {
+                body = abc.findBody(m.method_info);
+                if (body == null || body.exceptions.length != 0)
+                    throw new IllegalStateException(BASE + owner + "." + name + " expected a body without exception regions");
                 return;
             }
         }
@@ -71,9 +74,10 @@ class MyProBattleEffectsPatch {
     byte[] invoke(String name, int n) { return op(CallPropVoid, member(name), n); }
 
     AVM2Instruction at(int addr, int opcode, int... args) {
-        var ins = body.getCode().code.stream().filter(i -> i.getAddress() == addr).findFirst().orElseThrow();
-        if (ins.definition != AVM2Code.instructionSet[opcode] || (args.length > 0 && !Arrays.equals(args, ins.operands)))
-            throw new IllegalStateException(owner + " #" + body.method_info + " unexpected instruction at " + addr);
+        var ins = body.getCode().code.stream().filter(i -> i.getAddress() == addr).findFirst().orElse(null);
+        if (ins == null || ins.definition != AVM2Code.instructionSet[opcode] || (args.length > 0 && !Arrays.equals(args, ins.operands)))
+            throw new IllegalStateException(BASE + owner + "." + methodName + " expected " +
+                    AVM2Code.instructionSet[opcode].instructionName + " at " + addr);
         return ins;
     }
 
@@ -124,9 +128,8 @@ class MyProBattleEffectsPatch {
     void numbers() throws Exception {
         String[] names = {"showMultipleHit", "showIncMovie", "showReallyHit", "showShieldHit", "showReallyShieldHit",
                 "playStrongMovie", "setNormalMovie", "playAllHitMovie"};
-        int[] ids = {1083,1086,1089,1091,1093,1095,1097,1099};
         for (int i = 0; i < names.length; i++) {
-            method("SkillResultMovieHandler", names[i], ids[i]);
+            method("SkillResultMovieHandler", names[i]);
             at(5, PushScope);
             guard(6, i == 0 ? "multiple" : i == 1 ? "healing" : "damage", END);
             finish();
@@ -134,26 +137,26 @@ class MyProBattleEffectsPatch {
     }
 
     void pets() throws Exception {
-        method("MCPetContainer", "onResPrepared", 5178);
+        method("MCPetContainer", "onResPrepared");
         at(0x78, CallPropVoid, member("setMiracleLight"), 0);
         guard(0x7c, "skip", seq(SELF, SELF, op(GetProperty, pub("locaId")), invoke("dispatchGotPet", 1), END));
         finish();
-        method("MCPetContainer", "onStartCriEff", 5221);
+        method("MCPetContainer", "onStartCriEff");
         at(1, PushScope);
         guard(2, "skip", END);
         finish();
-        method(CTRL + "SwitchPm", "showSwitchMc", 1644);
+        method(CTRL + "SwitchPm", "showSwitchMc");
         at(0x11, IfFalse);
         at(0x15, GetLocal2); // A missing pet has no switch animation or completion.
         guard(0x15, "skip", seq(SELF, op(GetLocal1), invoke("onSwitchEnd", 1), END));
         finish();
-        method(CTRL + "ChangePetView", "onPetChange", 1741);
+        method(CTRL + "ChangePetView", "onPetChange");
         int accessor = at(0x55, SetProperty).operands[0];
         at(0x6a, CallPropVoid, pub("addChildAt"), 2);
         guard(0x6e, "skip", seq(field("_petContainer"), op(PushByte, 1), op(SetProperty, pub("scaleX")),
                 field("_petContainer"), op(PushByte, 1), op(SetProperty, pub("scaleY")), END));
         finish();
-        method(CTRL + "ChangePetView", "onGotPet", 1733);
+        method(CTRL + "ChangePetView", "onGotPet");
         at(0x21, ReturnVoid);
         at(0x23, GetProperty, member("_curPet"));
         guard(0x22, "skip", seq(field("fightPanel"), op(GetProperty, pub("petMCList")), field("_locaId"),
@@ -161,7 +164,7 @@ class MyProBattleEffectsPatch {
                 op(GetLocal2), op(CallProperty, pub("getChildIndex"), 1), op(GetLocal2), invoke("onPetChange", 2),
                 SELF, invoke("onEffectMoviePlayed", 0), END));
         finish();
-        method(CTRL + "BattlePmDying", "showPetDieEffect", 1962);
+        method(CTRL + "BattlePmDying", "showPetDieEffect");
         at(0x34, SetSlot, 4);
         guard(0x36, "skip", seq(slot(4), whenTrue(seq(slot(4), op(CallPropVoid, pub("disposeMouseResponder"), 0),
                 slot(4), op(PushFalse), op(SetProperty, pub("visible")))),
@@ -179,7 +182,7 @@ class MyProBattleEffectsPatch {
 
     void skills() throws Exception {
         String use = CTRL + "UseSkill";
-        method(use, "handleUseSkill", 1825);
+        method(use, "handleUseSkill");
         at(0x181, ReturnVoid); at(0x182, GetLocal0);
         at(0x183, FindPropertyStrict, abc.constants.getQnameId("AoYiMovieHelper", Namespace.KIND_PACKAGE,
                 BASE + "fightcontroller", false));
@@ -188,11 +191,11 @@ class MyProBattleEffectsPatch {
         at(0x1b2, CallProperty, member("isNeedToHandleWangzheReal"), 1);
         guard(0x1ad, "skip", skillDataAndMovie(slot(1)));
         finish();
-        method(use, "handleAnnalFeeEight", 1832);
+        method(use, "handleAnnalFeeEight");
         at(0x28, SetSlot, 2);
         guard(0x2a, "skip", skillDataAndMovie(op(GetLocal2)));
         finish();
-        method(use, "handleMovie", 1859);
+        method(use, "handleMovie");
         at(0x1b3, ReturnVoid); at(0x1b4, GetScopeObject, 1);
         int manager = abc.constants.getQnameId("FightFrameRateManager", Namespace.KIND_PACKAGE, BASE + "manager", false);
         if (manager == 0) throw new IllegalStateException("Frame rate manager missing");
@@ -201,18 +204,18 @@ class MyProBattleEffectsPatch {
                 updatePanel("setBS", "skillBS"), updatePanel("setBackGroundUp", "_bus"),
                 updatePanel("setPetUp", "_skillParams"), SELF, invoke("handleSkillEnd", 0), END));
         finish();
-        method(use, "getMuiltHitDecHpDelayFrame", 1933);
+        method(use, "getMuiltHitDecHpDelayFrame");
         at(1, PushScope);
         guard(2, "skip", seq(op(PushByte, 1), op(ReturnValue)));
         finish();
     }
 
     void queue() throws Exception {
-        method(CTRL + "BattleNextTurn", "checkPlayMovie", 1708);
+        method(CTRL + "BattleNextTurn", "checkPlayMovie");
         at(1, PushScope);
         guard(2, "skip", seq(SELF, invoke("handle", 0), END));
         finish();
-        method("FightController", "startHandle", 3854);
+        method("FightController", "startHandle");
         at(0x1c, GetLex, abc.constants.getQnameId("EnterFrameManager", Namespace.KIND_PACKAGE, "mmo.common.event", false));
         guard(0x1c, "skip", seq(SELF, op(CallPropVoid, pub("handle"), 0), END));
         finish();

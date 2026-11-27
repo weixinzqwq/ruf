@@ -58,7 +58,7 @@ struct TranslationUnitData<'gc> {
     abc: Rc<AbcFile>,
 
     #[collect(require_static)]
-    battle_methods: Box<[(u32, Operation)]>,
+    method_operations: Box<[(u32, Operation)]>,
 
     /// All classes loaded from the ABC's class list.
     classes: Box<[OnceLock<Class<'gc>>]>,
@@ -99,7 +99,7 @@ impl<'gc> TranslationUnit<'gc> {
         let this = TranslationUnitData {
             domain,
             name,
-            battle_methods: Operation::battle_methods(&abc),
+            method_operations: Operation::bind_methods(&abc),
             classes: repeat_n(OnceLock::new(), abc.classes.len()).collect(),
             methods: repeat_n(OnceLock::new(), abc.methods.len()).collect(),
             scripts: repeat_n(OnceLock::new(), abc.scripts.len()).collect(),
@@ -153,7 +153,7 @@ impl<'gc> TranslationUnit<'gc> {
     }
 
     pub(super) fn swf_operation(self, index: u32) -> Operation {
-        Operation::for_method(&self.0.abc, index, &self.0.battle_methods)
+        Operation::for_method(index, &self.0.method_operations)
     }
 
     /// Determines whether this `TranslationUnit` and the provided

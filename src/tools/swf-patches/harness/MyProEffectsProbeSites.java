@@ -5,6 +5,7 @@ import com.jpexs.decompiler.flash.SWF;
 import com.jpexs.decompiler.flash.abc.ABC;
 import com.jpexs.decompiler.flash.abc.avm2.AVM2Code;
 import com.jpexs.decompiler.flash.abc.avm2.instructions.AVM2Instruction;
+import com.jpexs.decompiler.flash.abc.types.MethodBody;
 import com.jpexs.decompiler.flash.abc.types.Namespace;
 import com.jpexs.decompiler.flash.abc.types.traits.TraitMethodGetterSetter;
 import static com.jpexs.decompiler.flash.abc.avm2.instructions.AVM2Instructions.*;
@@ -13,8 +14,8 @@ import static com.jpexs.decompiler.flash.abc.avm2.instructions.AVM2Instructions.
 // constant-pool indices (public fixture fields stand in for private fields) and
 // branch distances change. False falls through to the fixture's original body.
 class MyProEffectsProbeSites {
-    static void lift(ABC game, ABC probe, int id, String flag, String target) throws Exception {
-        var body = game.findBody(id);
+    static void lift(ABC game, ABC probe, String owner, String member, String flag, String target) throws Exception {
+        var body = method(game, "mmo.petfightnew.common." + owner, member);
         var code = body.getCode();
         int helper = game.constants.getQnameId("MyProBattleEffects", Namespace.KIND_PACKAGE, "aola.tools", false);
         var start = code.code.stream().filter(i -> i.definition.instructionCode == GetLex && i.operands[0] == helper)
@@ -67,15 +68,25 @@ class MyProEffectsProbeSites {
         fixture.getCode().checkValidOffsets(fixture);
     }
 
+    static MethodBody method(ABC abc, String owner, String target) {
+        var cls = abc.instance_info.get(abc.findClassByName(owner));
+        var method = (TraitMethodGetterSetter)cls.instance_traits.traits.stream().filter(t ->
+                target.equals(abc.constants.getString(t.getName(abc).name_index))).findFirst().orElseThrow();
+        return abc.findBody(method.method_info);
+    }
+
     public static void main(String[] args) throws Exception {
         try (var input = Files.newInputStream(Path.of(args[0])); var mock = Files.newInputStream(Path.of(args[1]));
              var output = Files.newOutputStream(Path.of(args[2]))) {
             var game = new SWF(input, false).getAbcList().getLast().getABC();
             var probe = new SWF(mock, false).getAbcList().getFirst().getABC();
-            lift(game, probe, 1089, "damage", "hit"); lift(game, probe, 1086, "healing", "heal");
-            lift(game, probe, 1083, "multiple", "multi"); lift(game, probe, 1644, "skip", "change");
-            lift(game, probe, 1859, "skip", "skill"); lift(game, probe, 1708, "skip", "next");
-            lift(game, probe, 1933, "skip", "delay");
+            lift(game, probe, "SkillResultMovieHandler", "showReallyHit", "damage", "hit");
+            lift(game, probe, "SkillResultMovieHandler", "showIncMovie", "healing", "heal");
+            lift(game, probe, "SkillResultMovieHandler", "showMultipleHit", "multiple", "multi");
+            lift(game, probe, "fightcontroller.SwitchPm", "showSwitchMc", "skip", "change");
+            lift(game, probe, "fightcontroller.UseSkill", "handleMovie", "skip", "skill");
+            lift(game, probe, "fightcontroller.BattleNextTurn", "checkPlayMovie", "skip", "next");
+            lift(game, probe, "fightcontroller.UseSkill", "getMuiltHitDecHpDelayFrame", "skip", "delay");
             probe.saveToStream(output);
         }
     }

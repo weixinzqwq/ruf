@@ -1,4 +1,4 @@
-//! Observable method returns in the verified backpack and battle ABCs.
+//! Observable game method returns, bound by name when the ABC loads.
 use std::sync::OnceLock;
 use swf::avm2::types::{AbcFile, Index, Multiname, Namespace, TraitKind};
 
@@ -22,32 +22,89 @@ pub(super) enum Operation {
 }
 
 impl Operation {
-    /// Bind the FightPanel methods once for this ABC, before any AVM calls.
-    pub(super) fn battle_methods(abc: &AbcFile) -> Box<[(u32, Self)]> {
+    pub(super) fn bind_methods(abc: &AbcFile) -> Box<[(u32, Self)]> {
+        Self::bind_methods_with_options(
+            abc,
+            Self::sampling_enabled(),
+            crate::pet_switch_frame::enabled(),
+        )
+    }
+
+    fn bind_methods_with_options(
+        abc: &AbcFile,
+        sampling: bool,
+        pet_switch_timing: bool,
+    ) -> Box<[(u32, Self)]> {
         let pool = &abc.constant_pool;
         let qname = |id: Index<Multiname>| pool.multinames.get(id.0.checked_sub(1)? as usize);
         let string = |id: Index<String>| pool.strings.get(id.0.checked_sub(1)? as usize).map(Vec::as_slice);
-        let owner = abc.instances.iter().find(|owner| {
-            let Some(Multiname::QName { namespace, name }) = qname(owner.name) else { return false };
+        let typename = |id| match qname(id)? {
+            Multiname::QName { name, .. } => string(*name),
+            _ => None,
+        };
+        let mut methods = Vec::new();
+        for (class_index, owner) in abc.instances.iter().enumerate() {
+            let Some(Multiname::QName { namespace, name }) = qname(owner.name) else { continue };
             let Some(Namespace::Package(package)) = namespace.0.checked_sub(1)
-                .and_then(|id| pool.namespaces.get(id as usize)) else { return false };
-            string(*package) == Some(b"mmo.petfightnew.common")
-                && string(*name) == Some(b"FightPanel")
-        });
-        let Some(owner) = owner else { return Box::default() };
-        let mut methods = vec![(owner.init_method.0, Self::ConstructFight)];
-        for member in &owner.traits {
-            let TraitKind::Method { method, .. } = member.kind else { continue };
-            let Some(Multiname::QName { name, .. }) = qname(member.name) else { continue };
-            let operation = match string(*name) {
-                Some(b"enableClick") => Self::BattleEnableClick,
-                Some(b"disableClick") => Self::BattleDisableClick,
-                Some(b"initPet") => Self::BattleInitPet,
-                Some(b"dispose") => Self::DisposeFight,
-                Some(b"disposeManagers") => Self::DisposeFightManagers,
-                _ => continue,
+                .and_then(|id| pool.namespaces.get(id as usize)) else { continue };
+            let mut traits = owner.traits.as_slice();
+            let (constructor, members): (Option<Self>, &[(&[u8], Self)]) =
+                match (string(*package), string(*name)) {
+                    (Some(b"mmo.petfightnew.common"), Some(b"FightPanel")) => (
+                        Some(Self::ConstructFight),
+                        &[
+                            (b"enableClick", Self::BattleEnableClick),
+                            (b"disableClick", Self::BattleDisableClick),
+                            (b"initPet", Self::BattleInitPet),
+                            (b"dispose", Self::DisposeFight),
+                            (b"disposeManagers", Self::DisposeFightManagers),
+                        ],
+                    ),
+                    (Some(b"mmo.play.activity.helper"), Some(b"Panel_Helper")) => {
+                        // Capture can be enabled after this ABC is loaded.
+                        let Some(class) = abc.classes.get(class_index) else { continue };
+                        traits = &class.traits;
+                        (None, &[(b"loadResAndShow", Self::OpenActivityPanel)])
+                    }
+                    (Some(b"mmo.petfightnew.common.fightcontroller"), Some(b"SwitchPm"))
+                        if pet_switch_timing =>
+                    {
+                        (None, &[(b"switchPet", Self::SwitchPet)])
+                    }
+                    (Some(b"mmo.petpackage.controller.skin"), Some(b"PackageSkinManager"))
+                        if sampling =>
+                    {
+                        (None, &[(b"changeClassify", Self::ClassifyView), (b"dispose", Self::DisposeSkin)])
+                    }
+                    (Some(b"mmo.petpackage.panel"), Some(b"PetPackagePanel")) if sampling => (
+                        Some(Self::ConstructPanel),
+                        &[(b"disposeEvent", Self::DisposePanel)],
+                    ),
+                    (Some(b"mmo.petpackage.panel"), Some(b"SimpleViewController")) if sampling => (
+                        None,
+                        &[(b"onClickMe", Self::ClickView), (b"changeStyle", Self::ChangeStyle)],
+                    ),
+                    _ => continue,
             };
-            methods.push((method.0, operation));
+            if let Some(operation) = constructor {
+                methods.push((owner.init_method.0, operation));
+            }
+            for member in traits {
+                let TraitKind::Method { method, .. } = member.kind else { continue };
+                let Some(name) = typename(member.name) else { continue };
+                let Some(&(_, operation)) = members.iter().find(|(member, _)| *member == name) else { continue };
+                if operation == Self::OpenActivityPanel {
+                    let Some(signature) = abc.methods.get(method.0 as usize) else { continue };
+                    let types: [&[u8]; 6] = [b"String", b"String", b"Object", b"ResDomain", b"Function", b"int"];
+                    if signature.params.len() != types.len()
+                        || typename(signature.return_type) != Some(b"void")
+                        || !signature.params.iter().zip(types).all(|(param, name)| typename(param.kind) == Some(name))
+                    {
+                        continue;
+                    }
+                }
+                methods.push((method.0, operation));
+            }
         }
         methods.into_boxed_slice()
     }
@@ -65,54 +122,9 @@ impl Operation {
             || crate::orphan_manager::ordinary_orphan_mode() == "battle")
     }
 
-    pub(super) fn for_method(abc: &AbcFile, index: u32, battle_methods: &[(u32, Self)]) -> Self {
-        if let Some((_, operation)) = battle_methods.iter().find(|(id, _)| *id == index) {
-            return *operation;
-        }
-        // Check the cheap method index before inspecting the owner and binding.
-        let (operation, instance, package, class, member) = match index {
-            // Method bindings are cached before the tools window can enable capture.
-            14 => (Self::OpenActivityPanel, 0, "mmo.play.activity.helper", "Panel_Helper", "loadResAndShow"),
-            222 => (Self::ClassifyView, 28, "mmo.petpackage.controller.skin", "PackageSkinManager", "changeClassify"),
-            224 => (Self::DisposeSkin, 28, "mmo.petpackage.controller.skin", "PackageSkinManager", "dispose"),
-            317 => (Self::ConstructPanel, 41, "mmo.petpackage.panel", "PetPackagePanel", ""),
-            375 => (Self::DisposePanel, 41, "mmo.petpackage.panel", "PetPackagePanel", "disposeEvent"),
-            1231 => (Self::ClickView, 128, "mmo.petpackage.panel", "SimpleViewController", "onClickMe"),
-            1232 => (Self::ChangeStyle, 128, "mmo.petpackage.panel", "SimpleViewController", "changeStyle"),
-            1646 if crate::pet_switch_frame::enabled() => (Self::SwitchPet, 143, "mmo.petfightnew.common.fightcontroller", "SwitchPm", "switchPet"),
-            _ => return Self::Other,
-        };
-        if !(matches!(operation, Self::SwitchPet | Self::OpenActivityPanel) || Self::sampling_enabled()) {
-            return Self::Other;
-        }
-        let Some(owner) = abc.instances.get(instance) else { return Self::Other };
-        let pool = &abc.constant_pool;
-        let qname = |id: Index<Multiname>| pool.multinames.get(id.0.checked_sub(1)? as usize);
-        let string = |id: Index<String>| pool.strings.get(id.0.checked_sub(1)? as usize).map(Vec::as_slice);
-        let Some(Multiname::QName { namespace, name }) = qname(owner.name) else { return Self::Other };
-        let Some(Namespace::Package(uri)) = namespace.0.checked_sub(1).and_then(|i| pool.namespaces.get(i as usize)) else {
-            return Self::Other;
-        };
-        if string(*uri) != Some(package.as_bytes()) || string(*name) != Some(class.as_bytes()) {
-            return Self::Other;
-        }
-        let bound = if operation == Self::OpenActivityPanel {
-            let Some(class) = abc.classes.get(instance) else { return Self::Other };
-            let Some(method) = abc.methods.get(index as usize) else { return Self::Other };
-            // Official play~261031358096721 helper ABC: static binding and complete six-parameter signature.
-            let typename = |key| match qname(key)? { Multiname::QName { name, .. } => string(*name), _ => None };
-            let types: [&[u8]; 6] = [b"String", b"String", b"Object", b"ResDomain", b"Function", b"int"];
-            method.params.len() == types.len() && typename(method.return_type) == Some(&b"void"[..])
-                && method.params.iter().zip(types).all(|(param, name)| typename(param.kind) == Some(name))
-                && class.traits.iter().any(|t| matches!(t.kind, TraitKind::Method { method, .. } if method.0 == index)
-                    && matches!(qname(t.name), Some(Multiname::QName { name, .. }) if string(*name) == Some(member.as_bytes())))
-        } else if operation == Self::ConstructPanel {
-            owner.init_method.0 == index
-        } else {
-            owner.traits.iter().any(|t| matches!(t.kind, TraitKind::Method { method, .. } if method.0 == index)
-                && matches!(qname(t.name), Some(Multiname::QName { name, .. }) if string(*name) == Some(member.as_bytes())))
-        };
-        if bound { operation } else { Self::Other }
+    pub(super) fn for_method(index: u32, methods: &[(u32, Self)]) -> Self {
+        methods.iter().find_map(|&(id, operation)| (id == index).then_some(operation))
+            .unwrap_or(Self::Other)
     }
 
     pub(super) fn observes_return(self) -> bool {
@@ -188,12 +200,134 @@ mod tests {
             scripts: vec![],
             method_bodies: vec![],
         };
-        let methods = Operation::battle_methods(&abc);
+        let methods = Operation::bind_methods(&abc);
         for (index, expected) in [(19, ConstructFight), (20, BattleEnableClick),
             (39, BattleDisableClick), (38, DisposeFight), (58, DisposeFightManagers), (81, BattleInitPet),
             (40, Other), (101, Other), (111, Other), (4023, Other)] {
-            assert_eq!(Operation::for_method(&abc, index, &methods), expected);
+            assert_eq!(Operation::for_method(index, &methods), expected);
         }
+    }
+
+    #[test]
+    fn aola_game_operations_bind_shifted_methods_by_name() {
+        use swf::avm2::types::{
+            AbcFile, Class, ConstantPool, Index, Instance, Method, MethodFlags, MethodParam,
+            Multiname, Namespace, Trait, TraitKind,
+        };
+
+        let mut pool = ConstantPool {
+            ints: vec![],
+            uints: vec![],
+            doubles: vec![],
+            strings: vec![],
+            namespaces: vec![],
+            namespace_sets: vec![],
+            multinames: vec![],
+        };
+        let mut qname = |package: &str, name: &str| {
+            pool.strings.push(package.as_bytes().to_vec());
+            pool.namespaces.push(Namespace::Package(Index::new(pool.strings.len() as u32)));
+            pool.strings.push(name.as_bytes().to_vec());
+            pool.multinames.push(Multiname::QName {
+                namespace: Index::new(pool.namespaces.len() as u32),
+                name: Index::new(pool.strings.len() as u32),
+            });
+            Index::new(pool.multinames.len() as u32)
+        };
+        let member = |name, method| Trait {
+            name,
+            kind: TraitKind::Method { disp_id: 0, method: Index::new(method) },
+            metadata: vec![],
+            is_final: false,
+            is_override: false,
+        };
+        let class = |name, constructor, traits| Instance {
+            name,
+            super_name: Index::new(0),
+            is_sealed: false,
+            is_final: false,
+            is_interface: false,
+            protected_namespace: None,
+            interfaces: vec![],
+            init_method: Index::new(constructor),
+            traits,
+        };
+        let load = qname("", "loadResAndShow");
+        let instances = vec![
+            class(qname("mmo.play.activity.helper", "Panel_Helper"), 0, vec![member(load, 9)]),
+            class(qname("mmo.petfightnew.common.fightcontroller", "SwitchPm"), 0,
+                vec![member(qname("", "switchPet"), 2)]),
+            class(qname("mmo.petpackage.controller.skin", "PackageSkinManager"), 0,
+                vec![member(qname("", "changeClassify"), 3), member(qname("", "dispose"), 4)]),
+            class(qname("mmo.petpackage.panel", "PetPackagePanel"), 5,
+                vec![member(qname("", "disposeEvent"), 6)]),
+            class(qname("mmo.petpackage.panel", "SimpleViewController"), 0,
+                vec![member(qname("", "onClickMe"), 7), member(qname("", "changeStyle"), 8)]),
+        ];
+        let mut classes = vec![Class { init_method: Index::new(0), traits: vec![] }; instances.len()];
+        classes[0].traits.push(member(load, 1));
+        let empty = Method {
+            name: Index::new(0),
+            return_type: qname("", "void"),
+            params: vec![],
+            flags: MethodFlags::empty(),
+            body: None,
+        };
+        let mut methods = vec![empty.clone(); 10];
+        methods[1].params = ["String", "String", "Object", "ResDomain", "Function", "int"]
+            .map(|name| MethodParam { kind: qname("", name), name: None, default_value: None })
+            .into();
+        methods[9] = methods[1].clone();
+        let mut abc = AbcFile {
+            major_version: 46,
+            minor_version: 16,
+            constant_pool: pool,
+            methods,
+            metadata: vec![],
+            instances,
+            classes,
+            scripts: vec![],
+            method_bodies: vec![],
+        };
+
+        let expected = [OpenActivityPanel, SwitchPet, ClassifyView, DisposeSkin, ConstructPanel,
+            DisposePanel, ClickView, ChangeStyle];
+        let bindings = Operation::bind_methods_with_options(&abc, true, true);
+        for (offset, operation) in expected.into_iter().enumerate() {
+            assert_eq!(Operation::for_method(offset as u32 + 1, &bindings), operation);
+        }
+        assert_eq!(Operation::for_method(9, &bindings), Other); // Same name and signature, instance trait.
+
+        let no_sampling = Operation::bind_methods_with_options(&abc, false, true);
+        assert_eq!(no_sampling.as_ref(), &[(1, OpenActivityPanel), (2, SwitchPet)]);
+        let no_switch_timing = Operation::bind_methods_with_options(&abc, true, false);
+        assert_eq!(Operation::for_method(2, &no_switch_timing), Other);
+
+        let shift = 73;
+        abc.methods.splice(0..0, std::iter::repeat_n(empty, shift as usize));
+        abc.instances.rotate_left(1);
+        abc.classes.rotate_left(1);
+        for owner in &mut abc.instances {
+            owner.init_method.0 += shift;
+        }
+        let traits = abc.instances.iter_mut().flat_map(|owner| &mut owner.traits)
+            .chain(abc.classes.iter_mut().flat_map(|owner| &mut owner.traits));
+        for member in traits {
+            if let TraitKind::Method { method, .. } = &mut member.kind {
+                method.0 += shift;
+            }
+        }
+        let bindings = Operation::bind_methods_with_options(&abc, true, true);
+        for (offset, operation) in expected.into_iter().enumerate() {
+            let original = offset as u32 + 1;
+            assert_eq!(Operation::for_method(original + shift, &bindings), operation);
+            assert_eq!(Operation::for_method(original, &bindings), Other);
+        }
+
+        let activity = &mut abc.methods[shift as usize + 1];
+        activity.params[5].kind = activity.params[0].kind;
+        let invalid = Operation::bind_methods_with_options(&abc, true, true);
+        assert_eq!(Operation::for_method(shift + 1, &invalid), Other);
     }
 
     #[test]
@@ -221,16 +355,16 @@ mod tests {
         let (mut abc, methods) = movie.tags.iter().find_map(|tag| {
             let swf::Tag::DoAbc2(tag) = tag else { return None };
             let abc = Reader::new(tag.data).read().unwrap();
-            let methods = Operation::battle_methods(&abc);
-            (!methods.is_empty()).then_some((abc, methods))
+            let methods = Operation::bind_methods(&abc);
+            methods.iter().any(|&(_, op)| op == ConstructFight).then_some((abc, methods))
         }).expect("FightPanel constructor");
         let binding = |target| methods.iter().find(|(_, op)| *op == target).unwrap().0;
         let constructor = binding(ConstructFight);
         let manager = binding(DisposeFightManagers);
         let dispose = binding(DisposeFight);
-        assert_eq!(Operation::for_method(&abc, binding(BattleEnableClick), &methods), BattleEnableClick);
-        assert_eq!(Operation::for_method(&abc, binding(BattleDisableClick), &methods), BattleDisableClick);
-        assert_eq!(Operation::for_method(&abc, binding(BattleInitPet), &methods), BattleInitPet);
+        assert_eq!(Operation::for_method(binding(BattleEnableClick), &methods), BattleEnableClick);
+        assert_eq!(Operation::for_method(binding(BattleDisableClick), &methods), BattleDisableClick);
+        assert_eq!(Operation::for_method(binding(BattleInitPet), &methods), BattleInitPet);
 
         let body = &abc.method_bodies[abc.methods[dispose as usize].body.unwrap().0 as usize];
         let mut code = Reader::new(&body.code);
@@ -254,10 +388,10 @@ mod tests {
         assert_eq!((manager_calls, early_return, completed_return), (1, true, true));
         let owner = abc.instances.iter().position(|owner| owner.init_method.0 == constructor).unwrap();
         abc.instances[owner].init_method = Index::new(0);
-        assert_eq!(Operation::for_method(&abc, constructor, &Operation::battle_methods(&abc)), Other);
+        assert_eq!(Operation::for_method(constructor, &Operation::bind_methods(&abc)), Other);
         abc.instances[owner].traits.retain(|t| !matches!(t.kind, TraitKind::Method { method, .. } if method.0 == manager));
-        assert_eq!(Operation::for_method(&abc, manager, &Operation::battle_methods(&abc)), Other);
+        assert_eq!(Operation::for_method(manager, &Operation::bind_methods(&abc)), Other);
         abc.instances[owner].name = Index::new(0);
-        assert_eq!(Operation::for_method(&abc, dispose, &Operation::battle_methods(&abc)), Other);
+        assert_eq!(Operation::for_method(dispose, &Operation::bind_methods(&abc)), Other);
     }
 }

@@ -2,6 +2,7 @@
 import argparse
 import os
 from pathlib import Path
+import re
 import shutil
 import struct
 import subprocess
@@ -13,7 +14,7 @@ from mypro_lineup_backpack import apply_lineup
 from mypro_model_recipe import RECIPES, model_table
 
 
-def build(work,emit=False):
+def build(work,emit=False,source=None):
     work.mkdir(parents=True, exist_ok=False)
     classes = work / "classes"
     classes.mkdir()
@@ -34,15 +35,23 @@ def build(work,emit=False):
     payload = struct.pack("<I", 1) + b"aola/tools/MyProBackpackMorph\0" + helper.with_suffix(".abc").read_bytes()
     helper_tag = struct.pack("<HI",(82 << 6) | 63,len(payload)) + payload
     java = [JAVA, "-cp", os.pathsep.join((str(classes),lib)), names[0]]
+    weekly = source is not None
+    if weekly:
+        if re.fullmatch(r"newpetpackage~[0-9]{1,32}\.swf", source.name) is None:
+            raise ValueError("Expected official filename newpetpackage~<numeric version>.swf")
+        cases = (("weekly", source, source.stat().st_size),)
+    else:
+        cases = (("supplied", ROOT/"newpetpackage.swf", 1524996), ("archived", REFERENCE, 1525161))
     tables = {}
-    for label, source, size in (("supplied", ROOT/"newpetpackage.swf", 1524996), ("archived", REFERENCE, 1525161)):
+    for label, source, size in cases:
         case = work / label
         case.mkdir()
         orig, patched = make_candidate(source, case, None, size, java_command=java)
         before = list(iter_tags(orig[8:]))
         tags = list(iter_tags(patched[8:]))
-        assert [t[0] for t in before] == [t[0] for t in tags]
-        assert [a[0] for a,b in zip(before,tags) if a[3]!=b[3]] == [82]
+        if ([t[0] for t in before] != [t[0] for t in tags]
+                or [a[0] for a,b in zip(before,tags) if a[3]!=b[3]] != [82]):
+            raise ValueError("Expected only the official backpack DoABC tag to change")
         offset, = [pos for kind,pos,_,_ in tags if kind==82]
         body = patched[8:8+offset] + helper_tag + patched[8+offset:]
         result = patched[:4] + struct.pack("<I",8+len(body)) + body
@@ -50,10 +59,11 @@ def build(work,emit=False):
         result = apply_lineup(result,case/"lineup")
         candidate.write_bytes(result)
         subprocess.run([*java,"--verify",candidate],check=True)
-        base_dir = case/"baseline"
-        base_dir.mkdir()
-        _, baseline = make_candidate(source,base_dir,None,size,java_command=[*java[:-1],"PetSwitchPatch"])
-        tables[RECIPES/f"aola_mypro_{label}.rs"] = model_table(baseline,result)
+        if not weekly:
+            base_dir = case/"baseline"
+            base_dir.mkdir()
+            _, baseline = make_candidate(source,base_dir,None,size,java_command=[*java[:-1],"PetSwitchPatch"])
+            tables[RECIPES/f"aola_mypro_{label}.rs"] = model_table(baseline,result)
         print(label, len(result))
     for path,table in tables.items():
         if table != path.read_text(encoding="ascii"):
@@ -67,5 +77,9 @@ if __name__ == "__main__":
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--output-dir",type=Path,required=True)
     ap.add_argument("--emit-table",action="store_true")
+    ap.add_argument("--weekly-source",type=Path)
     args=ap.parse_args()
-    build(args.output_dir.resolve(),args.emit_table)
+    if args.emit_table and args.weekly_source:
+        ap.error("--emit-table only applies to the built-in profiles")
+    source = args.weekly_source.resolve(strict=True) if args.weekly_source else None
+    build(args.output_dir.resolve(),args.emit_table,source)

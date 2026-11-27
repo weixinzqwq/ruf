@@ -484,8 +484,12 @@ impl ToolsHost {
             }
         }
         let size = game.inner_size();
+        let patch_mismatches: Vec<_> = ruffle_core::mypro_observer::patch_version_mismatches().into_iter()
+            .map(|item| json!({"resource":item.resource,"officialVersion":item.official_version,"localVersion":item.local_version}))
+            .collect();
         json!({"sessionId":session,"hasMovie":playing.is_some(),"playing":playing.unwrap_or(false),
             "logicalFrames":state.map(|s| s.1),"targetFps":state.map(|s| s.2),
+            "patchVersionMismatches":patch_mismatches,
             "viewport":{"width":size.width,"height":size.height},"capabilities":capabilities,
             "coreBuild":concat!("Ruffle ",env!("CARGO_PKG_VERSION"))})
     }

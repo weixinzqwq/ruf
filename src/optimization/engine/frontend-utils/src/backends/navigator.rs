@@ -1,5 +1,6 @@
 mod fetch;
 mod aola_pet_patch;
+mod aola_weekly_patch;
 mod aola_lifecycle;
 mod aola_swf_capture;
 mod aola_skin_recipe;
@@ -108,6 +109,7 @@ pub struct ExternalNavigatorBackend<F: FutureSpawner<Error>, I: NavigatorInterfa
     aola_lifecycle: Option<aola_lifecycle::Trial>,
     display_patches: Vec<Arc<aola_display_patch::DisplayPatch>>,
     aola_game_ui: Option<PathBuf>,
+    aola_weekly_patches: Option<Arc<aola_weekly_patch::Manifest>>,
 }
 
 impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F, I> {
@@ -177,6 +179,7 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
             aola_lifecycle: None,
             display_patches: Vec::new(),
             aola_game_ui: None,
+            aola_weekly_patches: None,
         }
     }
 
@@ -203,6 +206,11 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
             tracing::warn!("Couldn't create anonymous Aola resource client: {error}");
         }).ok();
         Ok(self)
+    }
+
+    pub fn with_aola_weekly_patches(mut self, data_root: &Path) -> Self {
+        self.aola_weekly_patches = Some(Arc::new(aola_weekly_patch::Manifest::load(data_root)));
+        self
     }
 
     pub fn with_aola_notice(mut self, bundle: Option<&Path>) -> Self {
@@ -265,6 +273,24 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
             }
         }
         self
+    }
+}
+
+fn wrap_aola_movie(
+    response: Box<dyn SuccessResponse>,
+    source: &'static str,
+    weekly: Option<aola_weekly_patch::Selection>,
+    lifecycle: Option<(aola_lifecycle::Trial, &'static str, String)>,
+    display: Option<Arc<aola_display_patch::DisplayPatch>>,
+    game_ui: Option<aola_game_ui::Selection>,
+) -> Box<dyn SuccessResponse> {
+    if let Some(weekly) = weekly {
+        return weekly.wrap(response, source, display, game_ui);
+    }
+    let response = aola_display_patch::wrap(display, source, aola_lifecycle::wrap(lifecycle, source, response));
+    match game_ui {
+        Some(selection) => selection.wrap(response),
+        None => response,
     }
 }
 
@@ -350,6 +376,10 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
         });
         let display_patch = self.display_patches.iter()
             .find(|p| p.recipe.accepts(&request, &processed_url)).cloned();
+        let weekly_patch = self.aola_weekly_patches.as_ref().and_then(|manifest| {
+            manifest.requested(&request, &processed_url, &self.display_patches, self.aola_game_ui.is_some(),
+                self.aola_lifecycle.is_some() || self.aola_pet_patch.is_some())
+        });
         let client = self.client.clone();
         let cookie_store = self.cookie_store.clone();
         let morph_client = self.morph_client.clone();
@@ -439,7 +469,7 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
                                 url: hit.response_url, response_body: ResponseBody::File(Ok(hit.bytes)),
                                 text_encoding, status: 200, redirected,
                             });
-                            return Ok(aola_display_patch::wrap(display_patch, "cache", aola_lifecycle::wrap(lifecycle, "cache", response)));
+                            return Ok(wrap_aola_movie(response, "cache", weekly_patch, lifecycle, display_patch, game_ui));
                         }
                         Ok(_) => {}
                         Err(error) => tracing::warn!("Static resource cache read failed: {error}"),
@@ -512,16 +542,13 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
                 let response = if let (Some(cache), Some(policy)) = (cache, cache_policy) {
                     Box::new(CachingResponse::new(response, cache, processed_url, policy)) as Box<dyn SuccessResponse>
                 } else { response };
-                Ok(aola_display_patch::wrap(display_patch, "network", aola_lifecycle::wrap(lifecycle, "network", response)))
+                Ok(wrap_aola_movie(response, "network", weekly_patch, lifecycle, display_patch, game_ui))
             }),
         };
         if let Some((trial, resource, version)) = error_trial {
             return Box::pin(async move {
                 fetch.await.inspect_err(|_| trial.reject(resource, &version, "fetch", "fetch-failed"))
             });
-        }
-        if let Some(selection) = game_ui {
-            return Box::pin(async move { Ok(selection.wrap(fetch.await?)) });
         }
         if let Some((catalog, url)) = catalog_request {
             return Box::pin(async move { Ok(aola_morph_intercept::capture_catalog(catalog, url, fetch.await?)) });

@@ -35,7 +35,9 @@ def run(candidate, runner, work):
     _, start, _, _ = next(t for t in iter_tags(body) if t[0] in (72, 82))
     body = body[:start] + struct.pack("<HI", (82 << 6) | 63, len(helper)) + helper + body[start:]
     (fixture / "test.swf").write_bytes(b"FWS\x12" + struct.pack("<I", len(body) + 8) + body)
-    (fixture / "test.toml").write_text("num_frames = 45\n")
+    # JPEG loading finishes on the worker executor. Give it wall time while
+    # advancing the normal fixture frames, including on a loaded build machine.
+    (fixture / "test.toml").write_text("num_frames = 45\nsleep_to_meet_frame_rate = true\n")
     expected = """bind 1 true
 pending scene change 1 1
 decoded 960 560 true true

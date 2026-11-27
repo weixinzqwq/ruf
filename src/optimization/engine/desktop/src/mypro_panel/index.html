@@ -84,6 +84,7 @@ details>summary{color:var(--blue);font-size:13px;font-weight:600}
 .enemy-ability{display:inline-block;margin:3px 12px 3px 0;font-size:13px}
 #battle .btn[aria-pressed=true]{background:var(--wash);border-color:var(--blue);color:var(--blue)}
 .note{position:sticky;top:8px;z-index:1;margin:0 0 10px;padding:8px 10px;background:#fff3df;color:#73431c;border:1px solid #edcca0;border-radius:5px;font-size:12px;overflow-wrap:anywhere}
+#patch-version-note{position:static;grid-column:1/-1;margin:0;white-space:pre-line}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:32vh;overflow:auto;padding:9px;background:#f2f5fa;border-radius:4px;font:12px/1.6 "IBM Plex Mono",Consolas,monospace}
 .spaced>*+*{margin-top:9px}
 #morph-search{max-width:300px}
@@ -128,6 +129,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:32vh;overflow:auto;pa
 <main>
 <p id="notice" class="note" role="status" hidden></p>
 <section id="overview">
+  <p id="patch-version-note" class="note" role="status" hidden></p>
   <article class="card">
     <h2>播放器</h2>
     <div class="row between"><span id="play-state" class="state" role="status">连接中</span><button class="btn primary" id="play" disabled>暂停播放</button></div>
@@ -361,6 +363,13 @@ function showOverview() {
   statusState("play-state",s.hasMovie ? (s.playing ? "正在播放" : "已暂停") : "等待游戏加载",s.hasMovie && s.playing);
   $("play").textContent=s.hasMovie && !s.playing ? "继续播放" : "暂停播放";
   setButton("play",s.hasMovie && cap(playCommand),s.capabilities?.[playCommand]?.reason);
+  const resources={battle:"petfightnew",backpack:"newpetpackage",notice:"messagesendservice",control:"controlv2",start:"start"};
+  const patchNote=$("patch-version-note");
+  const mismatches=Array.isArray(s.patchVersionMismatches) ? s.patchVersionMismatches : [];
+  const message=mismatches.filter(item=>Object.hasOwn(resources,item.resource)).map(item=>
+    `检测到官方 ${resources[item.resource]} 已更新至 ${item.officialVersion}，已自动回退官方原版，请运行 sync-weekly-swfs.ps1 同步补丁`).join("\n");
+  if (patchNote.textContent!==message) patchNote.textContent=message;
+  patchNote.hidden=!message;
   $("build").textContent=s.coreBuild || "—"; $("session").textContent=s.sessionId || "—";
   $("viewport").textContent=s.viewport?.width && s.viewport?.height ? s.viewport.width+" × "+s.viewport.height : "—";
   $("hide").disabled=false;

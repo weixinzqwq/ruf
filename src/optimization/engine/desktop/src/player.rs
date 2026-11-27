@@ -239,6 +239,7 @@ impl ActivePlayer {
 
         let navigator = if let Some(root)=preferences.cli.aola_data_dir.as_ref().filter(|_|preferences.cli.aola_host) {
             navigator.with_aola_cache(root.join("cache")).expect("Cannot initialize Aola resource cache")
+                .with_aola_weekly_patches(root)
         } else {navigator};
         let hide_notice = preferences.cli.aola_host
             && std::env::var_os("AOLA_HIDE_NOTICE").as_deref() == Some(std::ffi::OsStr::new("1"));

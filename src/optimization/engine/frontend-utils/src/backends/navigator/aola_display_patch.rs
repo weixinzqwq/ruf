@@ -73,6 +73,10 @@ pub(super) static ARCHIVED_BACKPACK: Recipe = Recipe {
 };
 
 impl Recipe {
+    pub(super) fn version_for_path(&self, path: &str) -> Option<&'static str> {
+        (self.path == path && !self.version.is_empty()).then_some(self.version)
+    }
+
     pub(super) fn audit(&self, source: &'static str, result: &'static str) {
         self.audit_version(source, result, self.version);
     }
@@ -207,7 +211,7 @@ impl DisplayPatch {
             .as_deref().map_err(|error| io::Error::new(error.kind(), error.to_string()))
     }
 
-    fn select(&self, source: &'static str, version: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+    pub(super) fn select(&self, source: &'static str, version: &str, bytes: &[u8]) -> Option<Vec<u8>> {
         let Ok(original) = self.original() else {
             self.recipe.audit_version(source, "invalid-reference", version);
             return None;
@@ -390,6 +394,49 @@ mod tests {
             response_body: ResponseBody::Network(Arc::new(std::sync::Mutex::new(Some(reqwest::Response::from(http))))) });
         assert_eq!(block_on(wrap(Some(patch), "network", network).body()).unwrap(), b"candidate");
         assert!(NOTICE.build(&vec![0; NOTICE.original_size]).is_err());
+    }
+
+    #[tokio::test]
+    async fn aola_weekly_notice_prefers_external_then_embedded_then_official() {
+        use super::super::aola_weekly_patch::Manifest;
+        use serde_json::json;
+        use sha2::{Digest, Sha256};
+
+        let temp = tempfile::tempdir().unwrap();
+        let patches = temp.path().join("patches");
+        std::fs::create_dir(&patches).unwrap();
+        let official = b"official-notice";
+        let external = b"FWS\x12\x17\0\0\0\x08\0\0\x18\x01\0\x43\x02\x01\0\0\x40\0\0\0";
+        let embedded = b"embedded-notice";
+        let candidate_file = patches.join("notice.fws.swf");
+        std::fs::write(&candidate_file, external).unwrap();
+        std::fs::write(patches.join("manifest.json"), json!({
+            "schemaVersion": 1,
+            "generatedAt": "2026-11-27T10:00:00Z",
+            "entries": [{
+                "resource": "notice", "path": NOTICE.path, "version": NOTICE.version,
+                "officialSha256": format!("{:x}", Sha256::digest(official)),
+                "candidateFile": "notice.fws.swf",
+                "candidateSha256": format!("{:x}", Sha256::digest(external)),
+            }],
+        }).to_string()).unwrap();
+        let manifest = Arc::new(Manifest::load(temp.path()));
+        let display = Arc::new(DisplayPatch::new(&NOTICE, temp.path()));
+        display.original.set(Ok(official.to_vec())).unwrap();
+        display.candidate.set(Ok(embedded.to_vec())).unwrap();
+        let url = Url::parse(&url()).unwrap();
+        let request = Request::get(url.to_string());
+        let load = |bytes: &[u8]| {
+            let selection = manifest.requested(&request, &url, &[display.clone()], false, false).unwrap();
+            selection.wrap(Box::new(Response {
+                url: url.to_string(), response_body: ResponseBody::File(Ok(bytes.to_vec())),
+                text_encoding: None, status: 200, redirected: false,
+            }), "cache", Some(display.clone()), None).body()
+        };
+        assert_eq!(load(official).await.unwrap(), external);
+        std::fs::write(&candidate_file, embedded).unwrap();
+        assert_eq!(load(official).await.unwrap(), embedded);
+        assert_eq!(load(b"changed-official").await.unwrap(), b"changed-official");
     }
 
     #[test]

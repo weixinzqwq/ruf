@@ -30,6 +30,7 @@ class Fixture:
         self.auto = False
         self.background = False
         self.theme = 0
+        self.patch_mismatches = []
         self.plans = []
         self.session_events = 0
         self.calls = []
@@ -62,6 +63,7 @@ class Fixture:
             capabilities += ["workshop.validate", "workshop.readOwnBag", "game.panels", "game.panel.open", "theme.read", "theme.apply",
                              "lineups.read", "lineups.refresh", "lineups.save", "lineups.restore"]
             return {"hasMovie": True, "playing": True, "sessionId": self.session,
+                    "patchVersionMismatches": self.patch_mismatches,
                     "viewport": {"width": 1200, "height": 700}, "coreBuild": "offline",
                     "capabilities": {key: {"available": True} for key in capabilities}}
         assert message["sessionId"] == self.session
@@ -396,6 +398,14 @@ def main():
         page.on("pageerror", lambda error: fixture.errors.append(str(error)))
         page.goto(PANEL_URL)
         expect(page.locator("#session")).to_have_text("fixture-one")
+        patch_note = page.locator("#patch-version-note")
+        expect(patch_note).to_be_hidden()
+        fixture.patch_mismatches = [{"resource": "battle", "officialVersion": "261127000000000",
+                                     "localVersion": "261112849126071"}]
+        expect(patch_note).to_contain_text("检测到官方 petfightnew 已更新至 261127000000000")
+        expect(patch_note).to_contain_text("sync-weekly-swfs.ps1")
+        fixture.patch_mismatches = []
+        expect(patch_note).to_be_hidden()
         capture(page, fixture)
         morph(page, fixture)
         packets(page, fixture)

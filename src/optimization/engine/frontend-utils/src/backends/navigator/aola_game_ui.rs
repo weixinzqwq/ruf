@@ -7,6 +7,9 @@ use ruffle_core::loader::Error;
 use std::path::{Path, PathBuf};
 use url::Url;
 
+const START_VERSION: &str = "2107300001";
+const CONTROL_VERSION: &str = "2026082731219998";
+
 #[derive(Clone, Copy)]
 pub(super) enum Asset {
     Start,
@@ -15,6 +18,14 @@ pub(super) enum Asset {
 }
 
 impl Asset {
+    pub(super) fn version_for_path(path: &str) -> Option<&'static str> {
+        match path {
+            "/play/start" => Some(START_VERSION),
+            "/play/control/controlv2" => Some(CONTROL_VERSION),
+            _ => None,
+        }
+    }
+
     pub(super) fn requested(request: &Request, url: &Url) -> Option<Self> {
         if !matches!(url.scheme(), "https" | "http")
             || url.host_str() != Some("aola.100bt.com")
@@ -31,17 +42,18 @@ impl Asset {
         {
             return None;
         }
-        match url.path() {
-            "/play/start~2107300001.swf" => Some(Self::Start),
-            "/play/control/controlv2~2026082731219998.swf" => Some(Self::Control),
-            path => {
+        let path = url.path().strip_suffix(".swf")?;
+        match path.split_once('~') {
+            Some(("/play/start", START_VERSION)) => Some(Self::Start),
+            Some(("/play/control/controlv2", CONTROL_VERSION)) => Some(Self::Control),
+            None => {
                 let id = path
-                    .strip_prefix("/play/aola-helper/theme/skin")?
-                    .strip_suffix(".swf")?;
+                    .strip_prefix("/play/aola-helper/theme/skin")?;
                 let number = id.parse::<u8>().ok()?;
                 ((1..=10).contains(&number) && id == number.to_string())
                     .then_some(Self::Skin(number))
             }
+            _ => None,
         }
     }
 }
@@ -130,14 +142,14 @@ impl Selection {
 
     fn audit(&self, result: &'static str) {
         let (source, version) = match self.asset {
-            Asset::Start => ("start", "2107300001"),
-            Asset::Control => ("control", "2026082731219998"),
+            Asset::Start => ("start", START_VERSION),
+            Asset::Control => ("control", CONTROL_VERSION),
             Asset::Skin(_) => return,
         };
         tracing::info!(target:"aola_game_ui",source,version,result);
     }
 
-    fn candidate(&self, received: &[u8]) -> Option<Vec<u8>> {
+    pub(super) fn candidate(&self, received: &[u8]) -> Option<Vec<u8>> {
         let (original, patched, packed_len, movie_len, profile): (_, _, _, _, &[u8]) =
             match self.asset {
                 Asset::Start => (
