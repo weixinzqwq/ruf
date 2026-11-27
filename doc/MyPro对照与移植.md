@@ -2,6 +2,54 @@
 
 2026-11-23。两份合作方报告的文件内容逐字节相同。以下 E 编号均指该报告。实现基于本项目的 `src/optimization`、本地官方游戏素材和现有运行包。性能实验沿用 11 月 23 日 Flux 包的画质、帧率和立绘设置。[报告](../MyPro_v1.0.0_static_analysis.txt) · [spec 文件](../MyPro_v1.0.0_static_analysis_spec.txt)
 
+## MyPro 1.0.2 高帧率对照
+
+2026-11-27，对比项目根目录的 `MyPro v1.0.1.exe` 和下载目录的 `MyPro v1.0.2.exe`，只读取两版发行文件及本机已有的性能相关设置、缓存。下表的 RVA 是以 EXE 映像基址为起点的地址，文件偏移另行注明。
+
+| 问题 | 两版差异与复核依据 |
+| --- | --- |
+| 120 FPS 控制什么 | 旧面板提供 25、30、45、60。新版在文件偏移 `0x1BBD41F`、`0x1BBD4DC` 增加 90、120，沿用 `ipc.emit("framerate", [fps])`。原生宿主在 RVA `0x1F3B96` 和 `0x1F3B9B` 接受 90、120，其他非支持值回退到 60，再调用 `0x1F8F70` 存储并传递目标值。两版自带帮助均说明帧率覆盖作用于时间线和脚本。面板提示在发出设置后立即显示。[帧率分支反汇编](../build/mypro102-fps-native/frame-rate-dispatch.txt) |
+| 热点脚本如何加速 | 新版 AVM2 即时编译（JIT）默认开启。RVA `0xA742C2` 递增单个脚本方法的计数，`0xA742DE` 检查阈值，默认值 8。符合条件的方法可生成 x64 代码，经 `0xA74766` 调用。内置统计分别记录已编译方法、实际进入次数和回退次数。旧版未找到对应的 JIT 模块路径、设置或统计。新版还包含默认开启的属性访问缓存、组合字节码操作与内联开关。[方法计数、默认值和机器码入口](../build/mypro102-fps-engine/avm2-hot-path.txt) |
+| 第二次打开能复用什么 | 新版支持把编译结果保存在 `aot-cache`，并提供独立的持久缓存开关。11 月 27 日 08:14:45 至 08:16:46，本机 MyPro 数据目录留下 875 个 `.aoqiaot`，合计 9,346,887 字节，全部以 `AOQIMOD7` 开头。按文件大小抽取最小、中位、最大三份解压，均含可反汇编的 x64 代码。配置中读到 `FrameRate=120`。缓存文件数不代表某场的命中数；要计算收益仍需要对应的 `aot_hits`、`entries` 与同场帧耗时。 |
+| 换宠后哪些动画会停 | 两版各识别出 14 个完整内嵌 SWF，其中 13 个逐字节一致。战斗主体 `petfightnew` 有改动，文件头均为 25 FPS。两版 `ChangePetView.onPetChange` 都会先处置旧宠。新版 `MCPetContainer.dispose` 对普通动作动画新增从 `FightMovieManager` 注销、停止和移除的步骤，并释放大招加载器。加载器清空回调与资源域，丢弃已处置后的异步结果。这条改动会在换宠时生效。它减少了旧动画被播放列表继续持有的机会，单场节省的时间尚无计数。[换宠入口](../build/mypro102-fps-res/new-export/scripts/mmo/petfightnew/common/fightcontroller/ChangePetView.as) · [旧宠处置](../build/mypro102-fps-res/new-export/scripts/mmo/petfightnew/common/MCPetContainer.as) · [大招加载器](../build/mypro102-fps-res/new-export/scripts/mmo/petfightnew/common/manager/GQKillBigMovieLoader.as) |
+| 渲染与 GC 有多少证据 | 提取到的 59 个 WGSL 着色器入口正文和出现次数在两版一致。融合发光、纹理池预算、空闲纹理上限、模糊遍数等设置读取函数在屏蔽重定位后指令一致，战斗 GC 开关两版均存在。检查只覆盖这些着色器和原生路径，其他 CPU 侧渲染、驱动提交或 GC 调度仍可能有变化。 |
+
+本次证据支持解释高帧率档位、脚本 CPU 开销和换宠残留。120 FPS 对应每帧约 8.33 ms。要量化各项贡献，可用同一台机器、同分辨率、同一场景，在 1.0.2 内固定 120 档比较默认模式和 `--no-jit` 的实际呈现、脚本及渲染耗时，并分开看首次加载和缓存预热后的换宠窗口。
+
+REA 两版 PE/Rust 元数据记录为 `ev_4e24f0663fb1527db5045f67871184448c971304cd6289f1cf23997f7a2c3109`（1.0.1）及 `ev_2355469426a944c4f20c2f579e42e7d0d435fc1d9f38a7cd8c02a442c90d827b`（1.0.2）。原生指令和 SWF 行为分别由本地反汇编与 ActionScript 对照确认。
+
+## 本项目的 120 FPS 测试包
+
+同一套播放器提供三个入口。首次使用直接运行 [run-game.cmd](../dist/aola-mypro102-20261127/run-game.cmd) 为 60 FPS，「功能面板 → 表现 → 播放帧率」可在游戏内切换 60、90、120，普通入口下次恢复已保存的值。[run-120fps.cmd](../dist/aola-mypro102-20261127/run-120fps.cmd) 明确以 120 启动。[run-120fps-no-jit.cmd](../dist/aola-mypro102-20261127/run-120fps-no-jit.cmd) 用同一 EXE 和游戏数据目录，目标也是 120，同时关闭整数机器码与字段读取加速，可与前一个入口做同负载对照。改变目标帧率会改变按帧推进的动画和脚本速度。实际逻辑帧率、呈现帧率分别看性能日志的 `logicalFps` 和 `presentedFps`。
+
+选招限帧加入后，开启该选项的手动选招窗口使用最高 25 FPS，演出和原生自动战斗使用选定基准。做 60／90／120 FPS 的同阶段对照时，保持两组的选招开关一致，并用逻辑帧率确认采样区间处于同一战斗阶段。[战斗选招帧率](MyPro原生面板与形态.md#战斗选招帧率)
+
+### 脚本执行范围与缓存
+
+奥拉宿主默认对经 AVM2 验证、优化后的短方法识别两类形状。Windows x64 可为最多两个局部输入、最多 15 次连续整数加、减、乘、按位与、或、异或生成本机代码。直接从已知对象槽位取值的短方法可走单独的字段读取分支。冷方法第 8 次调用起尝试加速，参数类型、方法形状、异常表或执行条件不适用时继续解释执行。方法返回仍执行原有的类型转换。动态属性、通用方法调用、循环和复杂战斗脚本继续使用现有 AVM2 引擎。[方法识别和返回处理](../src/optimization/engine/core/src/avm2/hot_method.rs) · [整数代码生成与回退](../src/optimization/engine/core/src/avm2/hot_method/native_int.rs)
+
+正常退出时把热点提示及整数机器码保存到本包的 `aola-data/cache/avm2-hot-v1.bin`、`avm2-win64-v1.bin`。最多保留 4,096 个提示、256 种机器码。下次启动只接受规定的叶函数指令序列，并在绑定到当前方法前按本次验证后生成的完整指令逐字节匹配。缺失或损坏的条目会回退到本地生成。两份缓存均可重建。关窗分段日志将保存耗时单列为 `avm2-hot-profile`。[缓存读取与匹配](../src/optimization/engine/core/src/avm2_hot_cache/native.rs)
+
+### 换宠与实战核对
+
+官方 `petfightnew` 版本 `261112849126071` 的基础补丁修改 `MCPetContainer.dispose`：停止并注销普通动作动画，释放旧大招加载器。在 `GQKillBigMovieLoader.createCommonMovie`、`parseBitmapMovie` 及 `loadJumpTipsOnMovie` 的加载路径增加处置状态和缺失引用检查。支持的工具面板叠加包同样包含清理。其他未通过版本匹配的 SWF 沿用原始资源。[补丁生成器](../src/tools/swf-patches/battle_patch.java) · [原版与补丁离线行为](../build/mypro102-pet-cleanup/acceptance.json)
+
+实战可用包内 [measure-game-close.ps1](../dist/aola-mypro102-20261127/measure-game-close.ps1) 正常关窗。按 `close-timing` 的 PID 查对应性能日志，使用同一换宠小窗的 `performanceInterval.avm2HotMethods` 和 `presentedFps` 对齐。前者的 `jitEntries`、`getterEntries` 是该区间的实际进入次数，`guardFallbacks` 是类型或作用域守卫拒绝次数。顶层 `avm2HotMethods` 为同线程累计值，`cachedKernelHits` 统计从持久缓存绑定的代码形状数。实战对照应固定阵容、窗口和战斗顺序，分别记录首次载入、预热后换宠及关窗。
+
+离线回归已用发行配置运行。核心 211 项通过、4 项忽略，桌面 132 项通过。包内战斗 SWF 通过旧动画重复处置和迟到回调测试，官方旧版在同一组断言中暴露了原问题。[核心测试](../build/mypro102-integration/core-all-final.log) · [桌面测试](../build/mypro102-integration/desktop-tests.log) · [成包 SWF 测试](../build/mypro102-integration/final-pet-cleanup/runner.log) · [可复跑的测试入口](../src/tools/swf-patches/test_battle_pet_cleanup.py)
+
+### 成品播放器三次离线运行
+
+同一个本地动画、同一发行 EXE、120 FPS 目标，分别正常启动和关窗。动画每个逻辑帧反复调用整数方法与字段 getter，同时测试需要类型转换的输入。每次取两个完整的五秒区间，排除关窗时长不足五秒的尾段。本次 Windows 主显示器报告 1920×1200、60 Hz，该分辨率枚举到的刷新率只有 60 Hz。
+
+| 模式与 PID | 逻辑 FPS | 实际呈现 FPS | 整数机器码实际调用 | 新建／从磁盘复用的代码形状 |
+| --- | ---: | ---: | ---: | ---: |
+| 关闭脚本加速，25404 | 118.38–119.39 | 59.00–59.19 | 0 | 0／0 |
+| 首次开启，13532 | 118.32–119.23 | 58.36–59.51 | 617,515 | 1／0 |
+| 同数据目录重启，16832 | 118.99–119.63 | 59.42–59.60 | 601,022 | 0／1 |
+
+首次与重启分别另有 617,515、601,022 次 getter 快速读取。两次各有 2 次类型守卫回退。关闭、首次及重启的完整区间平均逻辑帧耗时在 0.317–0.340 ms；该轻载场景能验证调用和缓存命中，无法据此估算真实换宠收益。[三次成品采样汇总](../build/mypro102-integration/verify-djybbt0e/summary.json)
+
 ## 运行与单项对照
 
 11 月 24 日进一步核对根目录的 MyPro **v1.0.1**。发行 EXE 文件偏移 `0x1f57301` 有配置名 `AOQI_FUSE_GLOW`，`0x1f4a9ac` 的内嵌着色器说明将最后一次纵向模糊与 Glow 合成，`0x1f4b3b9` 附近有恢复八位精度的运算。另一处 `0x1f4cf53` 描述同时融合横纵模糊。v2 的 PID 67460 在最慢的 10.64 秒小窗样本中有 4,386 次 Glow 调用，渲染线程为这一类滤镜记录了 806.55 ms。此次项目候选先验证最后一次纵向模糊的融合。[合作方 E07](../MyPro_v1.0.0_static_analysis.txt) · [v2 实战窗口](evidence/mypro-runtime-20261124/live-142192.json) · [候选与计数](goto与子树遍历.md#11-月-24-日-mypro-战斗跳帧候选)
