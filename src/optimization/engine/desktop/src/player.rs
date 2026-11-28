@@ -576,6 +576,27 @@ impl PlayerController {
     }
 
     #[cfg(windows)]
+    pub(crate) fn drop_with_close_timings(self) {
+        {
+            let _phase = crate::aola_close_phases::phase("player-controller-player-drop");
+            drop(self.player);
+        }
+        drop(self.event_loop);
+        {
+            let _phase = crate::aola_close_phases::phase("player-controller-window-drop");
+            drop(self.window);
+        }
+        {
+            let _phase = crate::aola_close_phases::phase("player-controller-descriptors-drop");
+            drop(self.descriptors);
+        }
+        {
+            let _phase = crate::aola_close_phases::phase("player-controller-font-database-drop");
+            drop(self.font_database);
+        }
+    }
+
+    #[cfg(windows)]
     pub fn session_id(&self) -> Option<i64> {
         self.player.as_ref().map(|player| player.id.0)
     }

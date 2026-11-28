@@ -1,4 +1,7 @@
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, VecDeque},
+    vec::Vec,
+};
 use core::{
     cell::{Cell, RefCell, UnsafeCell},
     mem,
@@ -208,12 +211,13 @@ pub(crate) struct Context {
 
     // A queue of gray objects that became gray as a result
     // of a write barrier.
-    gray_again: Queue<GcPtr>,
+    gray_again: FifoQueue<GcPtr>,
 
     // Key promotion wakes its dependent values, including chains crossing multiple dictionaries.
     // The marker consumes them one edge at a time. Sweep discards unresolved edges per dead key.
     ephemerons: RefCell<BTreeMap<*const (), Vec<GcPtr>>>,
     ready_ephemerons: Queue<Vec<GcPtr>>,
+    gray_again_since_ephemeron: u8,
 }
 
 impl Drop for Context {
@@ -266,9 +270,10 @@ impl Context {
             sweep_prev: Cell::new(None),
             root_needs_trace: true,
             gray: Queue::new(),
-            gray_again: Queue::new(),
+            gray_again: FifoQueue::new(),
             ephemerons: RefCell::new(BTreeMap::new()),
             ready_ephemerons: Queue::new(),
+            gray_again_since_ephemeron: 0,
         }
     }
 
@@ -339,6 +344,7 @@ impl Context {
                 Phase::Sleep => {
                     has_slept = true;
                     // Immediately enter the mark phase
+                    cx.gray_again_since_ephemeron = 0;
                     cx.switch(Phase::Mark);
                 }
                 Phase::Mark => {
@@ -615,16 +621,28 @@ impl Context {
     }
 
     fn mark_one<'gc, R: Collect<'gc> + ?Sized>(&mut self, root: &R) -> ControlFlow<()> {
-        // We look for an object first in the normal gray queue, then the "gray again" queue.
-        // Processing "gray again" objects later gives them more time to be mutated again without
-        // triggering another write barrier.
-        let next_gray = if let Some(gc_ptr) = self.gray.pop() {
-            Some(gc_ptr)
-        } else if let Some(gc_ptr) = self.gray_again.pop() {
-            Some(gc_ptr)
-        } else {
-            None
-        };
+        const GRAY_AGAIN_PER_EPHEMERON: u8 = 4;
+        // First trace newly discovered objects. Retrace older writes before newer ones,
+        // and give ready ephemeron edges a turn even if writes keep arriving.
+        let mut next_gray = self.gray.pop();
+        if next_gray.is_none() {
+            if (self.gray_again_since_ephemeron >= GRAY_AGAIN_PER_EPHEMERON
+                || self.gray_again.is_empty())
+                && let Some(mut values) = self.ready_ephemerons.pop()
+            {
+                self.gray_again_since_ephemeron = 0;
+                let value = values.pop().expect("promoted ephemeron key had no values");
+                if !values.is_empty() {
+                    self.ready_ephemerons.push(values);
+                }
+                Context::trace(self, value);
+                return ControlFlow::Continue(());
+            }
+            next_gray = self.gray_again.pop();
+            if next_gray.is_some() {
+                self.gray_again_since_ephemeron = self.gray_again_since_ephemeron.saturating_add(1);
+            }
+        }
 
         if let Some(gc_ptr) = next_gray {
             // We always mark work for objects processed from both the gray and "gray again" queue.
@@ -661,13 +679,6 @@ impl Context {
             unsafe { gc_ptr.trace_value(guard.context) }
             mem::forget(guard);
 
-            ControlFlow::Continue(())
-        } else if let Some(mut values) = self.ready_ephemerons.pop() {
-            let value = values.pop().expect("promoted ephemeron key had no values");
-            if !values.is_empty() {
-                self.ready_ephemerons.push(values);
-            }
-            Context::trace(self, value);
             ControlFlow::Continue(())
         } else if self.root_needs_trace {
             // We treat the root object as gray if `root_needs_trace` is set, and we process it at
@@ -887,5 +898,34 @@ impl<T> Queue<T> {
 
     fn pop(&self) -> Option<T> {
         unsafe { (*self.vec.get()).pop() }
+    }
+}
+
+// Uses the same single-threaded, callback-free access as Queue above.
+struct FifoQueue<T> {
+    deque: UnsafeCell<VecDeque<T>>,
+}
+
+impl<T> FifoQueue<T> {
+    fn new() -> Self {
+        Self {
+            deque: UnsafeCell::new(VecDeque::new()),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        unsafe { (*self.deque.get().cast_const()).is_empty() }
+    }
+
+    fn len(&self) -> usize {
+        unsafe { (*self.deque.get().cast_const()).len() }
+    }
+
+    fn push(&self, val: T) {
+        unsafe { (*self.deque.get()).push_back(val) }
+    }
+
+    fn pop(&self) -> Option<T> {
+        unsafe { (*self.deque.get()).pop_front() }
     }
 }

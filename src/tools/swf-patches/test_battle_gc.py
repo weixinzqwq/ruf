@@ -39,7 +39,7 @@ def verify_transitions(raw, policy):
                     "freed", "cyclesCompleted", "weakEntriesPruned", "gcUs", "maintenanceUs"):
             assert int(fields[key]) >= 0, fields
         if event == "battle-main-gc":
-            assert fields["mode"] == "finish-cycle" and fields["cyclesCompleted"] == "1", fields
+            assert fields["mode"] == "incremental-drain" and fields["cyclesCompleted"] == "1", fields
     reference = "battle-main-gc" if policy == "current" else "battle-exit"
     last = max(stamp for stamp, event, _ in rows if event == reference)
     assert (followup_time - last).total_seconds() >= 2.19, rows

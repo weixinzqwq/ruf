@@ -79,6 +79,64 @@ fn ephemerons_follow_promoted_keys_until_the_end_of_marking() {
 }
 
 #[test]
+fn gray_again_fifo_prevents_hot_object_starvation() {
+    use gc_arena::collect::Trace;
+
+    struct TraceCount(Cell<usize>);
+
+    // The counter contains no pointers. Its trace records each marking visit.
+    unsafe impl<'gc> Collect<'gc> for TraceCount {
+        fn trace<T: Trace<'gc>>(&self, _: &mut T) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    struct Root<'gc> {
+        nodes: [Gc<'gc, TraceCount>; 6],
+        key: GcWeak<'gc, u32>,
+        values: [GcWeak<'gc, u32>; 2],
+    }
+
+    unsafe impl<'gc> Collect<'gc> for Root<'gc> {
+        fn trace<T: Trace<'gc>>(&self, cc: &mut T) {
+            cc.trace(&self.nodes);
+            for value in self.values {
+                cc.trace_ephemeron(GcWeak::erase(self.key), GcWeak::erase(value));
+            }
+        }
+    }
+
+    let mut arena = Arena::<Rootable![Root<'_>]>::new(|mc| Root {
+        nodes: core::array::from_fn(|_| Gc::new(mc, TraceCount(Cell::new(0)))),
+        key: Gc::downgrade(Gc::new(mc, 0)),
+        values: [1, 2].map(|value| Gc::downgrade(Gc::new(mc, value))),
+    });
+    arena.finish_marking().unwrap();
+    arena.mutate(|mc, root| {
+        let key = root.key.upgrade(mc).unwrap();
+        mc.forward_barrier(None, Gc::erase(key));
+        for node in root.nodes {
+            mc.backward_barrier(Gc::erase(node), None);
+        }
+    });
+    assert_eq!(arena.mark_backlog(), (0, 6, 1, false));
+
+    for _ in 0..10 {
+        arena.collect_step();
+        // Every retrace of the last node is immediately invalidated by another write.
+        arena.mutate(|mc, root| mc.backward_barrier(Gc::erase(root.nodes[5]), None));
+    }
+
+    assert_eq!(arena.mark_backlog(), (0, 1, 0, false));
+    arena.mutate(|_, root| {
+        assert!(root.nodes[..5].iter().all(|node| node.0.get() == 2));
+        assert!(root.nodes[5].0.get() > 2);
+    });
+    arena.finish_cycle();
+    arena.mutate(|_, root| assert!(root.values.iter().all(|value| !value.is_dropped())));
+}
+
+#[test]
 fn aola_drop_observer_counts_remaining_headers_only_at_teardown() {
     use std::sync::Mutex;
     static EDGES: Mutex<Vec<(bool, usize)>> = Mutex::new(Vec::new());

@@ -69,7 +69,7 @@ impl MainWindow {
         }
         {
             let _phase = crate::aola_close_phases::phase("player-controller-drop");
-            drop(self.player);
+            self.player.drop_with_close_timings();
         }
     }
 
@@ -1005,6 +1005,9 @@ impl ApplicationHandler<RuffleEvent> for App {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         #[cfg(windows)]
+        let fast_exit = self.preferences.cli.aola_host
+            && std::env::var_os("AOLA_FAST_EXIT").as_deref() != Some(std::ffi::OsStr::new("0"));
+        #[cfg(windows)]
         {
             crate::aola_close_phases::start();
             if let Some(browser) = self.aola_browser.take() {
@@ -1026,9 +1029,33 @@ impl ApplicationHandler<RuffleEvent> for App {
             }
             if let Some(window) = self.main_window.take() {
                 #[cfg(windows)]
-                let _phase = crate::aola_close_phases::phase("main-window-drop");
-                #[cfg(windows)]
-                if crate::aola_close_phases::active() { window.drop_with_close_timings(); } else { drop(window); }
+                if fast_exit {
+                    let mut window = window;
+                    if let Some(mut player) = window.player.get() {
+                        let _phase = crate::aola_close_phases::phase("shared-object-flush");
+                        player.flush_shared_objects();
+                    }
+                    let _phase = crate::aola_close_phases::phase("fast-window-release");
+                    if let Some(host) = &self.mypro_host {
+                        host.panel.set_visible(false);
+                        host.parent.set_visible(false);
+                    }
+                    window.gui.window().set_visible(false);
+                    drop(window.window_move);
+                    drop(window.aoqi_host);
+                    drop(window.gui.aola_performance.take());
+                    // Only this process-exit path hands Player and GPU teardown to Windows.
+                    // The runtime and the remaining shutdown work still finish normally.
+                    std::mem::forget(window.gui);
+                    std::mem::forget(window.player);
+                } else {
+                    let _phase = crate::aola_close_phases::phase("main-window-drop");
+                    if crate::aola_close_phases::active() {
+                        window.drop_with_close_timings();
+                    } else {
+                        drop(window);
+                    }
+                }
                 #[cfg(not(windows))]
                 drop(window);
             }

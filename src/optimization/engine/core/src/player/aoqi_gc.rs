@@ -8,7 +8,11 @@ use web_time::Instant;
 const PERIODIC_INTERVAL: Duration = Duration::from_secs(5);
 const BATTLE_FOLLOWUP_DELAY: Duration = Duration::from_millis(2200);
 const BATTLE_CATCHUP_MAX: Duration = Duration::from_millis(8);
+const CATCHUP_NODE_DELTA_CAP: usize = 500_000;
+const STALLED_MARK_ESCALATION: Duration = Duration::from_secs(15);
+const STALLED_CATCHUP_MAX: Duration = Duration::from_millis(12);
 const BUSY_FRAME_CATCHUP_INTERVAL: Duration = Duration::from_millis(125);
+const BATTLE_DRAIN_MAX: Duration = Duration::from_millis(16);
 // MyPro counts two SWF/library registries. This engine indexes each movie once.
 const FULL_FOLLOWUP_MOVIES: usize = 305;
 
@@ -33,6 +37,7 @@ pub(crate) struct BattleMaintenance {
     active: Option<usize>,
     pub(crate) managers_returned: Option<usize>,
     work: Option<BattleWork>,
+    drain: Option<BattleGcReport>,
     pub(super) legacy_followup_only: bool,
     pub(super) entries: u64,
     pub(super) exits: u64,
@@ -40,8 +45,6 @@ pub(crate) struct BattleMaintenance {
     pub(super) full_followup_cycles: u64,
     pub(super) followup_slices: u64,
     pub(super) catchup_enabled: bool,
-    cycle_baseline: Option<(Instant, usize)>,
-    last_catchup: Option<Instant>,
     pub(super) catchup_slices: u64,
     pub(super) combat_cycles: u64,
     pub(super) combat_dropped: u64,
@@ -52,7 +55,7 @@ impl BattleMaintenance {
     pub(super) fn from_config() -> Self {
         Self {
             legacy_followup_only: std::env::var("AOLA_BATTLE_CLEANUP").as_deref() == Ok("0"),
-            catchup_enabled: std::env::var("AOLA_BATTLE_GC_CATCHUP").as_deref() == Ok("1"),
+            catchup_enabled: std::env::var("AOLA_BATTLE_GC_CATCHUP").as_deref() != Ok("0"),
             ..Self::default()
         }
     }
@@ -60,8 +63,7 @@ impl BattleMaintenance {
     pub(crate) fn enter(&mut self, receiver: usize) {
         self.active = Some(receiver);
         self.work = None;
-        self.cycle_baseline = None;
-        self.last_catchup = None;
+        self.drain = None;
         self.entries += 1;
         tracing::info!(target: "aola_swf_operation", operation = "battle-enter", battleId = self.entries);
     }
@@ -93,29 +95,6 @@ impl BattleMaintenance {
     pub(crate) fn is_active(&self) -> bool {
         self.active.is_some()
     }
-
-    fn combat_budget(&mut self, base: Duration, interval: Duration, work: Duration, now: Instant,
-        nodes: usize) -> Duration {
-        if !self.catchup_enabled { return base; }
-        let (since, initial_nodes) = *self.cycle_baseline.get_or_insert((now, nodes));
-        // A cycle must persist while the heap grows by at least a quarter.
-        if now.saturating_duration_since(since) < PERIODIC_INTERVAL
-            || nodes.saturating_sub(initial_nodes) < initial_nodes.div_ceil(4).max(1)
-        {
-            return base;
-        }
-        let target = (base * 2).min(interval / 2).min(BATTLE_CATCHUP_MAX);
-        if target <= base { return base; }
-        // Keep saturated ticks on the normal budget between occasional recovery slices.
-        if work.saturating_add(target) > interval && self.last_catchup.is_some_and(|last|
-            now.saturating_duration_since(last) < BUSY_FRAME_CATCHUP_INTERVAL)
-        {
-            return base;
-        }
-        self.last_catchup = Some(now);
-        self.catchup_slices += 1;
-        target
-    }
 }
 
 pub(super) fn slice_duration() -> Duration {
@@ -131,6 +110,8 @@ pub(super) fn sleep_factor() -> f64 {
 pub(super) struct Scheduler {
     last_completed: Instant,
     last_slice: Option<Instant>,
+    cycle_baseline: Option<(Instant, usize)>,
+    last_catchup: Option<Instant>,
     pub completed_cycles: u64,
     pub periodic_cycles: u64,
     pub slices: u64,
@@ -142,7 +123,8 @@ pub(super) struct Scheduler {
 
 impl Default for Scheduler {
     fn default() -> Self {
-        Self { last_completed: Instant::now(), last_slice: None, completed_cycles: 0, periodic_cycles: 0,
+        Self { last_completed: Instant::now(), last_slice: None, cycle_baseline: None, last_catchup: None,
+            completed_cycles: 0, periodic_cycles: 0,
             slices: 0, steps: 0, total_ns: 0, max_slice_ns: 0, over_budget_slices: 0 }
     }
 }
@@ -174,7 +156,7 @@ impl BattleGcReport {
             BattleWork::Followup(_) => "battle-followup-gc",
         };
         tracing::info!(target: "aola_swf_operation", operation, battleId = battle.entries,
-            mode = if self.full { "finish-cycle" } else { "slice" },
+            mode = if self.full { "incremental-drain" } else { "slice" },
             registeredMovies = self.registered_movies as u64, registeredMoviesAfter = remaining_movies as u64,
             nodesBefore = self.nodes_before as u64, nodesAfter = self.nodes_after as u64,
             dropped = self.dropped, freed = self.freed, cyclesCompleted = self.cycles,
@@ -184,6 +166,30 @@ impl BattleGcReport {
 }
 
 impl Scheduler {
+    fn catchup_budget(&mut self, base: Duration, interval: Duration, work: Duration, now: Instant,
+        nodes: usize, ready_ephemerons: bool) -> Duration {
+        let (since, initial_nodes) = *self.cycle_baseline.get_or_insert((now, nodes));
+        let age = now.saturating_duration_since(since);
+        let delta = initial_nodes.div_ceil(4).min(CATCHUP_NODE_DELTA_CAP).max(1);
+        if age < PERIODIC_INTERVAL || (nodes.saturating_sub(initial_nodes) < delta && !ready_ephemerons) {
+            return base;
+        }
+        let target = if age >= STALLED_MARK_ESCALATION {
+            (base * 3).min(interval * 2 / 3).min(STALLED_CATCHUP_MAX)
+        } else {
+            (base * 2).min(interval / 2).min(BATTLE_CATCHUP_MAX)
+        };
+        if target <= base { return base; }
+        // Keep saturated ticks on the normal budget between occasional recovery slices.
+        if work.saturating_add(target) > interval && self.last_catchup.is_some_and(|last|
+            now.saturating_duration_since(last) < BUSY_FRAME_CATCHUP_INTERVAL)
+        {
+            return base;
+        }
+        self.last_catchup = Some(now);
+        target
+    }
+
     pub(super) fn collect_for_frame<R>(
         &mut self, arena: &mut Arena<R>, budget: Duration, frame_interval: Duration, frame_work: Duration,
         battle: &mut BattleMaintenance, now: Instant, inventory: impl FnOnce(&Arena<R>) -> (usize, u64),
@@ -196,53 +202,61 @@ impl Scheduler {
         let work = match battle.work {
             Some(BattleWork::Main) => BattleWork::Main,
             Some(BattleWork::Followup(due)) if now >= due => BattleWork::Followup(due),
-            _ if battle.is_active() => {
-                let metrics = arena.metrics().clone();
-                let dropped = metrics.lifetime_dropped();
-                let freed = metrics.lifetime_freed();
-                let cycles = self.completed_cycles;
-                let budget = if arena.collection_phase() == CollectionPhase::Sleeping {
-                    budget
-                } else {
-                    battle.combat_budget(budget, frame_interval, frame_work, now, metrics.total_gc_count())
-                };
-                self.drive(arena, budget, now, false);
-                if self.completed_cycles != cycles {
-                    battle.combat_cycles += 1;
-                    battle.cycle_baseline = None;
-                    battle.last_catchup = None;
-                }
-                battle.combat_dropped += metrics.lifetime_dropped() - dropped;
-                battle.combat_freed += metrics.lifetime_freed() - freed;
-                return None;
-            }
             _ => {
-                self.drive(arena, budget, now, false);
+                let metrics = arena.metrics().clone();
+                let combat = battle.is_active().then(|| (
+                    metrics.lifetime_dropped(), metrics.lifetime_freed(), self.completed_cycles,
+                ));
+                let phase = arena.collection_phase();
+                let effective_budget = if battle.catchup_enabled && phase != CollectionPhase::Sleeping {
+                    self.catchup_budget(budget, frame_interval, frame_work, now, metrics.total_gc_count(),
+                        phase == CollectionPhase::Marking && arena.mark_backlog().2 > 0)
+                } else {
+                    budget
+                };
+                self.drive(arena, effective_budget, now, false);
+                if let Some((dropped, freed, cycles)) = combat {
+                    battle.catchup_slices += u64::from(effective_budget > budget);
+                    battle.combat_cycles += self.completed_cycles - cycles;
+                    battle.combat_dropped += metrics.lifetime_dropped() - dropped;
+                    battle.combat_freed += metrics.lifetime_freed() - freed;
+                }
                 return None;
             }
         };
-        let (registered_movies, weak_pruned_before) = inventory(arena);
-        let full = matches!(work, BattleWork::Main)
-            || (!battle.legacy_followup_only && registered_movies > FULL_FOLLOWUP_MOVIES);
         let metrics = arena.metrics().clone();
-        let nodes_before = metrics.total_gc_count();
+        let mut report = battle.drain.take().unwrap_or_else(|| {
+            let (registered_movies, weak_pruned_before) = inventory(arena);
+            let full = matches!(work, BattleWork::Main)
+                || (!battle.legacy_followup_only && registered_movies > FULL_FOLLOWUP_MOVIES);
+            BattleGcReport { work, full, registered_movies, weak_pruned_before,
+                nodes_before: metrics.total_gc_count(), nodes_after: 0, dropped: 0, freed: 0,
+                cycles: 0, gc_time: Duration::ZERO }
+        });
         let dropped_before = metrics.lifetime_dropped();
         let freed_before = metrics.lifetime_freed();
         let previous_cycles = self.completed_cycles;
-        let start = Instant::now();
-        if full {
-            // The verified AS3 dispose has returned and its activation is off the stack.
-            arena.finish_cycle();
-            self.completed_cycles += 1;
-            self.last_completed = now + start.elapsed();
-            self.slices += 1;
-            self.record_time(start.elapsed(), budget);
+        let previous_steps = self.steps;
+        let drain_budget = if report.full {
+            // Direct run_frame callers do not specify a host frame interval.
+            let limit = if frame_interval.is_zero() { budget } else { frame_interval * 4 / 5 };
+            limit.min(BATTLE_DRAIN_MAX)
         } else {
-            let previous_steps = self.steps;
-            self.drive(arena, budget, now, true);
-            if self.steps == previous_steps { return None; }
-        }
+            budget
+        };
+        let start = Instant::now();
+        // Complete a full pass across frames using the same arena state.
+        self.drive(arena, drain_budget, now, true);
         let gc_time = start.elapsed();
+        report.gc_time += gc_time;
+        report.dropped += metrics.lifetime_dropped() - dropped_before;
+        report.freed += metrics.lifetime_freed() - freed_before;
+        report.cycles += self.completed_cycles - previous_cycles;
+        if self.steps == previous_steps || (report.full && report.cycles == 0) {
+            battle.drain = Some(report);
+            return None;
+        }
+        report.nodes_after = metrics.total_gc_count();
         battle.work = match work {
             BattleWork::Main => {
                 battle.main_cycles += 1;
@@ -250,14 +264,11 @@ impl Scheduler {
             }
             BattleWork::Followup(_) => {
                 battle.followup_slices += 1;
-                battle.full_followup_cycles += u64::from(full);
+                battle.full_followup_cycles += u64::from(report.full);
                 None
             }
         };
-        Some(BattleGcReport { work, full, registered_movies, weak_pruned_before, nodes_before,
-            nodes_after: metrics.total_gc_count(), dropped: metrics.lifetime_dropped() - dropped_before,
-            freed: metrics.lifetime_freed() - freed_before, cycles: self.completed_cycles - previous_cycles,
-            gc_time })
+        Some(report)
     }
 
     fn claim_frame(&mut self, now: Instant, interval: Duration) -> bool {
@@ -272,10 +283,14 @@ impl Scheduler {
         for<'gc> <R as Rootable<'gc>>::Root: Sized + Collect<'gc>,
     {
         if budget.is_zero() { return; }
-        if arena.collection_phase() == CollectionPhase::Sleeping && arena.metrics().allocation_debt() <= 0.0 {
-            let periodic_due = now.saturating_duration_since(self.last_completed) >= PERIODIC_INTERVAL;
-            if !periodic_due && !battle_due { return; }
-            self.periodic_cycles = self.periodic_cycles.saturating_add(u64::from(periodic_due));
+        if arena.collection_phase() == CollectionPhase::Sleeping {
+            self.cycle_baseline = None;
+            self.last_catchup = None;
+            if arena.metrics().allocation_debt() <= 0.0 {
+                let periodic_due = now.saturating_duration_since(self.last_completed) >= PERIODIC_INTERVAL;
+                if !periodic_due && !battle_due { return; }
+                self.periodic_cycles = self.periodic_cycles.saturating_add(u64::from(!battle_due));
+            }
         }
         let start = Instant::now();
         self.slices += 1;
@@ -288,6 +303,8 @@ impl Scheduler {
             if arena.collection_phase() == CollectionPhase::Sleeping {
                 self.completed_cycles = self.completed_cycles.saturating_add(1);
                 self.last_completed = now + start.elapsed();
+                self.cycle_baseline = None;
+                self.last_catchup = None;
                 break;
             }
         }
@@ -309,34 +326,55 @@ mod tests {
     use crate::bitmap::bitmap_data::BitmapData;
 
     #[test]
-    fn battle_catchup_requires_age_growth_and_spaces_out_busy_ticks() {
+    fn catchup_requires_age_growth_and_spaces_out_busy_ticks() {
         let base = Duration::from_millis(4);
         let target = Duration::from_millis(8);
         let frame = Duration::from_millis(17);
         let start = Instant::now();
         let due = start + PERIODIC_INTERVAL;
-        let mut battle = BattleMaintenance { catchup_enabled: true, ..Default::default() };
-        battle.enter(1);
-        assert_eq!(battle.combat_budget(base, frame, frame, start, 100), base);
-        assert_eq!(battle.combat_budget(base, frame, frame, due - frame, 130), base);
-        assert_eq!(battle.combat_budget(base, frame, frame, due, 124), base);
-        assert_eq!(battle.combat_budget(base, frame, frame, due, 125), target);
-        assert_eq!(battle.combat_budget(base, frame, frame, due + frame, 130), base);
-        assert_eq!(battle.combat_budget(base, frame, frame, due + BUSY_FRAME_CATCHUP_INTERVAL, 130), target);
+        let mut scheduler = Scheduler::default();
+        assert_eq!(scheduler.catchup_budget(base, frame, frame, start, 100, false), base);
+        assert_eq!(scheduler.catchup_budget(base, frame, frame, due - frame, 130, false), base);
+        assert_eq!(scheduler.catchup_budget(base, frame, frame, due, 124, false), base);
+        assert_eq!(scheduler.catchup_budget(base, frame, frame, due, 125, false), target);
+        assert_eq!(scheduler.catchup_budget(base, frame, frame, due + frame, 130, false), base);
+        assert_eq!(scheduler.catchup_budget(base, frame, frame, due + BUSY_FRAME_CATCHUP_INTERVAL, 130, false), target);
         let next = due + BUSY_FRAME_CATCHUP_INTERVAL + frame;
         let target_frame = FloatDuration::from_millis(17.0);
         let light_tick = Duration::from_millis(2);
         let late = estimated_tick_work(light_tick, FloatDuration::from_millis(26.0), target_frame);
-        assert_eq!(battle.combat_budget(base, frame, late, next, 130), base);
+        assert_eq!(scheduler.catchup_budget(base, frame, late, next, 130, false), base);
         let on_time = estimated_tick_work(light_tick, FloatDuration::from_millis(17.0), target_frame);
-        assert_eq!(battle.combat_budget(base, frame, on_time, next, 130), target);
-        battle.enter(2);
-        assert_eq!(battle.combat_budget(base, frame, frame, due + PERIODIC_INTERVAL, 200), base);
-        assert_eq!(battle.catchup_slices, 3);
+        assert_eq!(scheduler.catchup_budget(base, frame, on_time, next, 130, false), target);
+    }
+
+    #[test]
+    fn catchup_triggers_on_large_heap_without_waiting_for_25_percent() {
+        let mut scheduler = Scheduler::default();
+        let base = Duration::from_millis(4);
+        let frame = Duration::from_millis(20);
+        let start = Instant::now();
+        let due = start + PERIODIC_INTERVAL;
+        let nodes = 20_000_000;
+        assert_eq!(scheduler.catchup_budget(base, frame, Duration::ZERO, start, nodes, false), base);
+        assert_eq!(scheduler.catchup_budget(base, frame, Duration::ZERO, due, nodes + 499_999, false), base);
+        assert_eq!(scheduler.catchup_budget(base, frame, Duration::ZERO, due, nodes + 500_000, false), BATTLE_CATCHUP_MAX);
+        assert_eq!(scheduler.catchup_budget(base, frame, Duration::ZERO, due, nodes, true), BATTLE_CATCHUP_MAX);
+        assert_eq!(scheduler.catchup_budget(base, frame, Duration::ZERO, start + STALLED_MARK_ESCALATION, nodes, true),
+            STALLED_CATCHUP_MAX);
     }
 
     #[test]
     fn battle_catchup_sweeps_discarded_opening_assets_while_other_objects_keep_changing() {
+        catchup_sweeps_discarded_opening_assets(true);
+    }
+
+    #[test]
+    fn non_battle_catchup_breaks_marking_livelock() {
+        catchup_sweeps_discarded_opening_assets(false);
+    }
+
+    fn catchup_sweeps_discarded_opening_assets(in_battle: bool) {
         // Model three objects whose indivisible traces must be redone if their children change.
         struct Hot<'gc>(Gc<'gc, u32>);
         // SAFETY: the only GC pointer is traced; Hot has no Drop or interior mutability.
@@ -369,7 +407,7 @@ mod tests {
             });
             arena.finish_cycle();
             let mut battle = BattleMaintenance { catchup_enabled, ..Default::default() };
-            battle.enter(1);
+            if in_battle { battle.enter(1); }
             arena.mutate_root(|_, scene| scene.opening = None);
             arena.collect_step();
             let mut scheduler = Scheduler::default();
@@ -384,16 +422,17 @@ mod tests {
                 scheduler.collect_for_frame(&mut arena, Duration::from_millis(4), frame, frame,
                     &mut battle, now, |_| unreachable!("no post-battle maintenance during combat"));
                 arena.mutate(|_, scene| assert!(scene.active.iter().all(|object| *object.borrow().0 == i)));
-                if battle.combat_cycles > 0 { break; }
+                if scheduler.completed_cycles > 0 { break; }
             }
             let dropped = arena.mutate(|_, scene| scene.observer.is_dropped());
             eprintln!("battle_catchup={catchup_enabled} slices={} boosted={} cycles={} dropped={} freed={} opening_dropped={dropped}",
                 scheduler.slices, battle.catchup_slices, battle.combat_cycles, battle.combat_dropped, battle.combat_freed);
             assert_eq!(dropped, catchup_enabled);
-            assert_eq!(battle.combat_freed > 0, catchup_enabled);
-            assert_eq!(battle.combat_cycles, u64::from(catchup_enabled));
+            assert_eq!(scheduler.completed_cycles, u64::from(catchup_enabled));
+            assert_eq!(battle.combat_freed > 0, in_battle && catchup_enabled);
+            assert_eq!(battle.combat_cycles, u64::from(in_battle && catchup_enabled));
             assert_eq!(battle.exits, 0);
-            assert!(battle.is_active());
+            assert_eq!(battle.is_active(), in_battle);
         }
     }
 
@@ -491,6 +530,52 @@ mod tests {
             assert!(frame(Duration::from_millis(2), &mut battle, due + BATTLE_FOLLOWUP_DELAY).is_none());
             arena.mutate(|_, key| assert_eq!(**key, 42));
         }
+    }
+
+    #[test]
+    fn battle_drains_span_frames_and_reentry_cancels_the_pending_report() {
+        struct SlowRoot<'gc>(Gc<'gc, u32>);
+        // SAFETY: The only GC pointer is traced and the root has no destructor.
+        unsafe impl<'gc> Collect<'gc> for SlowRoot<'gc> {
+            fn trace<T: gc_arena::collect::Trace<'gc>>(&self, trace: &mut T) {
+                trace.trace(&self.0);
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_millis(2) {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+        let mut arena = Arena::<Rootable![SlowRoot<'_>]>::new(|mc| {
+            let _ = Gc::new(mc, 13u32);
+            SlowRoot(Gc::new(mc, 42))
+        });
+        let mut scheduler = Scheduler::default();
+        let mut battle = BattleMaintenance::default();
+        let now = scheduler.last_completed;
+        let interval = Duration::from_millis(1);
+        let budget = Duration::from_millis(4);
+        battle.enter(1);
+        battle.managers_returned = Some(1);
+        battle.finish_dispose(None, Some(1), true, now, true);
+        let mut frame = |battle: &mut BattleMaintenance, time| {
+            scheduler.collect_for_frame(&mut arena, budget, interval, Duration::ZERO, battle, time,
+                |_| (FULL_FOLLOWUP_MOVIES + 1, 0))
+        };
+        assert!(frame(&mut battle, now).is_none());
+        assert_eq!(battle.main_cycles, 0);
+        assert!(battle.drain.is_some());
+        let report = (1..10).find_map(|i| frame(&mut battle, now + interval * i)).unwrap();
+        assert_eq!((report.freed, report.cycles, battle.main_cycles), (1, 1, 1));
+
+        let Some(BattleWork::Followup(due)) = battle.work else { panic!("missing follow-up") };
+        assert!(frame(&mut battle, due).is_none());
+        assert!(battle.drain.is_some());
+        battle.enter(2);
+        assert!(!battle.pending());
+        assert!(battle.drain.is_none());
+        assert!(frame(&mut battle, due + interval).is_none());
+        assert_eq!((battle.followup_slices, battle.full_followup_cycles), (0, 0));
+        arena.mutate(|_, root| assert_eq!(*root.0, 42));
     }
 
     #[test]

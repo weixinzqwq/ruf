@@ -154,7 +154,7 @@ impl Visit for SwfOperation {
                     | "pet-switch-timing-unbound"
                     | "pet-switch-completed"
             ))
-            || (field.name() == "mode" && matches!(value, "finish-cycle" | "slice"))
+            || (field.name() == "mode" && matches!(value, "incremental-drain" | "finish-cycle" | "slice"))
         {
             self.0.insert(field.name().into(), value.into());
         }
@@ -912,8 +912,11 @@ mod tests {
         tracing::subscriber::with_default(
             tracing_subscriber::registry().with(Capture(rows.clone())),
             || {
-                for operation in ["battle-main-gc", "battle-followup-gc"] {
-                    tracing::info!(target: "aola_swf_operation", operation, mode = "finish-cycle", battleId = 1u64,
+                for (operation, mode) in [
+                    ("battle-main-gc", "incremental-drain"),
+                    ("battle-followup-gc", "slice"),
+                ] {
+                    tracing::info!(target: "aola_swf_operation", operation, mode, battleId = 1u64,
                     registeredMovies = 306u64, registeredMoviesAfter = 301u64, nodesBefore = 17u64,
                     nodesAfter = 10u64, dropped = 8u64, freed = 7u64, weakEntriesPruned = 2u64,
                     cyclesCompleted = 1u64, gcUs = 42u64, maintenanceUs = 17u64, other = "ignored");
@@ -922,9 +925,12 @@ mod tests {
         );
         let rows = rows.lock().unwrap();
         assert_eq!(rows.len(), 2);
-        for (row, operation) in rows.iter().zip(["battle-main-gc", "battle-followup-gc"]) {
+        for (row, (operation, mode)) in rows.iter().zip([
+            ("battle-main-gc", "incremental-drain"),
+            ("battle-followup-gc", "slice"),
+        ]) {
             assert_eq!(row["operation"], operation);
-            assert_eq!(row["mode"], "finish-cycle");
+            assert_eq!(row["mode"], mode);
             for (name, value) in [
                 ("battleId", 1),
                 ("registeredMovies", 306),

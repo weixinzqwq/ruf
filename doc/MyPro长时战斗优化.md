@@ -2,6 +2,18 @@
 
 2026-11-23。本轮在 optimization 引擎中处理三个会跨帧或跨战斗累积的开销：混音器持有的声音定义、临时纹理池内的冷资源，以及小位图上传时的直接提交。另在已识别的战斗退场路径接入一次延迟 GC 切片。运行包沿用前一版背包切换和战斗显示设置。[合作方分析](../MyPro_v1.0.1_long_run_optimization_analysis.txt) · [优化版](../dist/aola-long-run-20261123/run-game.cmd) · [同包对照](../dist/aola-long-run-20261123/run-original-maintenance.cmd)
 
+## 11 月 28 日退战卡顿修复
+
+周更包 PID 1272 第 3 场退场后到第 4 场进场前，私有内存由 7.79 GiB 升至 15.99 GiB。第 4 场退战的主回收约 33 秒，补回收 56.77 秒，后一个区间未呈现新帧。两轮共释放约 3,019 万个 GC 节点。活动面板开关没有逐实例记录，资源归属待单独对照。[原始性能日志](../dist/aola-weekly-sync-20261127/aola-data/diagnostics/performance-1795857517585383700-1272.jsonl)
+
+战斗内外共用周期基线。周期持续 5 秒后，节点增长达到四分之一或 50 万中的较低值，或标记阶段出现已就绪的弱键依赖时，允许提高切片预算。预算最高 8 毫秒，符合追赶条件且周期达到 15 秒时放宽至最高 12 毫秒。繁忙帧仍按 125 毫秒节流。可用 `AOLA_BATTLE_GC_CATCHUP=0` 做对照。旧的 `battleMaintenance.inBattleGc` 计数仍只统计战斗内。[追赶调度](../src/optimization/engine/core/src/player/aoqi_gc.rs)
+
+写屏障加入的重标对象按先入先出处理。新发现对象仍优先，每四次重标为一个已就绪的弱键依赖让出一次处理机会。退战主回收与原本整轮执行的补回收改为逐帧完成，每帧预算最多 16 毫秒且不超过目标帧间隔的 80%。单个 GC 工作项仍可能超过预算。周期完成时保留原维护事件，`mode` 记为 `incremental-drain`。再次进战会取消上一场的待完成任务，普通 GC 可继续当前周期。[标记队列](../src/optimization/engine/core/aoqi-gc-arena/src/context.rs) · [退战调度](../src/optimization/engine/core/src/player/aoqi_gc.rs)
+
+36 项 GC 集成测试、7 项文档测试、14 项核心 GC 测试和 1 项本地 AVM2 进退战回归通过。Windows 发行版沿用前一周更包的补丁，并使用独立数据目录。[新运行包](../dist/aola-gc-stall-close-20261128/run-game.cmd)
+
+实战验收需要沿同一路线连续打 3–7 场，场间停留 5–7 分钟。按同一 PID 对齐 `completedCycles`、`gcMarkBacklog.readyWeakKeyGroups`、存活节点、私有内存、`maxSliceMs` 和实际画面帧率。若对照活动面板，保持地图、阵容和视口一致，并记下同一个面板的开关时间。
+
 ## 三场实战均在退场前完成清扫
 
 11 月 24 日 23:19 的关窗报告对应 PID 95768。73 条性能记录均为固定 60 FPS、战中追赶开启、退场采用主清加补清。下表用 `battleMaintenance.inBattleGc` 的相邻场次差值计数；这些计数只在战中普通 GC 分支累加，退场操作单独记入启动日志。[性能日志](../dist/aola-battle-live-gc-20261124/aola-data/diagnostics/performance-1795533191106173000-95768.jsonl) · [进退场及清理事件](../dist/aola-battle-live-gc-20261124/aola-data/diagnostics/startup-1795533191039-95768.jsonl)
